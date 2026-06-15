@@ -43,6 +43,15 @@ Plume detects the file type and renders it appropriately — ideal for living ne
 - **Log viewer** — `.log` files highlight ERROR/WARN/INFO levels and timestamps, interpret ANSI color, and **tail-follow** to the newest line as the file grows.
 - **CSV / TSV** render as tables; standalone **`.mmd`** render as Mermaid diagrams. Toggle source/rendered with ⌘/.
 
+### Daily driver, sharing & writing
+
+- **Folder sidebar** (⌘⇧E) — browse the open file's folder and switch files in place.
+- **Command palette** (⌘K) — fuzzy file quick-open + every command; type `>` to filter commands.
+- **Search in folder** (⌘⇧F) — grep across the folder, click a hit to jump to the file and line.
+- **Share-out** — *Copy as Rich Text* (⌘⇧C, paste formatted into Mail/Slack/Docs) and *Copy as HTML*; **Export** to PDF, HTML, and Word (`.docx`).
+- **Image paste/drop** — paste or drop an image and it's saved beside the file with a relative link.
+- **Writer tools** — live word count + reading time, `==highlight==`, `> [!NOTE]` callouts, and **Focus mode** (⌘⇧L) that dims everything but the current paragraph.
+
 ## Develop
 
 ```bash
