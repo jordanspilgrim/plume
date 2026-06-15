@@ -6,6 +6,10 @@
 
   --content-width: 46rem;
   --title-h: 38px;
+
+  /* Plume brand (matches the feather icon's periwinkle→indigo gradient) */
+  --brand: #6d7ff5;
+  --brand-grad: linear-gradient(90deg, #7c8df7 0%, #5b73f2 100%);
 }
 
 /* Dark palette */
@@ -87,15 +91,16 @@ html, body {
   justify-content: center;
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-muted);
+  color: #fff;
   letter-spacing: 0.01em;
   user-select: none;
-  border-bottom: 1px solid transparent;
+  background: var(--brand-grad);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.16);
 }
-#titlebar-name { opacity: 0.85; }
+#titlebar-name { opacity: 0.95; color: #fff; }
 #titlebar.dirty #titlebar-name::after {
   content: "•";
-  color: var(--accent);
+  color: #fff;
   margin-left: 6px;
 }
 
