@@ -1,4 +1,4 @@
-import { Decoration, WidgetType, EditorView } from "@codemirror/view";
+import { Decoration, WidgetType, EditorView, ViewPlugin } from "@codemirror/view";
 import { StateField, StateEffect } from "@codemirror/state";
 import { syntaxTree } from "@codemirror/language";
 import katex from "katex";
@@ -394,13 +394,6 @@ function buildDecorations(state) {
         return;
       }
       if (name === "ListMark") {
-        // Hanging indent: wrapped lines align under the text, not the bullet.
-        const ln = state.doc.lineAt(node.from);
-        const m = ln.text.match(/^(\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)/);
-        const col = m ? m[1].length : node.to - ln.from + 1;
-        ranges.push(
-          Decoration.line({ attributes: { style: `padding-left:${col}ch;text-indent:-${col}ch` } }).range(ln.from)
-        );
         const txt = state.doc.sliceString(node.from, node.to);
         if (/^[-*+]$/.test(txt) && shouldConceal(onActive)) {
           ranges.push(Decoration.replace({ widget: new BulletWidget() }).range(node.from, node.to));
@@ -476,4 +469,54 @@ const linkClicker = EditorView.domEventHandlers({
   },
 });
 
-export const livePreview = [docPathField, livePreviewField, linkClicker];
+/* ---------- List hanging indent (wrapped lines align under the text) ---------- */
+const LIST_PREFIX = /^(\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)/;
+
+function buildListIndent(view) {
+  const tree = syntaxTree(view.state);
+  const ranges = [];
+  for (const { from, to } of view.visibleRanges) {
+    let pos = from;
+    while (pos <= to) {
+      const line = view.state.doc.lineAt(pos);
+      const m = LIST_PREFIX.exec(line.text);
+      if (m) {
+        // Confirm it's a real list item (not a "- " line inside a code block).
+        const at = line.from + (line.text.length - line.text.trimStart().length);
+        let node = tree.resolveInner(at, 1), isList = false;
+        for (let n = node; n; n = n.parent) {
+          if (n.name === "ListItem") { isList = true; break; }
+          if (/Code|Fenced/.test(n.name)) break;
+        }
+        if (isList) {
+          // Size the hanging indent by the font's measured average character
+          // width (auto-adapts when the font changes). The trailing marker
+          // space renders narrower than an average glyph, so discount it.
+          const cols = m[1].length - 0.4;
+          const indent = Math.round(cols * view.defaultCharacterWidth);
+          if (indent > 0) {
+            ranges.push(
+              Decoration.line({ attributes: { style: `padding-left:${indent}px;text-indent:-${indent}px` } }).range(line.from)
+            );
+          }
+        }
+      }
+      pos = line.to + 1;
+    }
+  }
+  return Decoration.set(ranges, true);
+}
+
+const listIndent = ViewPlugin.fromClass(
+  class {
+    constructor(view) { this.decorations = buildListIndent(view); }
+    update(u) {
+      if (u.docChanged || u.viewportChanged || u.geometryChanged) {
+        this.decorations = buildListIndent(u.view);
+      }
+    }
+  },
+  { decorations: (v) => v.decorations }
+);
+
+export const livePreview = [docPathField, livePreviewField, listIndent, linkClicker];
