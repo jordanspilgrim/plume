@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: file:; font-src 'self' data:;"
+    />
+    <title>Plume</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app" data-theme="system">
+      <div id="titlebar"><span id="titlebar-name">Plume</span></div>
+      <div id="main">
+        <aside id="outline" class="hidden" aria-label="Document outline"></aside>
+        <div id="editor-host"></div>
+      </div>
+    </div>
+    <script src="../../dist/renderer.js"></script>
+  </body>
+</html>

@@ -1,0 +1,101 @@
+{
+  "name": "plume",
+  "version": "0.1.0",
+  "description": "A fast, single-surface Markdown editor — renders like a document, saves like a text file.",
+  "author": "Gabriel",
+  "license": "MIT",
+  "main": "src/main/main.js",
+  "scripts": {
+    "build:renderer": "node esbuild.config.mjs",
+    "watch:renderer": "node esbuild.config.mjs --watch",
+    "start": "npm run build:renderer && electron .",
+    "dev": "npm run build:renderer && electron .",
+    "dist": "npm run build:renderer && electron-builder",
+    "dist:dir": "npm run build:renderer && electron-builder --dir"
+  },
+  "build": {
+    "appId": "com.gabriel.plume",
+    "productName": "Plume",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/main/**/*",
+      "src/preload/**/*",
+      "src/renderer/index.html",
+      "src/renderer/styles.css",
+      "dist/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "build/icon.icns",
+      "extendInfo": {
+        "CFBundleDocumentTypes": [
+          {
+            "CFBundleTypeName": "Markdown Document",
+            "CFBundleTypeRole": "Editor",
+            "LSHandlerRank": "Owner",
+            "LSItemContentTypes": [
+              "net.daringfireball.markdown",
+              "public.plain-text"
+            ],
+            "CFBundleTypeExtensions": [
+              "md",
+              "markdown",
+              "mdown",
+              "mkd",
+              "mdx",
+              "text",
+              "txt"
+            ]
+          }
+        ],
+        "UTImportedTypeDeclarations": [
+          {
+            "UTTypeIdentifier": "net.daringfireball.markdown",
+            "UTTypeConformsTo": [
+              "public.plain-text"
+            ],
+            "UTTypeDescription": "Markdown Document",
+            "UTTypeTagSpecification": {
+              "public.filename-extension": [
+                "md",
+                "markdown",
+                "mdown",
+                "mkd",
+                "mdx"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "devDependencies": {
+    "electron": "^42.4.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.1"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.3",
+    "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-markdown": "^6.5.0",
+    "@codemirror/language": "^6.12.3",
+    "@codemirror/search": "^6.7.0",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.43.1",
+    "@lezer/common": "^1.5.2",
+    "@lezer/highlight": "^1.2.3",
+    "@lezer/markdown": "^1.6.4"
+  }
+}
