@@ -315,3 +315,41 @@ html, body {
   padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12.5px;
 }
 #banner button.ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--rule); }
+
+/* ---------- Formatting toolbar ---------- */
+#toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 14px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg);
+  -webkit-app-region: no-drag;
+  user-select: none;
+  overflow-x: auto;
+}
+#toolbar.hidden { display: none; }
+#toolbar::-webkit-scrollbar { height: 0; }
+.tb-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 28px;
+  padding: 0 6px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.08s, color 0.08s;
+}
+.tb-btn:hover { background: var(--accent-soft); color: var(--text); }
+.tb-btn:active { color: var(--accent); }
+.tb-btn svg { width: 16px; height: 16px; display: block; }
+.tb-text { font-size: 13px; font-weight: 650; line-height: 1; }
+.tb-text b { font-weight: 800; }
+.tb-text i { font-family: Georgia, "Times New Roman", serif; }
+.tb-text s { text-decoration: line-through; }
+.tb-divider { width: 1px; height: 18px; background: var(--rule); margin: 0 7px; flex: 0 0 auto; }

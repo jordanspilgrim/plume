@@ -218,31 +218,30 @@ applyTheme(localStorage.getItem("plume-theme") || "system");
 /* ---------- Formatting commands ---------- */
 function wrapSelection(before, after = before) {
   const changes = [];
-  const sel = view.state.selection;
-  const newRanges = [];
-  for (const r of sel.ranges) {
-    const text = view.state.doc.sliceString(r.from, r.to);
+  for (const r of view.state.selection.ranges) {
+    let from = r.from;
+    let to = r.to;
+    const text = view.state.doc.sliceString(from, to);
+    // Trim surrounding whitespace so the marks hug the content, not a trailing newline.
+    if (text.length) {
+      from += text.length - text.trimStart().length;
+      to -= text.length - text.trimEnd().length;
+      if (to < from) { from = r.from; to = r.from; }
+    }
     const outer = view.state.doc.sliceString(
-      Math.max(0, r.from - before.length),
-      Math.min(view.state.doc.length, r.to + after.length)
+      Math.max(0, from - before.length),
+      Math.min(view.state.doc.length, to + after.length)
     );
     const already =
-      outer.startsWith(before) && outer.endsWith(after) && r.from >= before.length;
+      text.trim().length > 0 &&
+      outer.startsWith(before) && outer.endsWith(after) && from >= before.length;
     if (already) {
       changes.push(
-        { from: r.from - before.length, to: r.from, insert: "" },
-        { from: r.to, to: r.to + after.length, insert: "" }
+        { from: from - before.length, to: from, insert: "" },
+        { from: to, to: to + after.length, insert: "" }
       );
-      newRanges.push({ from: r.from - before.length, to: r.to - before.length });
     } else {
-      changes.push(
-        { from: r.from, insert: before },
-        { from: r.to, insert: after }
-      );
-      newRanges.push({
-        from: r.from + before.length,
-        to: r.to + before.length + (r.empty ? 0 : 0),
-      });
+      changes.push({ from, insert: before }, { from: to, insert: after });
     }
   }
   view.dispatch({ changes });
@@ -285,6 +284,136 @@ function setHeading(level) {
   view.focus();
 }
 
+/* ---------- Line-oriented commands ---------- */
+function toggleLinePrefix(test, makePrefix) {
+  const sel = view.state.selection.main;
+  const startLine = view.state.doc.lineAt(sel.from);
+  const endLine = view.state.doc.lineAt(sel.to);
+  const lines = [];
+  for (let n = startLine.number; n <= endLine.number; n++) lines.push(view.state.doc.line(n));
+  const allHave = lines.every((l) => test.test(l.text));
+  const changes = [];
+  lines.forEach((l, i) => {
+    if (allHave) {
+      const m = l.text.match(test);
+      changes.push({ from: l.from, to: l.from + m[0].length, insert: "" });
+    } else {
+      changes.push({ from: l.from, insert: makePrefix(i) });
+    }
+  });
+  view.dispatch({ changes });
+  view.focus();
+}
+
+function freshLinePrefix(from) {
+  if (from === 0) return "";
+  const line = view.state.doc.lineAt(from);
+  return view.state.doc.sliceString(line.from, from).trim() === "" ? "" : "\n\n";
+}
+
+function insertCodeBlock() {
+  const sel = view.state.selection.main;
+  const selected = view.state.doc.sliceString(sel.from, sel.to);
+  const pre = freshLinePrefix(sel.from);
+  const block = pre + "```\n" + selected + "\n```\n";
+  view.dispatch({
+    changes: { from: sel.from, to: sel.to, insert: block },
+    selection: { anchor: sel.from + pre.length + 3 },
+  });
+  view.focus();
+}
+
+function insertTable() {
+  const sel = view.state.selection.main;
+  const pre = freshLinePrefix(sel.from);
+  const snippet = pre + "| Column | Column |\n| --- | --- |\n| Cell | Cell |\n";
+  view.dispatch({
+    changes: { from: sel.from, to: sel.to, insert: snippet },
+    selection: { anchor: sel.from + pre.length + 2 },
+  });
+  view.focus();
+}
+
+function insertHR() {
+  const sel = view.state.selection.main;
+  const pre = freshLinePrefix(sel.from);
+  const snippet = pre + "---\n";
+  view.dispatch({
+    changes: { from: sel.from, to: sel.to, insert: snippet },
+    selection: { anchor: sel.from + snippet.length },
+  });
+  view.focus();
+}
+
+/* ---------- Toolbar ---------- */
+const ICONS = {
+  code: '<svg viewBox="0 0 16 16"><path d="M5.5 4 2.5 8l3 4M10.5 4l3 4-3 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  link: '<svg viewBox="0 0 16 16"><path d="M6.3 9.7 9.7 6.3M7 4.6l1-1a2.7 2.7 0 0 1 3.8 3.8l-1 1M9 11.4l-1 1a2.7 2.7 0 0 1-3.8-3.8l1-1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
+  bullet: '<svg viewBox="0 0 16 16"><circle cx="3" cy="4.5" r="1.1" fill="currentColor"/><circle cx="3" cy="8" r="1.1" fill="currentColor"/><circle cx="3" cy="11.5" r="1.1" fill="currentColor"/><path d="M6.5 4.5h7M6.5 8h7M6.5 11.5h7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+  ordered: '<svg viewBox="0 0 16 16"><text x="1.2" y="5.6" font-size="5" fill="currentColor" font-family="sans-serif">1</text><text x="1.2" y="10" font-size="5" fill="currentColor" font-family="sans-serif">2</text><text x="1.2" y="14.2" font-size="5" fill="currentColor" font-family="sans-serif">3</text><path d="M6.5 4.5h7M6.5 8.4h7M6.5 12.3h7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+  task: '<svg viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="11" height="11" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 8.2l2 2 4-4.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  quote: '<svg viewBox="0 0 16 16"><path d="M3 5.5h3.2v3.2c0 1.6-1 2.7-2.7 3.1M9 5.5h3.2v3.2c0 1.6-1 2.7-2.7 3.1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  codeblock: '<svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M6 6.4 4.4 8 6 9.6M10 6.4 11.6 8 10 9.6" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  table: '<svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M2 6.5h12M2 9.8h12M6.5 3.2v9.6M10 3.2v9.6" stroke="currentColor" stroke-width="1"/></svg>',
+  hr: '<svg viewBox="0 0 16 16"><path d="M2.5 8h11" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+};
+
+const TOOLBAR_GROUPS = [
+  [
+    { t: "Heading 1  ⌘1", text: "H1", fn: () => setHeading(1) },
+    { t: "Heading 2  ⌘2", text: "H2", fn: () => setHeading(2) },
+    { t: "Heading 3  ⌘3", text: "H3", fn: () => setHeading(3) },
+  ],
+  [
+    { t: "Bold  ⌘B", text: "<b>B</b>", fn: () => applyFormat("bold") },
+    { t: "Italic  ⌘I", text: "<i>I</i>", fn: () => applyFormat("italic") },
+    { t: "Strikethrough  ⌘⇧X", text: "<s>S</s>", fn: () => applyFormat("strike") },
+    { t: "Inline code  ⌘E", svg: "code", fn: () => applyFormat("code") },
+    { t: "Link  ⌘K", svg: "link", fn: () => applyFormat("link") },
+  ],
+  [
+    { t: "Bullet list", svg: "bullet", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- ") },
+    { t: "Numbered list", svg: "ordered", fn: () => toggleLinePrefix(/^\s*\d+\. /, (i) => `${i + 1}. `) },
+    { t: "Task list", svg: "task", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] ") },
+    { t: "Quote", svg: "quote", fn: () => toggleLinePrefix(/^> ?/, () => "> ") },
+  ],
+  [
+    { t: "Code block", svg: "codeblock", fn: insertCodeBlock },
+    { t: "Table", svg: "table", fn: insertTable },
+    { t: "Divider", svg: "hr", fn: insertHR },
+  ],
+];
+
+function buildToolbar() {
+  const tb = document.getElementById("toolbar");
+  tb.innerHTML = "";
+  TOOLBAR_GROUPS.forEach((group, gi) => {
+    if (gi > 0) {
+      const div = document.createElement("span");
+      div.className = "tb-divider";
+      tb.appendChild(div);
+    }
+    for (const b of group) {
+      const btn = document.createElement("button");
+      btn.className = "tb-btn";
+      btn.title = b.t;
+      btn.setAttribute("aria-label", b.t);
+      btn.innerHTML = b.svg ? ICONS[b.svg] : `<span class="tb-text">${b.text}</span>`;
+      btn.addEventListener("mousedown", (e) => e.preventDefault()); // keep editor selection
+      btn.addEventListener("click", b.fn);
+      tb.appendChild(btn);
+    }
+  });
+}
+
+function applyToolbar(visible) {
+  document.getElementById("toolbar").classList.toggle("hidden", !visible);
+  localStorage.setItem("plume-toolbar", visible ? "1" : "0");
+}
+
+buildToolbar();
+applyToolbar(localStorage.getItem("plume-toolbar") !== "0");
+
 /* ---------- Menu + IPC wiring ---------- */
 window.plume.onOpenFile(({ filePath, content, recovery }) => loadDocument(content, filePath, recovery));
 
@@ -298,6 +427,7 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:format": applyFormat(args[0]); break;
     case "menu:heading": setHeading(args[0]); break;
     case "menu:toggleOutline": toggleOutline(); break;
+    case "menu:toggleToolbar": applyToolbar(document.getElementById("toolbar").classList.contains("hidden")); break;
     case "menu:toggleMode": appEl.classList.toggle("source-mode"); break;
     case "menu:theme": applyTheme(args[0]); break;
   }

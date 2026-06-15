@@ -10,7 +10,7 @@ contextBridge.exposeInMainWorld("plume", {
     const channels = [
       "menu:open", "menu:save", "menu:saveAs", "menu:find", "menu:replace",
       "menu:format", "menu:heading", "menu:toggleOutline", "menu:toggleMode",
-      "menu:theme",
+      "menu:theme", "menu:toggleToolbar",
     ];
     channels.forEach((ch) =>
       ipcRenderer.on(ch, (_e, ...args) => cb(ch, ...args))

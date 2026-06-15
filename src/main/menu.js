@@ -74,6 +74,7 @@ function buildMenu({ createWindow }) {
     {
       label: "View",
       submenu: [
+        { label: "Toggle Toolbar", accelerator: "CmdOrCtrl+Shift+T", click: () => send("menu:toggleToolbar") },
         { label: "Toggle Outline", accelerator: "CmdOrCtrl+Shift+O", click: () => send("menu:toggleOutline") },
         { label: "Toggle Source / Preview", accelerator: "CmdOrCtrl+/", click: () => send("menu:toggleMode") },
         { type: "separator" },
