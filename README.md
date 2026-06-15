@@ -19,7 +19,7 @@ Built on Electron + CodeMirror 6.
 - **Light / dark / system** themes
 - **Font picker** — Inter (default), System (SF Pro), New York, Charter, Iowan, JetBrains Mono
 - **Hidden Markdown marks** — `#`, `*`, etc. stay out of sight even on the line you're editing (bullets render as `•`); toggle raw syntax back with View ▸ Reveal Marks (⌘⇧M)
-- **Formatting toolbar** — one-click headings, bold/italic/strike/code/link, lists, quote, code block, table, divider
+- **Formatting toolbar** — one-click headings, bold/italic/strike/code/link, lists, quote, code block, table, divider, image alt text, and copy-for-Google-Docs
 - Opens via Finder "Open With", registers as a default `.md` handler
 - Reload/crash-resilient (re-opens the document on renderer reload)
 
@@ -46,7 +46,7 @@ Plume detects the file type and renders it appropriately — ideal for living ne
 ### Daily driver, sharing & writing
 
 - **Folder sidebar** (⌘⇧E) — browse the open file's folder and switch files in place.
-- **Command palette** (⌘K) — fuzzy file quick-open + every command; type `>` to filter commands.
+- **Command palette** (⌘P) — fuzzy file quick-open + every command; type `>` to filter commands.
 - **Search in folder** (⌘⇧F) — grep across the folder, click a hit to jump to the file and line.
 - **Share-out** — *Copy as Rich Text* (⌘⇧C, paste formatted into Mail/Slack/Docs) and *Copy as HTML*; **Export** to PDF, HTML, and Word (`.docx`).
 - **Image paste/drop** — paste or drop an image and it's saved beside the file with a relative link.

@@ -571,6 +571,39 @@ function insertHR() {
   view.focus();
 }
 
+// Edit (or add) an image's alt text. If the cursor's line already has an image,
+// select its alt so you can type; otherwise insert a new image template.
+function editImageAlt() {
+  const line = view.state.doc.lineAt(view.state.selection.main.head);
+  const m = /!\[([^\]]*)\]\([^)]*\)/.exec(line.text);
+  if (m) {
+    const altFrom = line.from + m.index + 2;
+    const altTo = altFrom + m[1].length;
+    view.dispatch({ selection: { anchor: altFrom, head: altTo } });
+    view.focus();
+    flashMessage(m[1] ? "Editing alt text — type to replace it" : "Type the image's alt text (for accessibility)");
+    return;
+  }
+  const r = view.state.selection.main;
+  const snippet = "![alt text](url)";
+  view.dispatch({ changes: { from: r.from, to: r.to, insert: snippet }, selection: { anchor: r.from + 2, head: r.from + 10 } });
+  view.focus();
+}
+
+// Copy the document (or selection) as rich text, ready to paste into a Google Doc.
+async function copyForGoogleDocs() {
+  const src = selectionOrDoc();
+  try {
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "text/html": new Blob([mdToHtml(src)], { type: "text/html" }),
+        "text/plain": new Blob([src], { type: "text/plain" }),
+      }),
+    ]);
+    flashMessage("Copied — open a Google Doc and paste (⌘V)");
+  } catch (e) { flashMessage("Copy failed: " + e.message); }
+}
+
 /* ---------- Toolbar ---------- */
 const ICONS = {
   code: '<svg viewBox="0 0 16 16"><path d="M5.5 4 2.5 8l3 4M10.5 4l3 4-3 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
@@ -582,6 +615,8 @@ const ICONS = {
   codeblock: '<svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M6 6.4 4.4 8 6 9.6M10 6.4 11.6 8 10 9.6" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   table: '<svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M2 6.5h12M2 9.8h12M6.5 3.2v9.6M10 3.2v9.6" stroke="currentColor" stroke-width="1"/></svg>',
   hr: '<svg viewBox="0 0 16 16"><path d="M2.5 8h11" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+  image: '<svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"/><circle cx="5.6" cy="6.4" r="1.1" fill="currentColor"/><path d="M3 12l3.3-3 2.2 2 2.1-2.4L14 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>',
+  gdocs: '<svg viewBox="0 0 16 16"><path d="M4 1.6h4.6L12 5v8.9a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5V2.1a.5.5 0 0 1 .5-.5z" fill="none" stroke="#4285F4" stroke-width="1.2" stroke-linejoin="round"/><path d="M8.4 1.7v3.1h3.1" fill="none" stroke="#4285F4" stroke-width="1.2"/><path d="M5.6 7.7h4.8M5.6 9.6h4.8M5.6 11.5h3.4" stroke="#4285F4" stroke-width="1" stroke-linecap="round"/></svg>',
 };
 
 const TOOLBAR_GROUPS = [
@@ -607,6 +642,10 @@ const TOOLBAR_GROUPS = [
     { t: "Code block", svg: "codeblock", fn: insertCodeBlock },
     { t: "Table", svg: "table", fn: insertTable },
     { t: "Divider", svg: "hr", fn: insertHR },
+  ],
+  [
+    { t: "Image alt text", svg: "image", fn: editImageAlt },
+    { t: "Copy for Google Docs", svg: "gdocs", fn: copyForGoogleDocs },
   ],
 ];
 
@@ -775,6 +814,7 @@ const COMMANDS = [
   { label: "Toggle Outline", run: toggleOutline },
   { label: "Search in Folder", run: () => openSearch() },
   { label: "Copy as Rich Text", run: copyAsRichText },
+  { label: "Copy for Google Docs", run: copyForGoogleDocs },
   { label: "Export to PDF", run: () => exportAs("pdf") },
   { label: "Export to HTML", run: () => exportAs("html") },
   { label: "Export to Word (.docx)", run: () => exportAs("docx") },
