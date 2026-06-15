@@ -449,7 +449,9 @@ function buildDecorations(state) {
       }
       if (name === "ListMark") {
         const txt = state.doc.sliceString(node.from, node.to);
-        if (/^[-*+]$/.test(txt) && shouldConceal(onActive)) {
+        // Only turn "-" into a bullet for a real item ("- x"), not a bare dash.
+        const followedBySpace = state.doc.sliceString(node.to, node.to + 1) === " ";
+        if (/^[-*+]$/.test(txt) && followedBySpace && shouldConceal(onActive)) {
           ranges.push(Decoration.replace({ widget: new BulletWidget() }).range(node.from, node.to));
         } else {
           ranges.push(markDeco("tok-list-bullet").range(node.from, node.to));
@@ -526,18 +528,14 @@ const linkClicker = EditorView.domEventHandlers({
 /* ---------- List hanging indent (wrapped lines align under the text) ---------- */
 const LIST_PREFIX = /^(\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)/;
 
-// Approximate width of each prefix character in units of the average glyph.
-function prefixCols(prefix) {
-  let cols = 0;
-  for (const ch of prefix) {
-    if (ch === " ") cols += 0.5;
-    else if (ch === "." || ch === ")") cols += 0.5;
-    else if (ch === "[" || ch === "]") cols += 0.55;
-    else if (/\d/.test(ch)) cols += 1.0;
-    else if (/[-*+]/.test(ch)) cols += 1.0; // rendered as a bullet
-    else cols += 0.9; // x / other
-  }
-  return cols;
+// Measure the actual rendered width of a list prefix in the editor font, so the
+// hanging indent aligns exactly (bullets render as "•", ordered keep "1.", etc.).
+const _measureCtx = document.createElement("canvas").getContext("2d");
+function measurePrefixWidth(view, prefix) {
+  const cs = getComputedStyle(view.contentDOM);
+  _measureCtx.font = `${cs.fontSize} ${cs.fontFamily}`;
+  const visible = prefix.replace(/^(\s*)[-*+]/, "$1•"); // bullet markers render as •
+  return _measureCtx.measureText(visible).width;
 }
 
 function buildListIndent(view) {
@@ -557,10 +555,7 @@ function buildListIndent(view) {
           if (/Code|Fenced/.test(n.name)) break;
         }
         if (isList) {
-          // Estimate the rendered prefix width per character (digits/markers are
-          // ~1 average glyph; spaces, dots, and brackets are narrower). Scaled by
-          // the editor's measured average char width, so it adapts to the font.
-          const indent = Math.round(prefixCols(m[1]) * view.defaultCharacterWidth);
+          const indent = Math.round(measurePrefixWidth(view, m[1]));
           if (indent > 0) {
             ranges.push(
               Decoration.line({ attributes: { style: `padding-left:${indent}px;text-indent:-${indent}px` } }).range(line.from)
