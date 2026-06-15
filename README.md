@@ -20,6 +20,15 @@ Built on Electron + CodeMirror 6.
 - Opens via Finder "Open With", registers as a default `.md` handler
 - Reload/crash-resilient (re-opens the document on renderer reload)
 
+### Phase 2
+
+- **Per-language syntax highlighting** inside code fences (JS/TS, Python, Bash, JSON, CSS, HTML, SQL, YAML, Rust, Go, C/C++, Java, PHP, XML)
+- **Live-rendered tables** with column alignment and inline markdown in cells
+- **KaTeX math** — inline `$…$` and display `$$…$$`, with a conservative heuristic that leaves currency (`$5`) and shell vars (`$HOME`) as literal text
+- **Mermaid diagrams** (theme-aware) rendered from ` ```mermaid ` fences
+- **Inline image preview** with relative-path resolution
+- **Autosave** to disk on idle, plus **crash recovery** with a restore banner
+
 ## Develop
 
 ```bash
@@ -37,13 +46,11 @@ npm run dist       # → release/mac-arm64/Plume.app
 Then drag `Plume.app` to `/Applications`, and set it as the default for `.md`:
 right-click any `.md` → Get Info → Open with → Plume → Change All.
 
-## Roadmap (phase 2)
+## Roadmap
 
-- Inline tables with live column editing
-- KaTeX math, Mermaid diagrams
-- Per-language syntax highlighting inside code fences
-- Inline image rendering
+- Live table cell editing (edit a rendered cell in place)
 - Reshell in Tauri for a ~10 MB instant-launch native binary
+- Per-document settings (front-matter driven)
 
 ## License
 
