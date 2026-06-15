@@ -299,6 +299,42 @@ ipcMain.handle("file:openInNewWindow", async (event, { filePath }) => {
   createWindow(filePath);
 });
 
+ipcMain.handle("doc:export", async (event, { format, html, defaultName }) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const ext = format === "pdf" ? "pdf" : format === "docx" ? "docx" : "html";
+  const res = await dialog.showSaveDialog(win, {
+    defaultPath: `${defaultName || "document"}.${ext}`,
+    filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+  });
+  if (res.canceled || !res.filePath) return null;
+  const target = res.filePath;
+  try {
+    if (format === "pdf") {
+      const tmp = path.join(app.getPath("temp"), `plume-export-${Date.now()}.html`);
+      await fs.writeFile(tmp, html, "utf8");
+      const pdfWin = new BrowserWindow({ show: false });
+      await pdfWin.loadFile(tmp);
+      const data = await pdfWin.webContents.printToPDF({
+        printBackground: true,
+        margins: { top: 0.5, bottom: 0.5, left: 0.5, right: 0.5 },
+      });
+      await fs.writeFile(target, data);
+      pdfWin.destroy();
+      fs.unlink(tmp).catch(() => {});
+    } else if (format === "docx") {
+      const htmlToDocx = require("html-to-docx");
+      const buf = await htmlToDocx(html);
+      await fs.writeFile(target, Buffer.from(buf));
+    } else {
+      await fs.writeFile(target, html, "utf8");
+    }
+    return target;
+  } catch (err) {
+    dialog.showMessageBox(win, { type: "error", message: "Export failed", detail: err.message });
+    return null;
+  }
+});
+
 // ---------- App lifecycle ----------
 
 app.on("open-file", (event, filePath) => {

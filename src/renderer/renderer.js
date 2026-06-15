@@ -15,6 +15,7 @@ import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, refreshEffect
 import { modeForPath, languageForExt, codeFeatures, extOf, baseName } from "./editor/modes.js";
 import { diffDecorations, logDecorations } from "./editor/decorators.js";
 import { renderJsonl, renderCsv } from "./editor/viewers.js";
+import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
 import "@fontsource-variable/inter/index.css";
 import "@fontsource/jetbrains-mono/400.css";
@@ -229,6 +230,38 @@ function flashMessage(text) {
   ok.className = "ghost";
   ok.onclick = () => { clearBanner(); view.focus(); };
   bannerEl.append(msg, ok);
+}
+
+/* ---------- Share-out: copy as / export ---------- */
+function docBaseName() {
+  return currentPath ? currentPath.split("/").pop().replace(/\.[^.]+$/, "") : "Untitled";
+}
+function selectionOrDoc() {
+  const r = view.state.selection.main;
+  return r.empty ? view.state.doc.toString() : view.state.doc.sliceString(r.from, r.to);
+}
+async function copyAsRichText() {
+  const src = selectionOrDoc();
+  try {
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "text/html": new Blob([mdToHtml(src)], { type: "text/html" }),
+        "text/plain": new Blob([src], { type: "text/plain" }),
+      }),
+    ]);
+    flashMessage("Copied as rich text — paste into Mail, Slack, Docs…");
+  } catch (e) { flashMessage("Copy failed: " + e.message); }
+}
+async function copyAsHtml() {
+  try {
+    await navigator.clipboard.writeText(mdToHtml(selectionOrDoc()));
+    flashMessage("Copied HTML source");
+  } catch (e) { flashMessage("Copy failed: " + e.message); }
+}
+async function exportAs(format) {
+  const html = fullHtmlDocument(mdToHtml(view.state.doc.toString()), docBaseName());
+  const result = await window.plume.exportDoc(format, html, docBaseName());
+  if (result) flashMessage("Exported " + result.split("/").pop());
 }
 
 /* ---------- File I/O ---------- */
@@ -649,6 +682,9 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:toggleToolbar": applyToolbar(document.getElementById("toolbar").classList.contains("hidden")); break;
     case "menu:toggleReveal": applyReveal(localStorage.getItem("plume-reveal") !== "1"); break;
     case "menu:formatDoc": formatDocument(); break;
+    case "menu:copyRich": copyAsRichText(); break;
+    case "menu:copyHtml": copyAsHtml(); break;
+    case "menu:export": exportAs(args[0]); break;
     case "menu:toggleMode": toggleSourceView(); break;
     case "menu:theme": applyTheme(args[0]); break;
   }
