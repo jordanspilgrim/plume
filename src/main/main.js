@@ -378,6 +378,77 @@ ipcMain.handle("image:save", async (event, { bytes, ext }) => {
   }
 });
 
+ipcMain.handle("image:pick", async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const state = windowState.get(win.id);
+  const res = await dialog.showOpenDialog(win, {
+    properties: ["openFile"],
+    filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "heic", "tiff"] }],
+  });
+  if (res.canceled || !res.filePaths.length) return null;
+  if (!state?.filePath) return { error: "unsaved" };
+  try {
+    const src = res.filePaths[0];
+    const dir = path.join(path.dirname(state.filePath), "assets");
+    await fs.mkdir(dir, { recursive: true });
+    const name = `image-${Date.now()}${path.extname(src) || ".png"}`;
+    await fs.copyFile(src, path.join(dir, name));
+    return { rel: `assets/${name}` };
+  } catch (err) {
+    dialog.showMessageBox(win, { type: "error", message: "Couldn't add image", detail: err.message });
+    return null;
+  }
+});
+
+function decodeEntities(s) {
+  return (s || "")
+    .replace(/&(#x?[0-9a-f]+|\w+);/gi, (m, e) => {
+      const named = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", "#39": "'", nbsp: " " };
+      if (named[e]) return named[e];
+      if (e[0] === "#") {
+        const code = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+        return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+      }
+      return m;
+    });
+}
+
+const previewCache = new Map();
+ipcMain.handle("link:preview", async (_e, { url }) => {
+  if (!/^https?:\/\//i.test(url)) return null;
+  if (previewCache.has(url)) return previewCache.get(url);
+  try {
+    const res = await fetch(url, {
+      redirect: "follow",
+      headers: { "user-agent": "Mozilla/5.0 (Macintosh) Plume/1.0", accept: "text/html,*/*" },
+      signal: AbortSignal.timeout(6000),
+    });
+    const host = new URL(res.url || url).hostname.replace(/^www\./, "");
+    const ct = res.headers.get("content-type") || "";
+    const cache = (r) => { if (previewCache.size > 300) previewCache.clear(); previewCache.set(url, r); return r; };
+    if (ct.startsWith("image/")) return cache({ isImage: true, image: res.url || url, title: host, site: host });
+    if (!ct.includes("html")) return cache({ title: host, description: "", image: "", site: host });
+    const html = (await res.text()).slice(0, 600000);
+    const meta = (prop) => {
+      const re = new RegExp(`<meta[^>]+(?:property|name)=["']${prop}["'][^>]+content=["']([^"']*)["']`, "i");
+      const re2 = new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:property|name)=["']${prop}["']`, "i");
+      const m = html.match(re) || html.match(re2);
+      return m ? decodeEntities(m[1]) : "";
+    };
+    const titleTag = (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || "";
+    let image = meta("og:image") || meta("twitter:image");
+    if (image && !/^https?:/i.test(image)) { try { image = new URL(image, res.url || url).href; } catch { image = ""; } }
+    return cache({
+      title: meta("og:title") || decodeEntities(titleTag).trim() || host,
+      description: meta("og:description") || meta("description") || "",
+      image,
+      site: meta("og:site_name") || host,
+    });
+  } catch {
+    return null;
+  }
+});
+
 ipcMain.handle("doc:export", async (event, { format, html, defaultName }) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   const ext = format === "pdf" ? "pdf" : format === "docx" ? "docx" : "html";

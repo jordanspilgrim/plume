@@ -31,6 +31,8 @@ contextBridge.exposeInMainWorld("plume", {
   exportDoc: (format, html, defaultName) =>
     ipcRenderer.invoke("doc:export", { format, html, defaultName }),
   saveImage: (bytes, ext) => ipcRenderer.invoke("image:save", { bytes, ext }),
+  pickImage: () => ipcRenderer.invoke("image:pick"),
+  linkPreview: (url) => ipcRenderer.invoke("link:preview", { url }),
   listDir: (dir, depth) => ipcRenderer.invoke("dir:list", { dir, depth }),
   searchFiles: (dir, query) => ipcRenderer.invoke("search:files", { dir, query }),
   openInThisWindow: (filePath, gotoLine) =>

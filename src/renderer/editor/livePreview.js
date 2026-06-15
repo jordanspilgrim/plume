@@ -126,6 +126,55 @@ class BulletWidget extends WidgetType {
   toDOM() { const s = document.createElement("span"); s.className = "tok-bullet"; s.textContent = "•"; return s; }
 }
 
+function urlHost(url) { try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return url; } }
+
+class LinkCardWidget extends WidgetType {
+  constructor(url) { super(); this.url = url; }
+  eq(o) { return o.url === this.url; }
+  toDOM() {
+    const host = urlHost(this.url);
+    const card = document.createElement("a");
+    card.className = "tok-linkcard";
+    card.href = this.url;
+    card.onclick = (e) => { e.preventDefault(); window.plume.openExternal(this.url); };
+    const body = document.createElement("div");
+    body.className = "lc-body";
+    body.innerHTML = "";
+    const title = document.createElement("div"); title.className = "lc-title"; title.textContent = host;
+    const desc = document.createElement("div"); desc.className = "lc-desc"; desc.textContent = "Loading preview…";
+    body.append(title, desc);
+    card.appendChild(body);
+    window.plume.linkPreview(this.url).then((meta) => {
+      card.innerHTML = "";
+      if (meta && meta.isImage) {
+        card.classList.add("lc-isimage");
+        const img = document.createElement("img");
+        img.className = "lc-fullimg";
+        img.src = meta.image; img.alt = "";
+        img.onerror = () => { card.textContent = urlHost(this.url); };
+        card.appendChild(img);
+        return;
+      }
+      if (meta && meta.image) {
+        const thumb = document.createElement("div"); thumb.className = "lc-thumb";
+        const img = document.createElement("img"); img.src = meta.image; img.alt = "";
+        img.onerror = () => thumb.remove();
+        thumb.appendChild(img);
+        card.appendChild(thumb);
+      }
+      const b = document.createElement("div"); b.className = "lc-body";
+      const t = document.createElement("div"); t.className = "lc-title"; t.textContent = (meta && meta.title) || host;
+      b.appendChild(t);
+      if (meta && meta.description) { const d = document.createElement("div"); d.className = "lc-desc"; d.textContent = meta.description; b.appendChild(d); }
+      const s = document.createElement("div"); s.className = "lc-site"; s.textContent = (meta && meta.site) || host;
+      b.appendChild(s);
+      card.appendChild(b);
+    }).catch(() => {});
+    return card;
+  }
+  ignoreEvent() { return false; }
+}
+
 const CALLOUT_LABELS = {
   note: ["ⓘ", "Note"], tip: ["✦", "Tip"], important: ["❗", "Important"],
   warning: ["⚠", "Warning"], caution: ["⚑", "Caution"], info: ["ⓘ", "Info"],
@@ -297,6 +346,15 @@ function fenceLang(state, node) {
   const m = first.match(/^\s*(?:`{3,}|~{3,})\s*([\w+#-]+)/);
   return m ? m[1].toLowerCase() : "";
 }
+// A line that is just a Markdown link or a bare URL (not an image — those start with "!").
+function parseLoneLink(text) {
+  let m = text.match(/^\[([^\]]*)\]\(([^)\s]+)\)$/);
+  if (m) return { label: m[1], url: m[2] };
+  m = text.match(/^<?(https?:\/\/[^\s>]+)>?$/);
+  if (m) return { label: "", url: m[1] };
+  return null;
+}
+const IMAGE_URL_RE = /\.(png|jpe?g|gif|webp|svg|bmp|avif)(\?|#|$)/i;
 function fenceBody(state, node) {
   const lines = state.sliceDoc(node.from, node.to).split("\n");
   if (lines.length && /^\s*(`{3,}|~{3,})/.test(lines[0])) lines.shift();
@@ -361,6 +419,23 @@ function buildDecorations(state) {
   tree.iterate({
     enter: (node) => {
       const name = node.name;
+
+      // ----- A line that is just a link/URL → inline image or link-preview card -----
+      if (name === "Paragraph" && !rangeActive(state, node.from, node.to)) {
+        const lk = parseLoneLink(state.sliceDoc(node.from, node.to).trim());
+        if (lk) {
+          if (IMAGE_URL_RE.test(lk.url)) {
+            const url = resolveSrc(state, lk.url);
+            if (url) {
+              ranges.push(Decoration.replace({ widget: new ImageWidget(url, lk.label || ""), block: true }).range(node.from, node.to));
+              return false;
+            }
+          } else if (/^https?:\/\//i.test(lk.url)) {
+            ranges.push(Decoration.replace({ widget: new LinkCardWidget(lk.url), block: true }).range(node.from, node.to));
+            return false;
+          }
+        }
+      }
 
       // ----- Block widgets (tables, mermaid) -----
       if (name === "Table") {

@@ -49,7 +49,8 @@ Plume detects the file type and renders it appropriately — ideal for living ne
 - **Command palette** (⌘P) — fuzzy file quick-open + every command; type `>` to filter commands.
 - **Search in folder** (⌘⇧F) — grep across the folder, click a hit to jump to the file and line.
 - **Share-out** — *Copy as Rich Text* (⌘⇧C, paste formatted into Mail/Slack/Docs) and *Copy as HTML*; **Export** to PDF, HTML, and Word (`.docx`).
-- **Image paste/drop** — paste or drop an image and it's saved beside the file with a relative link.
+- **Images** — paste, drop, or pick an image (toolbar) and it's saved beside the file with a relative link; the toolbar image button also edits an existing image's alt text.
+- **Link previews** — a line that's just a link or URL renders as a card (title/description/site, fetched from the page); if the URL is an image, it displays inline.
 - **Writer tools** — live word count + reading time, `==highlight==`, `> [!NOTE]` callouts, and **Focus mode** (⌘⇧L) that dims everything but the current paragraph.
 
 ## Develop

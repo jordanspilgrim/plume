@@ -584,10 +584,20 @@ function editImageAlt() {
     flashMessage(m[1] ? "Editing alt text — type to replace it" : "Type the image's alt text (for accessibility)");
     return;
   }
-  const r = view.state.selection.main;
-  const snippet = "![alt text](url)";
-  view.dispatch({ changes: { from: r.from, to: r.to, insert: snippet }, selection: { anchor: r.from + 2, head: r.from + 10 } });
-  view.focus();
+  insertImageViaPicker();
+}
+
+async function insertImageViaPicker() {
+  if (!currentPath) { flashMessage("Save the file first to add images."); return; }
+  const res = await window.plume.pickImage();
+  if (res?.error === "unsaved") { flashMessage("Save the file first to add images."); return; }
+  if (res?.rel) {
+    const r = view.state.selection.main;
+    const snippet = `![](${res.rel})`;
+    view.dispatch({ changes: { from: r.from, to: r.to, insert: snippet }, selection: { anchor: r.from + 2 } });
+    view.focus();
+    flashMessage("Inserted " + res.rel);
+  }
 }
 
 // Copy the document (or selection) as rich text, ready to paste into a Google Doc.
