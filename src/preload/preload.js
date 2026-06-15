@@ -14,7 +14,7 @@ contextBridge.exposeInMainWorld("plume", {
       "menu:format", "menu:heading", "menu:toggleOutline", "menu:toggleMode",
       "menu:theme", "menu:toggleToolbar", "menu:toggleReveal", "menu:formatDoc",
       "menu:copyRich", "menu:copyHtml", "menu:export",
-      "menu:toggleSidebar", "menu:palette", "menu:searchFolder",
+      "menu:toggleSidebar", "menu:palette", "menu:searchFolder", "menu:toggleFocus",
     ];
     channels.forEach((ch) =>
       ipcRenderer.on(ch, (_e, ...args) => cb(ch, ...args))

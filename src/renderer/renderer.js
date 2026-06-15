@@ -11,7 +11,7 @@ import {
 } from "@codemirror/search";
 import { syntaxTree, syntaxHighlighting } from "@codemirror/language";
 import { codeLanguages, codeHighlightStyle } from "./editor/highlight.js";
-import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, refreshEffect, renderMermaidInto } from "./editor/livePreview.js";
+import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, setFocusMode, refreshEffect, renderMermaidInto, Highlight } from "./editor/livePreview.js";
 import { modeForPath, languageForExt, codeFeatures, extOf, baseName } from "./editor/modes.js";
 import { diffDecorations, logDecorations } from "./editor/decorators.js";
 import { renderJsonl, renderCsv } from "./editor/viewers.js";
@@ -28,6 +28,23 @@ const appEl = document.getElementById("app");
 const titlebar = document.getElementById("titlebar");
 const titlebarName = document.getElementById("titlebar-name");
 const outlineEl = document.getElementById("outline");
+const statusEl = document.getElementById("statusbar");
+
+function updateStatus() {
+  const sel = view.state.selection.main;
+  const scope = sel.empty ? view.state.doc.toString() : view.state.doc.sliceString(sel.from, sel.to);
+  const parts = [];
+  if (currentMode === "markdown") {
+    const words = (scope.match(/\S+/g) || []).length;
+    if (!sel.empty) parts.push("selection");
+    parts.push(`${words.toLocaleString()} word${words === 1 ? "" : "s"}`);
+    parts.push(`~${Math.max(1, Math.round(words / 200))} min read`);
+  } else {
+    parts.push(`${view.state.doc.lines.toLocaleString()} lines`);
+    parts.push(`${view.state.doc.length.toLocaleString()} chars`);
+  }
+  statusEl.textContent = parts.join("  ·  ");
+}
 
 /* ---------- Editor ---------- */
 // Compartments let us swap language + features per file type without rebuilding the editor.
@@ -36,13 +53,12 @@ const previewConf = new Compartment();
 const codeConf = new Compartment();
 
 function markdownLang() {
-  return markdown({ base: markdownLanguage, extensions: [GFM], codeLanguages, addKeymap: true });
+  return markdown({ base: markdownLanguage, extensions: [GFM, Highlight], codeLanguages, addKeymap: true });
 }
 
 const updateListener = EditorView.updateListener.of((u) => {
-  if (u.docChanged) {
-    scheduleSideEffects();
-  }
+  if (u.docChanged) scheduleSideEffects();
+  if (u.selectionSet) updateStatus();
 });
 
 const view = new EditorView({
@@ -90,6 +106,7 @@ function scheduleSideEffects() {
     const text = view.state.doc.toString();
     setDirty(text !== savedText);
     renderOutline();
+    updateStatus();
   }, 120);
 
   // Crash-recovery snapshot (path-backed docs only; main ignores untitled).
@@ -276,6 +293,7 @@ function loadDocument(content, filePath, recovery, gotoLine) {
   setTitle(filePath);
   setDirty(false);
   renderOutline();
+  updateStatus();
   if (isRenderMode()) renderCurrent();
   if (recovery != null) showRecoveryBanner(recovery);
   else clearBanner();
@@ -664,10 +682,18 @@ function applyReveal(reveal) {
   view.dispatch({ effects: refreshEffect.of(null) });
 }
 
+function applyFocus(on) {
+  setFocusMode(on);
+  appEl.classList.toggle("focus-mode", on);
+  localStorage.setItem("plume-focus", on ? "1" : "0");
+  view.dispatch({ effects: refreshEffect.of(null) });
+}
+
 applyFont(localStorage.getItem("plume-font") || "inter");
 buildToolbar();
 applyToolbar(localStorage.getItem("plume-toolbar") !== "0");
 applyReveal(localStorage.getItem("plume-reveal") === "1");
+applyFocus(localStorage.getItem("plume-focus") === "1");
 viewToggle.addEventListener("click", toggleSourceView);
 
 /* ---------- Image paste / drop ---------- */
@@ -757,6 +783,7 @@ const COMMANDS = [
   { label: "Appearance: Light", run: () => applyTheme("light") },
   { label: "Appearance: System", run: () => applyTheme("system") },
   { label: "Reveal Markdown Marks While Editing", run: () => applyReveal(localStorage.getItem("plume-reveal") !== "1") },
+  { label: "Toggle Focus Mode", run: () => applyFocus(localStorage.getItem("plume-focus") !== "1") },
 ];
 function flattenFiles(tree, acc = []) {
   for (const n of tree) { if (n.type === "file") acc.push(n); else flattenFiles(n.children || [], acc); }
@@ -865,6 +892,7 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:searchFolder": openSearch(); break;
     case "menu:toggleToolbar": applyToolbar(document.getElementById("toolbar").classList.contains("hidden")); break;
     case "menu:toggleReveal": applyReveal(localStorage.getItem("plume-reveal") !== "1"); break;
+    case "menu:toggleFocus": applyFocus(localStorage.getItem("plume-focus") !== "1"); break;
     case "menu:formatDoc": formatDocument(); break;
     case "menu:copyRich": copyAsRichText(); break;
     case "menu:copyHtml": copyAsHtml(); break;
@@ -877,4 +905,4 @@ window.plume.onMenu((channel, ...args) => {
 setTitle(null);
 
 // Automation surface (used for scripting / testing the UI).
-window.__plume = { toggleSidebar, openPalette, openSearch, refreshSidebar, exportAs, copyAsRichText };
+window.__plume = { toggleSidebar, openPalette, openSearch, refreshSidebar, exportAs, copyAsRichText, applyFocus };

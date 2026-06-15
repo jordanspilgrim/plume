@@ -79,6 +79,26 @@ let revealMarksWhenEditing = false;
 export function setRevealMarks(v) { revealMarksWhenEditing = v; }
 function shouldConceal(onActive) { return !(revealMarksWhenEditing && onActive); }
 
+/* Focus mode dims everything but the paragraph you're in. */
+let focusMode = false;
+export function setFocusMode(v) { focusMode = v; }
+
+/* `==highlight==` inline mark (a small @lezer/markdown delimiter extension). */
+const HighlightDelim = { resolve: "Highlight", mark: "HighlightMark" };
+export const Highlight = {
+  defineNodes: ["Highlight", "HighlightMark"],
+  parseInline: [{
+    name: "Highlight",
+    parse(cx, next, pos) {
+      if (next !== 61 /* = */ || cx.char(pos + 1) !== 61 || cx.char(pos + 2) === 61) return -1;
+      return cx.addDelimiter(HighlightDelim, pos, pos + 2, true, true);
+    },
+    after: "Emphasis",
+  }],
+};
+
+const CALLOUT_RE = /^>\s*\[!(\w+)\]/;
+
 /* ---------- Widgets ---------- */
 
 class CheckboxWidget extends WidgetType {
@@ -104,6 +124,23 @@ class RuleWidget extends WidgetType {
 class BulletWidget extends WidgetType {
   eq() { return true; }
   toDOM() { const s = document.createElement("span"); s.className = "tok-bullet"; s.textContent = "•"; return s; }
+}
+
+const CALLOUT_LABELS = {
+  note: ["ⓘ", "Note"], tip: ["✦", "Tip"], important: ["❗", "Important"],
+  warning: ["⚠", "Warning"], caution: ["⚑", "Caution"], info: ["ⓘ", "Info"],
+  success: ["✓", "Success"], danger: ["⚠", "Danger"], question: ["?", "Question"],
+};
+class CalloutWidget extends WidgetType {
+  constructor(type) { super(); this.type = type; }
+  eq(o) { return o.type === this.type; }
+  toDOM() {
+    const [icon, label] = CALLOUT_LABELS[this.type] || ["ⓘ", this.type.replace(/^\w/, (c) => c.toUpperCase())];
+    const el = document.createElement("span");
+    el.className = "tok-callout-label";
+    el.textContent = `${icon} ${label}`;
+    return el;
+  }
 }
 
 class ImageWidget extends WidgetType {
@@ -220,6 +257,7 @@ const HEADING_LINE = {
 const INLINE_STYLE = {
   StrongEmphasis: "tok-strong", Emphasis: "tok-emphasis",
   Strikethrough: "tok-strike", InlineCode: "tok-inline-code",
+  Highlight: "tok-highlight",
 };
 
 function activeLineSet(state) {
@@ -361,7 +399,23 @@ function buildDecorations(state) {
 
       // ----- Block line styling -----
       if (HEADING_LINE[name]) { addLineClasses(ranges, state, node.from, node.from, HEADING_LINE[name]); return; }
-      if (name === "Blockquote") { addLineClasses(ranges, state, node.from, node.to, "tok-quote"); return; }
+      if (name === "Blockquote") {
+        const first = state.doc.lineAt(node.from);
+        const cm = CALLOUT_RE.exec(first.text);
+        if (cm) {
+          const type = cm[1].toLowerCase();
+          addLineClasses(ranges, state, node.from, node.to, `tok-callout tok-cal-${type}`);
+          if (shouldConceal(active.has(first.number))) {
+            const br = first.text.indexOf("[");
+            ranges.push(
+              Decoration.replace({ widget: new CalloutWidget(type) }).range(first.from + br, first.from + cm[0].length)
+            );
+          }
+          return; // descend so QuoteMark on each line is concealed
+        }
+        addLineClasses(ranges, state, node.from, node.to, "tok-quote");
+        return;
+      }
 
       // ----- Inline styling -----
       if (INLINE_STYLE[name]) { ranges.push(markDeco(INLINE_STYLE[name]).range(node.from, node.to)); return; }
@@ -385,7 +439,7 @@ function buildDecorations(state) {
         if (shouldConceal(onActive)) ranges.push(conceal.range(node.from, eatTrailingSpace(state, node.to)));
         return;
       }
-      if (name === "EmphasisMark" || name === "StrikethroughMark" || name === "CodeMark") {
+      if (name === "EmphasisMark" || name === "StrikethroughMark" || name === "CodeMark" || name === "HighlightMark") {
         if (shouldConceal(onActive)) ranges.push(conceal.range(node.from, node.to));
         return;
       }
@@ -532,4 +586,36 @@ const listIndent = ViewPlugin.fromClass(
   { decorations: (v) => v.decorations }
 );
 
-export const livePreview = [docPathField, livePreviewField, listIndent, linkClicker];
+/* ---------- Focus mode (dim everything but the current paragraph) ---------- */
+function buildFocus(view) {
+  if (!focusMode) return Decoration.none;
+  const active = new Set();
+  for (const r of view.state.selection.ranges) {
+    const a = view.state.doc.lineAt(r.from).number, b = view.state.doc.lineAt(r.to).number;
+    for (let n = a; n <= b; n++) active.add(n);
+  }
+  const ranges = [];
+  for (const { from, to } of view.visibleRanges) {
+    let pos = from;
+    while (pos <= to) {
+      const line = view.state.doc.lineAt(pos);
+      if (!active.has(line.number)) ranges.push(Decoration.line({ class: "cm-dim" }).range(line.from));
+      pos = line.to + 1;
+    }
+  }
+  return Decoration.set(ranges, true);
+}
+const focusPlugin = ViewPlugin.fromClass(
+  class {
+    constructor(view) { this.decorations = buildFocus(view); }
+    update(u) {
+      if (u.docChanged || u.viewportChanged || u.selectionSet ||
+        u.transactions.some((t) => t.effects.some((e) => e.is(refreshEffect)))) {
+        this.decorations = buildFocus(u.view);
+      }
+    }
+  },
+  { decorations: (v) => v.decorations }
+);
+
+export const livePreview = [docPathField, livePreviewField, listIndent, focusPlugin, linkClicker];

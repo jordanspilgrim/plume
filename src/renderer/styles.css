@@ -535,3 +535,42 @@ html, body {
 .sr-item:hover { background: var(--accent-soft); }
 .sr-meta { font: 600 11.5px var(--font-mono); color: var(--accent); }
 .sr-text { font: 12.5px var(--font-mono); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- Status bar ---------- */
+#statusbar {
+  flex: 0 0 auto;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  padding: 0 16px;
+  border-top: 1px solid var(--rule);
+  background: var(--bg-elevated);
+  color: var(--text-faint);
+  font: 11px var(--font-ui);
+  user-select: none;
+}
+
+/* ---------- ==highlight== ---------- */
+[data-theme="dark"], [data-theme="system"] { --hl: rgba(255, 213, 79, 0.30); }
+[data-theme="light"] { --hl: rgba(255, 213, 79, 0.55); }
+@media (prefers-color-scheme: light) { [data-theme="system"] { --hl: rgba(255, 213, 79, 0.55); } }
+.tok-highlight { background: var(--hl); border-radius: 3px; padding: 0 0.12em; }
+
+/* ---------- Callouts (> [!NOTE]) ---------- */
+.cm-line.tok-callout {
+  border-left: 3px solid var(--cal, var(--accent));
+  background: color-mix(in srgb, var(--cal, var(--accent)) 9%, transparent);
+  padding-left: 16px;
+}
+.tok-cal-note, .tok-cal-info { --cal: #4c91f0; }
+.tok-cal-tip, .tok-cal-success { --cal: #3fb950; }
+.tok-cal-warning, .tok-cal-caution { --cal: #d6a417; }
+.tok-cal-important { --cal: #bc8cff; }
+.tok-cal-danger { --cal: #f85149; }
+.tok-cal-question { --cal: #39c5cf; }
+.tok-callout-label { font-weight: 700; color: var(--cal, var(--accent)); }
+
+/* ---------- Focus mode ---------- */
+.cm-dim { opacity: 0.3; transition: opacity 0.18s ease; }
