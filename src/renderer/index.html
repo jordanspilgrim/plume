@@ -4,19 +4,21 @@
     <meta charset="utf-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: file:; font-src 'self' data:;"
+      content="default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: file: blob:; font-src 'self' data:; worker-src 'self' blob:;"
     />
     <title>Plume</title>
     <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="../../dist/renderer.css" />
   </head>
   <body>
     <div id="app" data-theme="system">
       <div id="titlebar"><span id="titlebar-name">Plume</span></div>
+      <div id="banner" class="hidden"></div>
       <div id="main">
         <aside id="outline" class="hidden" aria-label="Document outline"></aside>
         <div id="editor-host"></div>
       </div>
     </div>
-    <script src="../../dist/renderer.js"></script>
+    <script type="module" src="../../dist/renderer.js"></script>
   </body>
 </html>

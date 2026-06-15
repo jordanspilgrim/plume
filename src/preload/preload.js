@@ -28,4 +28,6 @@ contextBridge.exposeInMainWorld("plume", {
   // Fire-and-forget renderer → main
   setDirty: (dirty) => ipcRenderer.send("doc:dirty", dirty),
   openExternal: (url) => ipcRenderer.send("file:openExternal", url),
+  snapshot: (content) => ipcRenderer.send("doc:snapshot", { content }),
+  discardRecovery: () => ipcRenderer.send("recovery:discard"),
 });

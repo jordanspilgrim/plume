@@ -3,7 +3,19 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs/promises");
+const crypto = require("node:crypto");
 const { buildMenu } = require("./menu");
+
+function recoveryFileFor(filePath) {
+  const dir = path.join(app.getPath("userData"), "recovery");
+  const key = crypto.createHash("sha1").update(filePath).digest("hex");
+  return { dir, file: path.join(dir, key + ".json") };
+}
+
+async function clearRecovery(filePath) {
+  if (!filePath) return;
+  try { await fs.unlink(recoveryFileFor(filePath).file); } catch { /* none */ }
+}
 
 /** @type {Map<number, { filePath: string|null, dirty: boolean }>} */
 const windowState = new Map();
@@ -94,7 +106,16 @@ async function openInWindow(win, filePath) {
     win.setTitle(path.basename(filePath));
     win.setDocumentEdited(false);
     app.addRecentDocument(filePath);
-    win.webContents.send("file:opened", { filePath, content });
+
+    // Surface a crash-recovery snapshot if one is newer than the file on disk.
+    let recovery = null;
+    try {
+      const snap = JSON.parse(await fs.readFile(recoveryFileFor(filePath).file, "utf8"));
+      const stat = await fs.stat(filePath);
+      if (snap.content !== content && snap.ts > stat.mtimeMs) recovery = snap.content;
+    } catch { /* no recovery */ }
+
+    win.webContents.send("file:opened", { filePath, content, recovery });
   } catch (err) {
     dialog.showMessageBox(win, {
       type: "error",
@@ -156,6 +177,7 @@ ipcMain.handle("file:save", async (event, { content }) => {
   win.setTitle(path.basename(target));
   win.setDocumentEdited(false);
   app.addRecentDocument(target);
+  await clearRecovery(target);
   return target;
 });
 
@@ -176,7 +198,25 @@ ipcMain.handle("file:saveAs", async (event, { content }) => {
   win.setTitle(path.basename(res.filePath));
   win.setDocumentEdited(false);
   app.addRecentDocument(res.filePath);
+  await clearRecovery(res.filePath);
   return res.filePath;
+});
+
+ipcMain.on("doc:snapshot", async (event, { content }) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const state = windowState.get(win?.id);
+  if (!state?.filePath) return; // only path-backed docs are recovered in v1
+  try {
+    const { dir, file } = recoveryFileFor(state.filePath);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(file, JSON.stringify({ filePath: state.filePath, content, ts: Date.now() }), "utf8");
+  } catch { /* best effort */ }
+});
+
+ipcMain.on("recovery:discard", (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const state = windowState.get(win?.id);
+  clearRecovery(state?.filePath);
 });
 
 ipcMain.on("doc:dirty", (event, dirty) => {

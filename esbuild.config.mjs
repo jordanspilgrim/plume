@@ -3,12 +3,21 @@ import * as esbuild from "esbuild";
 const ctx = await esbuild.context({
   entryPoints: ["src/renderer/renderer.js"],
   bundle: true,
-  outfile: "dist/renderer.js",
-  format: "iife",
+  outdir: "dist",
+  entryNames: "renderer",
+  format: "esm",
+  splitting: true,
   platform: "browser",
   target: ["chrome120"],
   sourcemap: true,
   logLevel: "info",
+  // KaTeX ships its fonts as CSS url() refs; inline them as data: URIs so they
+  // load under the file:// CSP (font-src 'self' data:) with no path juggling.
+  loader: {
+    ".woff2": "dataurl",
+    ".woff": "dataurl",
+    ".ttf": "dataurl",
+  },
 });
 
 if (process.argv.includes("--watch")) {

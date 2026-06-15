@@ -9,8 +9,10 @@ import { GFM } from "@lezer/markdown";
 import {
   search, searchKeymap, openSearchPanel,
 } from "@codemirror/search";
-import { syntaxTree } from "@codemirror/language";
-import { livePreview } from "./editor/livePreview.js";
+import { syntaxTree, syntaxHighlighting } from "@codemirror/language";
+import { codeLanguages, codeHighlightStyle } from "./editor/highlight.js";
+import { livePreview, setDocPath, setMermaidTheme, refreshEffect } from "./editor/livePreview.js";
+import "katex/dist/katex.min.css";
 
 /* ---------- State ---------- */
 let savedText = "";
@@ -39,8 +41,9 @@ const view = new EditorView({
       crosshairCursor(),
       EditorView.lineWrapping,
       EditorState.allowMultipleSelections.of(true),
-      markdown({ base: markdownLanguage, extensions: [GFM], addKeymap: true }),
-      livePreview,
+      markdown({ base: markdownLanguage, extensions: [GFM], codeLanguages, addKeymap: true }),
+      syntaxHighlighting(codeHighlightStyle),
+      ...livePreview,
       search({ top: true }),
       keymap.of([
         ...defaultKeymap,
@@ -56,6 +59,8 @@ view.focus();
 
 /* ---------- Debounced side effects (dirty + outline) ---------- */
 let sideTimer = null;
+let snapshotTimer = null;
+let autosaveTimer = null;
 function scheduleSideEffects() {
   if (sideTimer) clearTimeout(sideTimer);
   sideTimer = setTimeout(() => {
@@ -63,6 +68,22 @@ function scheduleSideEffects() {
     setDirty(text !== savedText);
     renderOutline();
   }, 120);
+
+  // Crash-recovery snapshot (path-backed docs only; main ignores untitled).
+  if (snapshotTimer) clearTimeout(snapshotTimer);
+  snapshotTimer = setTimeout(() => window.plume.snapshot(view.state.doc.toString()), 700);
+
+  // Autosave the open file after a short idle.
+  if (autosaveTimer) clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(autosave, 1300);
+}
+
+async function autosave() {
+  if (!currentPath) return; // never auto-create files for untitled docs
+  const text = view.state.doc.toString();
+  if (text === savedText) return;
+  const result = await window.plume.save(text);
+  if (result) { savedText = text; setTitle(result); setDirty(false); }
 }
 
 function setDirty(dirty) {
@@ -79,16 +100,42 @@ function setTitle(pathOrNull) {
 }
 
 /* ---------- File I/O ---------- */
-function loadDocument(content, filePath) {
+function loadDocument(content, filePath, recovery) {
   savedText = content;
   view.dispatch({
     changes: { from: 0, to: view.state.doc.length, insert: content },
     selection: { anchor: 0 },
   });
+  setDocPath(view, filePath);
   setTitle(filePath);
   setDirty(false);
   renderOutline();
+  if (recovery != null) showRecoveryBanner(recovery);
+  else clearBanner();
   view.focus();
+}
+
+/* ---------- Recovery banner ---------- */
+const bannerEl = document.getElementById("banner");
+function clearBanner() { bannerEl.className = "hidden"; bannerEl.innerHTML = ""; }
+function showRecoveryBanner(recoveryContent) {
+  bannerEl.className = "";
+  bannerEl.innerHTML = "";
+  const msg = document.createElement("span");
+  msg.textContent = "Plume recovered unsaved changes from a previous session.";
+  const restore = document.createElement("button");
+  restore.textContent = "Restore";
+  restore.onclick = () => {
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: recoveryContent } });
+    setDirty(true);
+    clearBanner();
+    view.focus();
+  };
+  const discard = document.createElement("button");
+  discard.textContent = "Discard";
+  discard.className = "ghost";
+  discard.onclick = () => { window.plume.discardRecovery(); clearBanner(); view.focus(); };
+  bannerEl.append(msg, restore, discard);
 }
 
 async function save(thenClose = false) {
@@ -160,6 +207,11 @@ function toggleOutline() {
 function applyTheme(theme) {
   appEl.dataset.theme = theme;
   localStorage.setItem("plume-theme", theme);
+  const dark =
+    theme === "dark" ||
+    (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  setMermaidTheme(dark ? "dark" : "default");
+  view.dispatch({ effects: refreshEffect.of(null) });
 }
 applyTheme(localStorage.getItem("plume-theme") || "system");
 
@@ -234,7 +286,7 @@ function setHeading(level) {
 }
 
 /* ---------- Menu + IPC wiring ---------- */
-window.plume.onOpenFile(({ filePath, content }) => loadDocument(content, filePath));
+window.plume.onOpenFile(({ filePath, content, recovery }) => loadDocument(content, filePath, recovery));
 
 window.plume.onMenu((channel, ...args) => {
   switch (channel) {

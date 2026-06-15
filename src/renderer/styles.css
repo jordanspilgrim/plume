@@ -246,3 +246,72 @@ html, body {
 .cm-scroller::-webkit-scrollbar-thumb, #outline::-webkit-scrollbar-thumb {
   background: var(--rule); border-radius: 6px; border: 3px solid var(--bg);
 }
+
+/* ---------- Phase 2: code token colors ---------- */
+[data-theme="dark"], [data-theme="system"] {
+  --syn-keyword: #c792ea; --syn-string: #c3e88d; --syn-number: #f78c6c;
+  --syn-comment: #6b7689; --syn-function: #82aaff; --syn-type: #ffcb6b;
+  --syn-property: #80cbc4; --syn-variable: #e6e6ea; --syn-punct: #89ddff;
+  --syn-invalid: #ff5370;
+}
+[data-theme="light"] {
+  --syn-keyword: #7c3aed; --syn-string: #0a7d3b; --syn-number: #b45309;
+  --syn-comment: #9aa1ad; --syn-function: #2563eb; --syn-type: #a16207;
+  --syn-property: #0e7490; --syn-variable: #1d1d1f; --syn-punct: #0891b2;
+  --syn-invalid: #dc2626;
+}
+@media (prefers-color-scheme: light) {
+  [data-theme="system"] {
+    --syn-keyword: #7c3aed; --syn-string: #0a7d3b; --syn-number: #b45309;
+    --syn-comment: #9aa1ad; --syn-function: #2563eb; --syn-type: #a16207;
+    --syn-property: #0e7490; --syn-variable: #1d1d1f; --syn-punct: #0891b2;
+    --syn-invalid: #dc2626;
+  }
+}
+
+/* ---------- Tables ---------- */
+.tok-table { margin: 0.4em 0; overflow-x: auto; }
+.tok-table table { border-collapse: collapse; font-size: 0.92em; width: auto; }
+.tok-table th, .tok-table td {
+  border: 1px solid var(--rule);
+  padding: 6px 12px;
+  text-align: left;
+}
+.tok-table th { background: var(--bg-elevated); font-weight: 650; }
+.tok-table tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg-elevated) 50%, transparent); }
+.tok-table code { font-family: var(--font-mono); font-size: 0.88em; background: var(--code-bg); color: var(--code-text); padding: 0.05em 0.3em; border-radius: 4px; }
+
+/* ---------- Images ---------- */
+.tok-img { display: inline-block; }
+.tok-img img { max-width: 100%; max-height: 360px; border-radius: 8px; vertical-align: middle; }
+.tok-img.broken { color: var(--text-faint); font-style: italic; }
+
+/* ---------- Math ---------- */
+.tok-math.display { display: block; margin: 0.6em 0; overflow-x: auto; }
+.tok-math.error { color: var(--syn-invalid); font-family: var(--font-mono); }
+.katex { font-size: 1.04em; }
+
+/* ---------- Mermaid ---------- */
+.tok-mermaid {
+  display: block; margin: 0.6em 0; padding: 14px;
+  background: var(--bg-elevated); border: 1px solid var(--rule); border-radius: 10px;
+  text-align: center; overflow-x: auto;
+}
+.tok-mermaid svg { max-width: 100%; height: auto; }
+.tok-mermaid.error { color: var(--syn-invalid); font-family: var(--font-mono); text-align: left; }
+
+/* ---------- Recovery banner ---------- */
+#banner {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 18px;
+  background: var(--accent-soft); color: var(--text);
+  border-bottom: 1px solid var(--rule);
+  font-size: 13px;
+}
+#banner.hidden { display: none; }
+#banner button {
+  background: var(--accent); color: #fff; border: none;
+  padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12.5px;
+}
+#banner button.ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--rule); }
