@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld("plume", {
       "menu:format", "menu:heading", "menu:toggleOutline", "menu:toggleMode",
       "menu:theme", "menu:toggleToolbar", "menu:toggleReveal", "menu:formatDoc",
       "menu:copyRich", "menu:copyHtml", "menu:export",
+      "menu:toggleSidebar", "menu:palette", "menu:searchFolder",
     ];
     channels.forEach((ch) =>
       ipcRenderer.on(ch, (_e, ...args) => cb(ch, ...args))
@@ -30,6 +31,10 @@ contextBridge.exposeInMainWorld("plume", {
   exportDoc: (format, html, defaultName) =>
     ipcRenderer.invoke("doc:export", { format, html, defaultName }),
   saveImage: (bytes, ext) => ipcRenderer.invoke("image:save", { bytes, ext }),
+  listDir: (dir, depth) => ipcRenderer.invoke("dir:list", { dir, depth }),
+  searchFiles: (dir, query) => ipcRenderer.invoke("search:files", { dir, query }),
+  openInThisWindow: (filePath, gotoLine) =>
+    ipcRenderer.invoke("file:openInThisWindow", { filePath, gotoLine }),
 
   // Fire-and-forget renderer → main
   setDirty: (dirty) => ipcRenderer.send("doc:dirty", dirty),

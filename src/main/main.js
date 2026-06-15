@@ -102,7 +102,7 @@ function createWindow(filePath = null) {
   return win;
 }
 
-async function openInWindow(win, filePath) {
+async function openInWindow(win, filePath, gotoLine) {
   try {
     const content = await fs.readFile(filePath, "utf8");
     const state = windowState.get(win.id);
@@ -124,7 +124,7 @@ async function openInWindow(win, filePath) {
       if (snap.content !== content && snap.ts > stat.mtimeMs) recovery = snap.content;
     } catch { /* no recovery */ }
 
-    win.webContents.send("file:opened", { filePath, content, recovery });
+    win.webContents.send("file:opened", { filePath, content, recovery, gotoLine });
     setupWatcher(win, filePath);
   } catch (err) {
     dialog.showMessageBox(win, {
@@ -297,6 +297,69 @@ ipcMain.handle("file:resolveLink", async (event, { href }) => {
 
 ipcMain.handle("file:openInNewWindow", async (event, { filePath }) => {
   createWindow(filePath);
+});
+
+const IGNORE_DIRS = new Set([
+  "node_modules", ".git", "dist", "release", ".cache", "__pycache__", ".next", ".venv", "assets",
+]);
+
+async function listTree(dir, depth) {
+  let entries;
+  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return []; }
+  entries = entries.filter((e) => !e.name.startsWith(".") && !IGNORE_DIRS.has(e.name));
+  entries.sort((a, b) =>
+    a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1
+  );
+  const out = [];
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      out.push({ name: e.name, path: full, type: "dir", children: depth > 0 ? await listTree(full, depth - 1) : [] });
+    } else {
+      out.push({ name: e.name, path: full, type: "file" });
+    }
+  }
+  return out;
+}
+
+ipcMain.handle("dir:list", async (_e, { dir, depth = 3 }) => (dir ? listTree(dir, depth) : []));
+
+ipcMain.handle("search:files", async (_e, { dir, query }) => {
+  if (!dir || !query || query.length < 2) return [];
+  const q = query.toLowerCase();
+  const results = [];
+  let scanned = 0;
+  async function walk(d, depth) {
+    if (depth < 0 || results.length >= 200 || scanned > 2000) return;
+    let entries;
+    try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { return; }
+    for (const en of entries) {
+      if (en.name.startsWith(".") || IGNORE_DIRS.has(en.name)) continue;
+      const full = path.join(d, en.name);
+      if (en.isDirectory()) { await walk(full, depth - 1); continue; }
+      const ext = path.extname(en.name).toLowerCase();
+      if (ext && !TEXT_EXTENSIONS.has(ext)) continue;
+      scanned++;
+      try {
+        const st = await fs.stat(full);
+        if (st.size > 1024 * 1024) continue;
+        const lines = (await fs.readFile(full, "utf8")).split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].toLowerCase().includes(q)) {
+            results.push({ path: full, name: en.name, line: i + 1, text: lines[i].trim().slice(0, 200) });
+            if (results.length >= 200) return;
+          }
+        }
+      } catch { /* skip */ }
+    }
+  }
+  await walk(dir, 4);
+  return results;
+});
+
+ipcMain.handle("file:openInThisWindow", async (event, { filePath, gotoLine }) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) await openInWindow(win, filePath, gotoLine);
 });
 
 ipcMain.handle("image:save", async (event, { bytes, ext }) => {

@@ -88,6 +88,7 @@ function buildMenu({ createWindow }) {
     {
       label: "View",
       submenu: [
+        { label: "Toggle Files Sidebar", accelerator: "CmdOrCtrl+Shift+E", click: () => send("menu:toggleSidebar") },
         { label: "Toggle Toolbar", accelerator: "CmdOrCtrl+Shift+T", click: () => send("menu:toggleToolbar") },
         { label: "Toggle Outline", accelerator: "CmdOrCtrl+Shift+O", click: () => send("menu:toggleOutline") },
         { label: "Reveal Markdown Marks While Editing", accelerator: "CmdOrCtrl+Shift+M", click: () => send("menu:toggleReveal") },
@@ -103,6 +104,13 @@ function buildMenu({ createWindow }) {
         { type: "separator" },
         { role: "togglefullscreen" },
         { role: "toggleDevTools" },
+      ],
+    },
+    {
+      label: "Go",
+      submenu: [
+        { label: "Command Palette…", accelerator: "CmdOrCtrl+K", click: () => send("menu:palette") },
+        { label: "Search in Folder…", accelerator: "CmdOrCtrl+Shift+F", click: () => send("menu:searchFolder") },
       ],
     },
     {

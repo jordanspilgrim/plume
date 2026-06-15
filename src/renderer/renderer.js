@@ -265,7 +265,7 @@ async function exportAs(format) {
 }
 
 /* ---------- File I/O ---------- */
-function loadDocument(content, filePath, recovery) {
+function loadDocument(content, filePath, recovery, gotoLine) {
   applyMode(filePath);
   savedText = content;
   view.dispatch({
@@ -279,6 +279,11 @@ function loadDocument(content, filePath, recovery) {
   if (isRenderMode()) renderCurrent();
   if (recovery != null) showRecoveryBanner(recovery);
   else clearBanner();
+  if (gotoLine) {
+    const ln = view.state.doc.line(Math.max(1, Math.min(gotoLine, view.state.doc.lines)));
+    view.dispatch({ selection: { anchor: ln.from }, effects: EditorView.scrollIntoView(ln.from, { y: "center" }) });
+  }
+  refreshSidebar();
   view.focus();
 }
 
@@ -694,8 +699,155 @@ view.dom.addEventListener("drop", (e) => {
   if (files.length) { e.preventDefault(); e.stopPropagation(); files.forEach(insertImageFile); }
 }, true);
 
+/* ---------- Folder sidebar ---------- */
+const sidebarEl = document.getElementById("sidebar");
+function currentDir() { return currentPath ? currentPath.replace(/\/[^/]*$/, "") : null; }
+
+async function refreshSidebar() {
+  if (sidebarEl.classList.contains("hidden")) return;
+  const dir = currentDir();
+  sidebarEl.innerHTML = "";
+  if (!dir) { sidebarEl.innerHTML = '<div class="sb-empty">Open a saved file to browse its folder.</div>'; return; }
+  const header = document.createElement("div");
+  header.className = "sb-header";
+  header.textContent = dir.split("/").pop();
+  sidebarEl.appendChild(header);
+  const body = document.createElement("div");
+  renderTree(await window.plume.listDir(dir, 3), body, 0);
+  sidebarEl.appendChild(body);
+}
+function renderTree(nodes, parent, depth) {
+  for (const n of nodes) {
+    const row = document.createElement("div");
+    row.className = "sb-item sb-" + n.type;
+    row.style.paddingLeft = 8 + depth * 13 + "px";
+    if (n.type === "file") {
+      row.textContent = n.name;
+      if (n.path === currentPath) row.classList.add("active");
+      row.onclick = () => window.plume.openInThisWindow(n.path);
+      parent.appendChild(row);
+    } else {
+      row.textContent = "▸ " + n.name;
+      const kids = document.createElement("div");
+      kids.className = "sb-children hidden";
+      let open = false;
+      row.onclick = () => { open = !open; row.textContent = (open ? "▾ " : "▸ ") + n.name; kids.classList.toggle("hidden", !open); };
+      renderTree(n.children || [], kids, depth + 1);
+      parent.append(row, kids);
+    }
+  }
+}
+function toggleSidebar() { sidebarEl.classList.toggle("hidden"); refreshSidebar(); }
+
+/* ---------- Command palette ---------- */
+const paletteEl = document.getElementById("palette");
+const paletteInput = document.getElementById("palette-input");
+const paletteList = document.getElementById("palette-list");
+let paletteFiles = [], paletteItems = [], paletteSel = 0;
+const COMMANDS = [
+  { label: "Toggle Files Sidebar", run: toggleSidebar },
+  { label: "Toggle Outline", run: toggleOutline },
+  { label: "Search in Folder", run: () => openSearch() },
+  { label: "Copy as Rich Text", run: copyAsRichText },
+  { label: "Export to PDF", run: () => exportAs("pdf") },
+  { label: "Export to HTML", run: () => exportAs("html") },
+  { label: "Export to Word (.docx)", run: () => exportAs("docx") },
+  { label: "Format Document (JSON)", run: formatDocument },
+  { label: "Appearance: Dark", run: () => applyTheme("dark") },
+  { label: "Appearance: Light", run: () => applyTheme("light") },
+  { label: "Appearance: System", run: () => applyTheme("system") },
+  { label: "Reveal Markdown Marks While Editing", run: () => applyReveal(localStorage.getItem("plume-reveal") !== "1") },
+];
+function flattenFiles(tree, acc = []) {
+  for (const n of tree) { if (n.type === "file") acc.push(n); else flattenFiles(n.children || [], acc); }
+  return acc;
+}
+function fuzzy(q, s) {
+  q = q.toLowerCase(); s = s.toLowerCase();
+  let i = 0;
+  for (let j = 0; j < s.length && i < q.length; j++) if (s[j] === q[i]) i++;
+  return i === q.length;
+}
+async function openPalette() {
+  closeSearch();
+  paletteEl.classList.remove("hidden");
+  paletteInput.value = "";
+  const dir = currentDir();
+  paletteFiles = dir ? flattenFiles(await window.plume.listDir(dir, 3)) : [];
+  renderPalette("");
+  paletteInput.focus();
+}
+function closePalette() { paletteEl.classList.add("hidden"); view.focus(); }
+function renderPalette(q) {
+  const cmdMode = q.startsWith(">");
+  const term = (cmdMode ? q.slice(1) : q).trim();
+  const cmds = COMMANDS.filter((c) => !term || fuzzy(term, c.label)).map((c) => ({ kind: "cmd", label: c.label, run: c.run }));
+  const files = cmdMode ? [] : paletteFiles.filter((f) => !term || fuzzy(term, f.name)).slice(0, 40)
+    .map((f) => ({ kind: "file", label: f.name, run: () => window.plume.openInThisWindow(f.path) }));
+  paletteItems = [...files, ...cmds];
+  paletteSel = 0;
+  drawPalette();
+}
+function drawPalette() {
+  paletteList.innerHTML = "";
+  paletteItems.forEach((it, i) => {
+    const row = document.createElement("div");
+    row.className = "pal-item" + (i === paletteSel ? " sel" : "");
+    const icon = document.createElement("span"); icon.className = "pal-icon"; icon.textContent = it.kind === "file" ? "›" : "⚡";
+    const label = document.createElement("span"); label.className = "pal-label"; label.textContent = it.label;
+    row.append(icon, label);
+    row.onmousedown = (e) => { e.preventDefault(); runPalette(i); };
+    paletteList.appendChild(row);
+  });
+}
+function runPalette(i) { const it = paletteItems[i]; closePalette(); if (it) it.run(); }
+paletteInput.addEventListener("input", () => renderPalette(paletteInput.value));
+paletteInput.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closePalette();
+  else if (e.key === "ArrowDown") { e.preventDefault(); paletteSel = Math.min(paletteSel + 1, paletteItems.length - 1); drawPalette(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); paletteSel = Math.max(paletteSel - 1, 0); drawPalette(); }
+  else if (e.key === "Enter") { e.preventDefault(); runPalette(paletteSel); }
+});
+paletteEl.addEventListener("mousedown", (e) => { if (e.target === paletteEl) closePalette(); });
+
+/* ---------- Cross-file search ---------- */
+const searchPanel = document.getElementById("searchpanel");
+const searchInput = document.getElementById("search-input");
+const searchResults = document.getElementById("search-results");
+let searchTimer = null;
+function openSearch() {
+  closePalette();
+  searchPanel.classList.remove("hidden");
+  searchInput.value = "";
+  searchResults.innerHTML = "";
+  searchInput.focus();
+}
+function closeSearch() { searchPanel.classList.add("hidden"); }
+searchInput.addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  const q = searchInput.value;
+  searchTimer = setTimeout(async () => {
+    const dir = currentDir();
+    if (!dir || q.length < 2) { searchResults.innerHTML = ""; return; }
+    const res = await window.plume.searchFiles(dir, q);
+    searchResults.innerHTML = "";
+    if (!res.length) { searchResults.innerHTML = '<div class="sb-empty">No matches</div>'; return; }
+    for (const r of res) {
+      const row = document.createElement("div");
+      row.className = "sr-item";
+      const meta = document.createElement("div"); meta.className = "sr-meta"; meta.textContent = `${r.name}:${r.line}`;
+      const txt = document.createElement("div"); txt.className = "sr-text"; txt.textContent = r.text;
+      row.append(meta, txt);
+      row.onmousedown = (e) => { e.preventDefault(); closeSearch(); window.plume.openInThisWindow(r.path, r.line); };
+      searchResults.appendChild(row);
+    }
+  }, 160);
+});
+searchInput.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeSearch(); view.focus(); } });
+searchPanel.addEventListener("mousedown", (e) => { if (e.target === searchPanel) closeSearch(); });
+
 /* ---------- Menu + IPC wiring ---------- */
-window.plume.onOpenFile(({ filePath, content, recovery }) => loadDocument(content, filePath, recovery));
+window.plume.onOpenFile(({ filePath, content, recovery, gotoLine }) => loadDocument(content, filePath, recovery, gotoLine));
 window.plume.onExternalChange(({ content }) => applyExternalChange(content));
 
 window.plume.onMenu((channel, ...args) => {
@@ -708,6 +860,9 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:format": applyFormat(args[0]); break;
     case "menu:heading": setHeading(args[0]); break;
     case "menu:toggleOutline": toggleOutline(); break;
+    case "menu:toggleSidebar": toggleSidebar(); break;
+    case "menu:palette": openPalette(); break;
+    case "menu:searchFolder": openSearch(); break;
     case "menu:toggleToolbar": applyToolbar(document.getElementById("toolbar").classList.contains("hidden")); break;
     case "menu:toggleReveal": applyReveal(localStorage.getItem("plume-reveal") !== "1"); break;
     case "menu:formatDoc": formatDocument(); break;
@@ -720,3 +875,6 @@ window.plume.onMenu((channel, ...args) => {
 });
 
 setTitle(null);
+
+// Automation surface (used for scripting / testing the UI).
+window.__plume = { toggleSidebar, openPalette, openSearch, refreshSidebar, exportAs, copyAsRichText };
