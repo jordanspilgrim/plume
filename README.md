@@ -17,6 +17,9 @@ Built on Electron + CodeMirror 6.
 - **Find / replace** (⌘F)
 - **Formatting shortcuts** — ⌘B/⌘I/⌘E/⌘K, ⌘1/2/3 for headings
 - **Light / dark / system** themes
+- **Font picker** — Inter (default), System (SF Pro), New York, Charter, Iowan, JetBrains Mono
+- **Hidden Markdown marks** — `#`, `*`, etc. stay out of sight even on the line you're editing (bullets render as `•`); toggle raw syntax back with View ▸ Reveal Marks (⌘⇧M)
+- **Formatting toolbar** — one-click headings, bold/italic/strike/code/link, lists, quote, code block, table, divider
 - Opens via Finder "Open With", registers as a default `.md` handler
 - Reload/crash-resilient (re-opens the document on renderer reload)
 

@@ -61,6 +61,11 @@ export function setMermaidTheme(theme) {
   mermaidInit = false; // re-init on next render
 }
 
+/* When false (default), Markdown marks stay hidden even on the active line. */
+let revealMarksWhenEditing = false;
+export function setRevealMarks(v) { revealMarksWhenEditing = v; }
+function shouldConceal(onActive) { return !(revealMarksWhenEditing && onActive); }
+
 /* ---------- Widgets ---------- */
 
 class CheckboxWidget extends WidgetType {
@@ -81,6 +86,11 @@ class CheckboxWidget extends WidgetType {
 class RuleWidget extends WidgetType {
   eq() { return true; }
   toDOM() { const s = document.createElement("span"); s.className = "tok-hr-line"; return s; }
+}
+
+class BulletWidget extends WidgetType {
+  eq() { return true; }
+  toDOM() { const s = document.createElement("span"); s.className = "tok-bullet"; s.textContent = "•"; return s; }
 }
 
 class ImageWidget extends WidgetType {
@@ -341,28 +351,38 @@ function buildDecorations(state) {
       if (name === "URL") {
         const parent = node.node.parent?.name;
         if (parent === "Link" || parent === "Image") {
-          if (!active.has(state.doc.lineAt(node.from).number)) ranges.push(conceal.range(node.from, node.to));
+          if (shouldConceal(active.has(state.doc.lineAt(node.from).number))) {
+            ranges.push(conceal.range(node.from, node.to));
+          }
         } else {
           ranges.push(markDeco("tok-url").range(node.from, node.to));
         }
         return;
       }
 
-      // ----- Concealable marks -----
+      // ----- Concealable marks (hidden even when editing unless reveal mode is on) -----
       const onActive = active.has(state.doc.lineAt(node.from).number);
       if (name === "HeaderMark" || name === "QuoteMark") {
-        if (!onActive) ranges.push(conceal.range(node.from, eatTrailingSpace(state, node.to)));
+        if (shouldConceal(onActive)) ranges.push(conceal.range(node.from, eatTrailingSpace(state, node.to)));
         return;
       }
       if (name === "EmphasisMark" || name === "StrikethroughMark" || name === "CodeMark") {
-        if (!onActive) ranges.push(conceal.range(node.from, node.to));
+        if (shouldConceal(onActive)) ranges.push(conceal.range(node.from, node.to));
         return;
       }
       if (name === "LinkMark" || name === "LinkTitle") {
-        if (!onActive) ranges.push(conceal.range(node.from, node.to));
+        if (shouldConceal(onActive)) ranges.push(conceal.range(node.from, node.to));
         return;
       }
-      if (name === "ListMark") { ranges.push(markDeco("tok-list-bullet").range(node.from, node.to)); return; }
+      if (name === "ListMark") {
+        const txt = state.doc.sliceString(node.from, node.to);
+        if (/^[-*+]$/.test(txt) && shouldConceal(onActive)) {
+          ranges.push(Decoration.replace({ widget: new BulletWidget() }).range(node.from, node.to));
+        } else {
+          ranges.push(markDeco("tok-list-bullet").range(node.from, node.to));
+        }
+        return;
+      }
       if (name === "TaskMarker") {
         if (!onActive) {
           const checked = /x/i.test(state.doc.sliceString(node.from, node.to));

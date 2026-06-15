@@ -11,8 +11,11 @@ import {
 } from "@codemirror/search";
 import { syntaxTree, syntaxHighlighting } from "@codemirror/language";
 import { codeLanguages, codeHighlightStyle } from "./editor/highlight.js";
-import { livePreview, setDocPath, setMermaidTheme, refreshEffect } from "./editor/livePreview.js";
+import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, refreshEffect } from "./editor/livePreview.js";
 import "katex/dist/katex.min.css";
+import "@fontsource-variable/inter/index.css";
+import "@fontsource/jetbrains-mono/400.css";
+import "@fontsource/jetbrains-mono/700.css";
 
 /* ---------- State ---------- */
 let savedText = "";
@@ -41,6 +44,12 @@ const view = new EditorView({
       crosshairCursor(),
       EditorView.lineWrapping,
       EditorState.allowMultipleSelections.of(true),
+      // Override CodeMirror's default monospace content font with the themeable body font.
+      EditorView.theme({
+        "&": { fontFamily: "var(--font-body)" },
+        ".cm-content": { fontFamily: "var(--font-body)" },
+        ".cm-scroller": { fontFamily: "var(--font-body)" },
+      }),
       markdown({ base: markdownLanguage, extensions: [GFM], codeLanguages, addKeymap: true }),
       syntaxHighlighting(codeHighlightStyle),
       ...livePreview,
@@ -384,6 +393,40 @@ const TOOLBAR_GROUPS = [
   ],
 ];
 
+/* ---------- Fonts ---------- */
+const FONTS = [
+  { id: "inter", label: "Inter", stack: '"Inter Variable", "Inter", -apple-system, sans-serif' },
+  { id: "system", label: "System (SF Pro)", stack: '-apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif' },
+  { id: "newyork", label: "New York", stack: 'ui-serif, "New York", Charter, Georgia, serif' },
+  { id: "charter", label: "Charter", stack: 'Charter, "Bitstream Charter", Georgia, serif' },
+  { id: "iowan", label: "Iowan", stack: '"Iowan Old Style", Palatino, "Palatino Linotype", serif' },
+  { id: "mono", label: "JetBrains Mono", stack: '"JetBrains Mono", "SF Mono", ui-monospace, monospace' },
+];
+
+function applyFont(id) {
+  const font = FONTS.find((f) => f.id === id) || FONTS[0];
+  document.documentElement.style.setProperty("--font-body", font.stack);
+  localStorage.setItem("plume-font", font.id);
+}
+
+function buildFontPicker() {
+  const wrap = document.createElement("label");
+  wrap.className = "tb-font";
+  wrap.title = "Editor font";
+  const select = document.createElement("select");
+  for (const f of FONTS) {
+    const opt = document.createElement("option");
+    opt.value = f.id;
+    opt.textContent = f.label;
+    select.appendChild(opt);
+  }
+  select.value = localStorage.getItem("plume-font") || "inter";
+  select.addEventListener("change", () => { applyFont(select.value); view.focus(); });
+  wrap.appendChild(select);
+  return wrap;
+}
+
+/* ---------- Toolbar ---------- */
 function buildToolbar() {
   const tb = document.getElementById("toolbar");
   tb.innerHTML = "";
@@ -404,6 +447,10 @@ function buildToolbar() {
       tb.appendChild(btn);
     }
   });
+  const spacer = document.createElement("span");
+  spacer.className = "tb-spacer";
+  tb.appendChild(spacer);
+  tb.appendChild(buildFontPicker());
 }
 
 function applyToolbar(visible) {
@@ -411,8 +458,17 @@ function applyToolbar(visible) {
   localStorage.setItem("plume-toolbar", visible ? "1" : "0");
 }
 
+/* ---------- Markdown mark visibility ---------- */
+function applyReveal(reveal) {
+  setRevealMarks(reveal);
+  localStorage.setItem("plume-reveal", reveal ? "1" : "0");
+  view.dispatch({ effects: refreshEffect.of(null) });
+}
+
+applyFont(localStorage.getItem("plume-font") || "inter");
 buildToolbar();
 applyToolbar(localStorage.getItem("plume-toolbar") !== "0");
+applyReveal(localStorage.getItem("plume-reveal") === "1");
 
 /* ---------- Menu + IPC wiring ---------- */
 window.plume.onOpenFile(({ filePath, content, recovery }) => loadDocument(content, filePath, recovery));
@@ -428,6 +484,7 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:heading": setHeading(args[0]); break;
     case "menu:toggleOutline": toggleOutline(); break;
     case "menu:toggleToolbar": applyToolbar(document.getElementById("toolbar").classList.contains("hidden")); break;
+    case "menu:toggleReveal": applyReveal(localStorage.getItem("plume-reveal") !== "1"); break;
     case "menu:toggleMode": appEl.classList.toggle("source-mode"); break;
     case "menu:theme": applyTheme(args[0]); break;
   }

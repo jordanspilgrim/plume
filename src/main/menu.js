@@ -76,6 +76,7 @@ function buildMenu({ createWindow }) {
       submenu: [
         { label: "Toggle Toolbar", accelerator: "CmdOrCtrl+Shift+T", click: () => send("menu:toggleToolbar") },
         { label: "Toggle Outline", accelerator: "CmdOrCtrl+Shift+O", click: () => send("menu:toggleOutline") },
+        { label: "Reveal Markdown Marks While Editing", accelerator: "CmdOrCtrl+Shift+M", click: () => send("menu:toggleReveal") },
         { label: "Toggle Source / Preview", accelerator: "CmdOrCtrl+/", click: () => send("menu:toggleMode") },
         { type: "separator" },
         { label: "Appearance: System", click: () => send("menu:theme", "system") },
