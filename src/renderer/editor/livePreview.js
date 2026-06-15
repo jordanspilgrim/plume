@@ -472,6 +472,20 @@ const linkClicker = EditorView.domEventHandlers({
 /* ---------- List hanging indent (wrapped lines align under the text) ---------- */
 const LIST_PREFIX = /^(\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)/;
 
+// Approximate width of each prefix character in units of the average glyph.
+function prefixCols(prefix) {
+  let cols = 0;
+  for (const ch of prefix) {
+    if (ch === " ") cols += 0.5;
+    else if (ch === "." || ch === ")") cols += 0.5;
+    else if (ch === "[" || ch === "]") cols += 0.55;
+    else if (/\d/.test(ch)) cols += 1.0;
+    else if (/[-*+]/.test(ch)) cols += 1.0; // rendered as a bullet
+    else cols += 0.9; // x / other
+  }
+  return cols;
+}
+
 function buildListIndent(view) {
   const tree = syntaxTree(view.state);
   const ranges = [];
@@ -489,11 +503,10 @@ function buildListIndent(view) {
           if (/Code|Fenced/.test(n.name)) break;
         }
         if (isList) {
-          // Size the hanging indent by the font's measured average character
-          // width (auto-adapts when the font changes). The trailing marker
-          // space renders narrower than an average glyph, so discount it.
-          const cols = m[1].length - 0.4;
-          const indent = Math.round(cols * view.defaultCharacterWidth);
+          // Estimate the rendered prefix width per character (digits/markers are
+          // ~1 average glyph; spaces, dots, and brackets are narrower). Scaled by
+          // the editor's measured average char width, so it adapts to the font.
+          const indent = Math.round(prefixCols(m[1]) * view.defaultCharacterWidth);
           if (indent > 0) {
             ranges.push(
               Decoration.line({ attributes: { style: `padding-left:${indent}px;text-indent:-${indent}px` } }).range(line.from)
