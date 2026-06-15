@@ -299,6 +299,22 @@ ipcMain.handle("file:openInNewWindow", async (event, { filePath }) => {
   createWindow(filePath);
 });
 
+ipcMain.handle("image:save", async (event, { bytes, ext }) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const state = windowState.get(win.id);
+  if (!state?.filePath) return null; // need a saved file to anchor the relative path
+  try {
+    const dir = path.join(path.dirname(state.filePath), "assets");
+    await fs.mkdir(dir, { recursive: true });
+    const name = `image-${Date.now()}.${(ext || "png").replace(/[^a-z0-9]/gi, "")}`;
+    await fs.writeFile(path.join(dir, name), Buffer.from(bytes));
+    return `assets/${name}`;
+  } catch (err) {
+    dialog.showMessageBox(win, { type: "error", message: "Couldn't save image", detail: err.message });
+    return null;
+  }
+});
+
 ipcMain.handle("doc:export", async (event, { format, html, defaultName }) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   const ext = format === "pdf" ? "pdf" : format === "docx" ? "docx" : "html";

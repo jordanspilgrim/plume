@@ -665,6 +665,35 @@ applyToolbar(localStorage.getItem("plume-toolbar") !== "0");
 applyReveal(localStorage.getItem("plume-reveal") === "1");
 viewToggle.addEventListener("click", toggleSourceView);
 
+/* ---------- Image paste / drop ---------- */
+async function insertImageFile(file) {
+  if (currentMode !== "markdown") return;
+  if (!currentPath) { flashMessage("Save the file first to add images."); return; }
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const ext = ((file.type.split("/")[1]) || "png").replace("jpeg", "jpg").replace("svg+xml", "svg");
+    const rel = await window.plume.saveImage(bytes, ext);
+    if (rel) {
+      const r = view.state.selection.main;
+      const snippet = `![](${rel})`;
+      view.dispatch({ changes: { from: r.from, to: r.to, insert: snippet }, selection: { anchor: r.from + 2 } });
+      view.focus();
+      flashMessage("Saved " + rel);
+    }
+  } catch (e) { flashMessage("Image insert failed: " + e.message); }
+}
+view.dom.addEventListener("paste", (e) => {
+  const img = [...(e.clipboardData?.items || [])].find((it) => it.kind === "file" && it.type.startsWith("image/"));
+  if (img) { e.preventDefault(); e.stopPropagation(); insertImageFile(img.getAsFile()); }
+}, true);
+view.dom.addEventListener("dragover", (e) => {
+  if ([...(e.dataTransfer?.items || [])].some((it) => it.kind === "file" && it.type.startsWith("image/"))) e.preventDefault();
+}, true);
+view.dom.addEventListener("drop", (e) => {
+  const files = [...(e.dataTransfer?.files || [])].filter((f) => f.type.startsWith("image/"));
+  if (files.length) { e.preventDefault(); e.stopPropagation(); files.forEach(insertImageFile); }
+}, true);
+
 /* ---------- Menu + IPC wiring ---------- */
 window.plume.onOpenFile(({ filePath, content, recovery }) => loadDocument(content, filePath, recovery));
 window.plume.onExternalChange(({ content }) => applyExternalChange(content));

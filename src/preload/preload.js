@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld("plume", {
     ipcRenderer.invoke("file:openInNewWindow", { filePath }),
   exportDoc: (format, html, defaultName) =>
     ipcRenderer.invoke("doc:export", { format, html, defaultName }),
+  saveImage: (bytes, ext) => ipcRenderer.invoke("image:save", { bytes, ext }),
 
   // Fire-and-forget renderer → main
   setDirty: (dirty) => ipcRenderer.send("doc:dirty", dirty),
