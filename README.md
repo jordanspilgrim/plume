@@ -32,6 +32,17 @@ Built on Electron + CodeMirror 6.
 - **Inline image preview** with relative-path resolution
 - **Autosave** to disk on idle, plus **crash recovery** with a restore banner
 
+### Agentic-dev companion
+
+Plume detects the file type and renders it appropriately — ideal for living next to an agent like Claude Code:
+
+- **Live auto-reload** — the open document refreshes the instant the file changes on disk (e.g. when an agent writes it), preserving your scroll. Unsaved edits trigger a non-destructive "changed on disk" prompt instead of clobbering.
+- **Code & config editing** — JSON/JSONC, YAML, TOML, `.env`/INI, JS/TS, Python, shell, and more open with line numbers, code folding, bracket matching, and syntax highlighting. `Format Document` prettifies JSON.
+- **JSONL / NDJSON viewer** — transcripts, traces, and eval datasets render as collapsible, role-tagged records (great for Claude Code session files).
+- **Diff / patch viewer** — `.diff`/`.patch` show file/hunk headers and red/green add/remove lines.
+- **Log viewer** — `.log` files highlight ERROR/WARN/INFO levels and timestamps, interpret ANSI color, and **tail-follow** to the newest line as the file grows.
+- **CSV / TSV** render as tables; standalone **`.mmd`** render as Mermaid diagrams. Toggle source/rendered with ⌘/.
+
 ## Develop
 
 ```bash

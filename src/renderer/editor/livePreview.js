@@ -61,6 +61,19 @@ export function setMermaidTheme(theme) {
   mermaidInit = false; // re-init on next render
 }
 
+/** Render a standalone Mermaid document into an element (for .mmd files). */
+export async function renderMermaidInto(el, code) {
+  ensureMermaid();
+  const id = "mmd-file-" + mmdSeq++;
+  try {
+    const { svg } = await mermaid.render(id, code.trim());
+    el.innerHTML = svg;
+  } catch (e) {
+    el.classList.add("error");
+    el.textContent = "Mermaid: " + (e?.message || e);
+  }
+}
+
 /* When false (default), Markdown marks stay hidden even on the active line. */
 let revealMarksWhenEditing = false;
 export function setRevealMarks(v) { revealMarksWhenEditing = v; }

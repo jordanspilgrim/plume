@@ -11,7 +11,10 @@ import {
 } from "@codemirror/search";
 import { syntaxTree, syntaxHighlighting } from "@codemirror/language";
 import { codeLanguages, codeHighlightStyle } from "./editor/highlight.js";
-import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, refreshEffect } from "./editor/livePreview.js";
+import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, refreshEffect, renderMermaidInto } from "./editor/livePreview.js";
+import { modeForPath, languageForExt, codeFeatures, extOf, baseName } from "./editor/modes.js";
+import { diffDecorations, logDecorations } from "./editor/decorators.js";
+import { renderJsonl, renderCsv } from "./editor/viewers.js";
 import "katex/dist/katex.min.css";
 import "@fontsource-variable/inter/index.css";
 import "@fontsource/jetbrains-mono/400.css";
@@ -26,6 +29,15 @@ const titlebarName = document.getElementById("titlebar-name");
 const outlineEl = document.getElementById("outline");
 
 /* ---------- Editor ---------- */
+// Compartments let us swap language + features per file type without rebuilding the editor.
+const langConf = new Compartment();
+const previewConf = new Compartment();
+const codeConf = new Compartment();
+
+function markdownLang() {
+  return markdown({ base: markdownLanguage, extensions: [GFM], codeLanguages, addKeymap: true });
+}
+
 const updateListener = EditorView.updateListener.of((u) => {
   if (u.docChanged) {
     scheduleSideEffects();
@@ -50,9 +62,10 @@ const view = new EditorView({
         ".cm-content": { fontFamily: "var(--font-body)" },
         ".cm-scroller": { fontFamily: "var(--font-body)" },
       }),
-      markdown({ base: markdownLanguage, extensions: [GFM], codeLanguages, addKeymap: true }),
+      langConf.of(markdownLang()),
+      previewConf.of(livePreview),
+      codeConf.of([]),
       syntaxHighlighting(codeHighlightStyle),
-      ...livePreview,
       search({ top: true }),
       keymap.of([
         ...defaultKeymap,
@@ -108,8 +121,119 @@ function setTitle(pathOrNull) {
   document.title = name;
 }
 
+/* ---------- Mode dispatch ---------- */
+const RENDER_MODES = new Set(["jsonl", "csv", "mermaid"]);
+const editorHost = document.getElementById("editor-host");
+const renderHost = document.getElementById("render-host");
+const viewToggle = document.getElementById("view-toggle");
+let currentMode = "markdown";
+let showSource = false;
+
+function isRenderMode() { return RENDER_MODES.has(currentMode); }
+
+function updateHosts() {
+  const render = isRenderMode();
+  viewToggle.classList.toggle("hidden", !render);
+  viewToggle.textContent = showSource ? "Rendered" : "Source";
+  const showRendered = render && !showSource;
+  editorHost.classList.toggle("hidden", showRendered);
+  renderHost.classList.toggle("hidden", !showRendered);
+}
+
+function renderCurrent() {
+  if (!isRenderMode()) return;
+  const text = view.state.doc.toString();
+  renderHost.innerHTML = "";
+  const body = document.createElement("div");
+  body.className = "render-body mode-" + currentMode;
+  renderHost.appendChild(body);
+  if (currentMode === "jsonl") renderJsonl(body, text);
+  else if (currentMode === "csv") renderCsv(body, text, extOf(currentPath) === "tsv");
+  else if (currentMode === "mermaid") {
+    const d = document.createElement("div");
+    d.className = "render-mermaid";
+    body.appendChild(d);
+    renderMermaidInto(d, text);
+  }
+}
+
+function toggleSourceView() {
+  if (!isRenderMode()) return;
+  showSource = !showSource;
+  updateHosts();
+  if (showSource) view.focus();
+  else renderCurrent();
+}
+
+function applyMode(filePath) {
+  const mode = modeForPath(filePath);
+  currentMode = mode;
+  showSource = false;
+  appEl.dataset.mode = mode;
+  if (mode === "markdown") {
+    view.dispatch({ effects: [
+      langConf.reconfigure(markdownLang()),
+      previewConf.reconfigure(livePreview),
+      codeConf.reconfigure([]),
+    ]});
+  } else if (mode === "diff") {
+    view.dispatch({ effects: [
+      langConf.reconfigure([]),
+      previewConf.reconfigure(diffDecorations),
+      codeConf.reconfigure([]),
+    ]});
+  } else if (mode === "log") {
+    view.dispatch({ effects: [
+      langConf.reconfigure([]),
+      previewConf.reconfigure(logDecorations),
+      codeConf.reconfigure([]),
+    ]});
+  } else {
+    // Code/config (and, for now, jsonl/csv/mermaid until their richer modes
+    // land) open as plain, foldable, syntax-highlighted text.
+    const lang = languageForExt(extOf(filePath), baseName(filePath));
+    view.dispatch({ effects: [
+      langConf.reconfigure(lang || []),
+      previewConf.reconfigure([]),
+      codeConf.reconfigure(codeFeatures),
+    ]});
+  }
+  // Markdown-only chrome.
+  document.getElementById("toolbar").classList.toggle("mode-hidden", mode !== "markdown");
+  if (mode !== "markdown") outlineEl.classList.add("hidden");
+  updateHosts();
+}
+
+function formatDocument() {
+  const ext = extOf(currentPath || "");
+  if (ext === "json" || ext === "jsonc" || ext === "json5") {
+    try {
+      const pretty = JSON.stringify(JSON.parse(view.state.doc.toString()), null, 2);
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: pretty } });
+      view.focus();
+    } catch (e) {
+      flashMessage("Can't format: " + e.message);
+    }
+  } else {
+    flashMessage("Format is available for JSON files.");
+  }
+}
+
+function flashMessage(text) {
+  bannerEl.className = "";
+  bannerEl.innerHTML = "";
+  const msg = document.createElement("span");
+  msg.textContent = text;
+  const ok = document.createElement("button");
+  ok.textContent = "OK";
+  ok.className = "ghost";
+  ok.onclick = () => { clearBanner(); view.focus(); };
+  bannerEl.append(msg, ok);
+}
+
 /* ---------- File I/O ---------- */
 function loadDocument(content, filePath, recovery) {
+  applyMode(filePath);
   savedText = content;
   view.dispatch({
     changes: { from: 0, to: view.state.doc.length, insert: content },
@@ -119,6 +243,7 @@ function loadDocument(content, filePath, recovery) {
   setTitle(filePath);
   setDirty(false);
   renderOutline();
+  if (isRenderMode()) renderCurrent();
   if (recovery != null) showRecoveryBanner(recovery);
   else clearBanner();
   view.focus();
@@ -145,6 +270,42 @@ function showRecoveryBanner(recoveryContent) {
   discard.className = "ghost";
   discard.onclick = () => { window.plume.discardRecovery(); clearBanner(); view.focus(); };
   bannerEl.append(msg, restore, discard);
+}
+
+/* ---------- Live auto-reload (file changed on disk) ---------- */
+function setDoc(content, { bottom = false } = {}) {
+  const scrollTop = view.scrollDOM.scrollTop;
+  const anchor = Math.min(view.state.selection.main.anchor, content.length);
+  savedText = content;
+  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content }, selection: { anchor } });
+  // Log files tail-follow to the newest line; everything else holds position.
+  view.scrollDOM.scrollTop = bottom ? view.scrollDOM.scrollHeight : scrollTop;
+  setDirty(false);
+  renderOutline();
+}
+
+function applyExternalChange(content) {
+  if (content === view.state.doc.toString()) { savedText = content; setDirty(false); return; }
+  // Don't clobber unsaved edits — let the user choose.
+  if (titlebar.classList.contains("dirty")) { showDiskChangedBanner(content); return; }
+  setDoc(content, { bottom: currentMode === "log" });
+  if (isRenderMode() && !showSource) renderCurrent();
+  clearBanner();
+}
+
+function showDiskChangedBanner(content) {
+  bannerEl.className = "";
+  bannerEl.innerHTML = "";
+  const msg = document.createElement("span");
+  msg.textContent = "This file changed on disk.";
+  const reload = document.createElement("button");
+  reload.textContent = "Reload";
+  reload.onclick = () => { setDoc(content); clearBanner(); view.focus(); };
+  const keep = document.createElement("button");
+  keep.textContent = "Keep mine";
+  keep.className = "ghost";
+  keep.onclick = () => { clearBanner(); view.focus(); };
+  bannerEl.append(msg, reload, keep);
 }
 
 async function save(thenClose = false) {
@@ -469,9 +630,11 @@ applyFont(localStorage.getItem("plume-font") || "inter");
 buildToolbar();
 applyToolbar(localStorage.getItem("plume-toolbar") !== "0");
 applyReveal(localStorage.getItem("plume-reveal") === "1");
+viewToggle.addEventListener("click", toggleSourceView);
 
 /* ---------- Menu + IPC wiring ---------- */
 window.plume.onOpenFile(({ filePath, content, recovery }) => loadDocument(content, filePath, recovery));
+window.plume.onExternalChange(({ content }) => applyExternalChange(content));
 
 window.plume.onMenu((channel, ...args) => {
   switch (channel) {
@@ -485,7 +648,8 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:toggleOutline": toggleOutline(); break;
     case "menu:toggleToolbar": applyToolbar(document.getElementById("toolbar").classList.contains("hidden")); break;
     case "menu:toggleReveal": applyReveal(localStorage.getItem("plume-reveal") !== "1"); break;
-    case "menu:toggleMode": appEl.classList.toggle("source-mode"); break;
+    case "menu:formatDoc": formatDocument(); break;
+    case "menu:toggleMode": toggleSourceView(); break;
     case "menu:theme": applyTheme(args[0]); break;
   }
 });

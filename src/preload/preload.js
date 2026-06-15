@@ -6,11 +6,13 @@ contextBridge.exposeInMainWorld("plume", {
   // Push events from main → renderer
   onOpenFile: (cb) =>
     ipcRenderer.on("file:opened", (_e, payload) => cb(payload)),
+  onExternalChange: (cb) =>
+    ipcRenderer.on("file:externalChange", (_e, payload) => cb(payload)),
   onMenu: (cb) => {
     const channels = [
       "menu:open", "menu:save", "menu:saveAs", "menu:find", "menu:replace",
       "menu:format", "menu:heading", "menu:toggleOutline", "menu:toggleMode",
-      "menu:theme", "menu:toggleToolbar", "menu:toggleReveal",
+      "menu:theme", "menu:toggleToolbar", "menu:toggleReveal", "menu:formatDoc",
     ];
     channels.forEach((ch) =>
       ipcRenderer.on(ch, (_e, ...args) => cb(ch, ...args))

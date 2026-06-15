@@ -58,6 +58,18 @@
               "text",
               "txt"
             ]
+          },
+          {
+            "CFBundleTypeName": "Source & Data File",
+            "CFBundleTypeRole": "Editor",
+            "LSHandlerRank": "Alternate",
+            "CFBundleTypeExtensions": [
+              "json", "jsonc", "jsonl", "ndjson", "yaml", "yml", "toml",
+              "ini", "env", "conf", "cfg", "diff", "patch", "log",
+              "csv", "tsv", "mmd", "xml", "svg",
+              "js", "jsx", "mjs", "cjs", "ts", "tsx", "py", "rs", "go",
+              "sh", "bash", "zsh", "sql", "css", "html"
+            ]
           }
         ],
         "UTImportedTypeDeclarations": [

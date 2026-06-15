@@ -54,6 +54,8 @@ function buildMenu({ createWindow }) {
         { type: "separator" },
         { label: "Find…", accelerator: "CmdOrCtrl+F", click: () => send("menu:find") },
         { label: "Find & Replace…", accelerator: "CmdOrCtrl+Alt+F", click: () => send("menu:replace") },
+        { type: "separator" },
+        { label: "Format Document", accelerator: "Shift+Alt+F", click: () => send("menu:formatDoc") },
       ],
     },
     {

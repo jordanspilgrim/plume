@@ -3,6 +3,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs/promises");
+const { watch } = require("node:fs");
 const crypto = require("node:crypto");
 const { buildMenu } = require("./menu");
 
@@ -25,7 +26,10 @@ const pendingPaths = [];
 let appReady = false;
 
 const TEXT_EXTENSIONS = new Set([
-  ".md", ".markdown", ".mdown", ".mkd", ".mdx", ".text", ".txt", ".",
+  ".md", ".markdown", ".mdown", ".mkd", ".mdx", ".text", ".txt",
+  ".json", ".jsonc", ".jsonl", ".ndjson", ".yaml", ".yml", ".toml",
+  ".env", ".ini", ".diff", ".patch", ".log", ".csv", ".tsv", ".mmd",
+  ".xml", ".sh", ".bash", ".zsh", ".js", ".ts", ".py", ".rs", ".go",
 ]);
 
 function looksLikeOpenableFile(p) {
@@ -65,7 +69,11 @@ function createWindow(filePath = null) {
     if (target) await openInWindow(win, target);
   });
 
-  win.on("closed", () => windowState.delete(win.id));
+  win.on("closed", () => {
+    const state = windowState.get(win.id);
+    if (state?.watcher) { try { state.watcher.close(); } catch { /* ignore */ } }
+    windowState.delete(win.id);
+  });
 
   // Intercept the red-button close when there are unsaved changes.
   win.on("close", (e) => {
@@ -101,6 +109,7 @@ async function openInWindow(win, filePath) {
     if (state) {
       state.filePath = filePath;
       state.dirty = false;
+      state.knownContent = content;
     }
     win.setRepresentedFilename(filePath);
     win.setTitle(path.basename(filePath));
@@ -116,6 +125,7 @@ async function openInWindow(win, filePath) {
     } catch { /* no recovery */ }
 
     win.webContents.send("file:opened", { filePath, content, recovery });
+    setupWatcher(win, filePath);
   } catch (err) {
     dialog.showMessageBox(win, {
       type: "error",
@@ -123,6 +133,38 @@ async function openInWindow(win, filePath) {
       detail: `${filePath}\n\n${err.message}`,
     });
   }
+}
+
+/**
+ * Watch the open file's directory and push external changes to the renderer.
+ * Watching the directory (not the file) survives atomic writes (temp + rename),
+ * which is how editors and agents commonly write. Self-writes are ignored by
+ * comparing against the content we last delivered/saved (state.knownContent).
+ */
+function setupWatcher(win, filePath) {
+  const state = windowState.get(win.id);
+  if (!state) return;
+  if (state.watcher) { try { state.watcher.close(); } catch { /* ignore */ } state.watcher = null; }
+
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  let timer = null;
+  try {
+    state.watcher = watch(dir, (_event, changed) => {
+      if (changed && changed !== base) return;
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        if (win.isDestroyed()) return;
+        const cur = windowState.get(win.id);
+        if (!cur || cur.filePath !== filePath) return;
+        let content;
+        try { content = await fs.readFile(filePath, "utf8"); } catch { return; }
+        if (content === cur.knownContent) return; // our own write, or no real change
+        cur.knownContent = content;
+        win.webContents.send("file:externalChange", { content });
+      }, 120);
+    });
+  } catch { /* directory may be unwatchable; skip */ }
 }
 
 /** Route an incoming path to a sensible window: reuse a blank/focused one or make a new one. */
@@ -172,12 +214,14 @@ ipcMain.handle("file:save", async (event, { content }) => {
   if (state) {
     state.filePath = target;
     state.dirty = false;
+    state.knownContent = content;
   }
   win.setRepresentedFilename(target);
   win.setTitle(path.basename(target));
   win.setDocumentEdited(false);
   app.addRecentDocument(target);
   await clearRecovery(target);
+  setupWatcher(win, target);
   return target;
 });
 
@@ -193,12 +237,14 @@ ipcMain.handle("file:saveAs", async (event, { content }) => {
   if (state) {
     state.filePath = res.filePath;
     state.dirty = false;
+    state.knownContent = content;
   }
   win.setRepresentedFilename(res.filePath);
   win.setTitle(path.basename(res.filePath));
   win.setDocumentEdited(false);
   app.addRecentDocument(res.filePath);
   await clearRecovery(res.filePath);
+  setupWatcher(win, res.filePath);
   return res.filePath;
 });
 
