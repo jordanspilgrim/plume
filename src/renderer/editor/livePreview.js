@@ -296,7 +296,13 @@ function parseImage(src) {
   return m ? { alt: m[1], src: m[2] } : { alt: "", src: "" };
 }
 
+// Above this size, the whole-document live-preview pass is skipped so the
+// editor stays responsive (the file still opens as plain, highlighted text).
+const MAX_LIVE_PREVIEW_BYTES = 400_000;
+
 function buildDecorations(state) {
+  if (state.doc.length > MAX_LIVE_PREVIEW_BYTES) return Decoration.none;
+
   const ranges = [];
   const active = activeLineSet(state);
   const tree = syntaxTree(state);
