@@ -394,6 +394,13 @@ function buildDecorations(state) {
         return;
       }
       if (name === "ListMark") {
+        // Hanging indent: wrapped lines align under the text, not the bullet.
+        const ln = state.doc.lineAt(node.from);
+        const m = ln.text.match(/^(\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)/);
+        const col = m ? m[1].length : node.to - ln.from + 1;
+        ranges.push(
+          Decoration.line({ attributes: { style: `padding-left:${col}ch;text-indent:-${col}ch` } }).range(ln.from)
+        );
         const txt = state.doc.sliceString(node.from, node.to);
         if (/^[-*+]$/.test(txt) && shouldConceal(onActive)) {
           ranges.push(Decoration.replace({ widget: new BulletWidget() }).range(node.from, node.to));
