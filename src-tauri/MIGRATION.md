@@ -63,18 +63,26 @@ work against the Tauri build — the socket protocol is identical.
 | `plume://` scheme | `tauri-plugin-deep-link` + `on_open_url` | ✅ in Info.plist |
 | Focused-window agent query | `agent_query` targets focused window | — |
 
-## Remaining
+### Also ported (batch 4)
 
-1. **Export PDF** — the real gap: no `printToPDF` in WKWebView via Tauri. Best
-   path: `WKWebView.createPDF` (public on macOS 11+) through objc2.
-2. **Export DOCX + Google publish** — reuse the verified Node code
-   (`html-to-docx`, `gdocs.js`) via an esbuild-bundled Node sidecar spawned by
-   Rust (no node_modules at runtime).
-3. **`setDirty`** — N/A: the window title is hidden, and the renderer already
-   shows the dirty dot in its own titlebar.
+| Capability | Tauri | Verified |
+|---|---|---|
+| Export DOCX | `export_doc` docx → bundled Node sidecar (`html-to-docx`) | ✅ valid .docx bytes |
+| Google Docs publish | `publish_google` → sidecar (`gdocs.js`, openUrl injected) | ✅ NO_CREDS path; live gated on creds |
 
-Not yet live-verified (renderer-observable, mirror the verified Electron impls):
-link-preview render, image save, recovery banner, HTML export write.
+## Remaining — one item
+
+**Export PDF.** The genuine gap: WKWebView has no `printToPDF` exposed to JS, and
+Tauri doesn't wrap it. The correct fix is `WKWebView.createPDF` (public, macOS 11+)
+via objc2 — but that's unsafe Rust (raw webview-handle cast + an objc completion
+block + load-timing) that segfaults on mistakes, so it needs a focused, iterative
+pass rather than a blind one-shot. Until then, PDF export falls through (HTML and
+DOCX both work; the Electron build still does PDF).
+
+`setDirty` is **N/A** (hidden title; the renderer shows its own dirty dot).
+
+Not yet live-verified (renderer-observable; mirror the verified Electron impls):
+link-preview render, image save, recovery banner, HTML/DOCX dialog write.
 
 ## Notes / risks
 
