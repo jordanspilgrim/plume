@@ -993,6 +993,7 @@ const COMMANDS = [
   { label: "Toggle Files Sidebar", run: toggleSidebar },
   { label: "Toggle Outline", run: toggleOutline },
   { label: "Search in Folder", run: () => openSearch() },
+  { label: "Claude Code Sessions & Context", run: () => openWorkspace() },
   { label: "Copy as Rich Text", run: copyAsRichText },
   { label: "Copy for Google Docs", run: copyForGoogleDocs },
   { label: "Export to PDF", run: () => exportAs("pdf") },
@@ -1093,6 +1094,87 @@ searchInput.addEventListener("input", () => {
 searchInput.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeSearch(); view.focus(); } });
 searchPanel.addEventListener("mousedown", (e) => { if (e.target === searchPanel) closeSearch(); });
 
+/* ---------- Sessions & project context (Claude Code workspace) ---------- */
+const wsEl = document.getElementById("workspace");
+const wsInput = document.getElementById("ws-input");
+const wsList = document.getElementById("ws-list");
+let wsSessions = [], wsContext = [], wsTimer = null, wsRows = [], wsSel = 0;
+
+async function openWorkspace() {
+  closePalette(); closeSearch();
+  wsEl.classList.remove("hidden");
+  wsInput.value = "";
+  const dir = currentDir();
+  [wsContext, wsSessions] = await Promise.all([
+    window.plume.listContext(dir),
+    window.plume.listSessions(dir),
+  ]);
+  renderWorkspace("");
+  wsInput.focus();
+}
+function closeWorkspace() { wsEl.classList.add("hidden"); }
+
+function tsLabel(ms) {
+  const d = Date.now() - ms;
+  if (d < 6e4) return "just now";
+  if (d < 36e5) return Math.round(d / 6e4) + "m ago";
+  if (d < 864e5) return Math.round(d / 36e5) + "h ago";
+  return Math.round(d / 864e5) + "d ago";
+}
+
+function renderWorkspace(q) {
+  const term = q.trim().toLowerCase();
+  wsRows = []; wsSel = 0; wsList.innerHTML = "";
+  const addGroup = (label) => { const h = document.createElement("div"); h.className = "ws-group"; h.textContent = label; wsList.appendChild(h); };
+  const addRow = (title, sub, openPath, line) => {
+    const row = document.createElement("div");
+    row.className = "ws-item";
+    const t = document.createElement("div"); t.className = "ws-title"; t.textContent = title;
+    const s = document.createElement("div"); s.className = "ws-sub"; s.textContent = sub;
+    row.append(t, s);
+    const idx = wsRows.length;
+    row.onmousedown = (e) => { e.preventDefault(); closeWorkspace(); window.plume.openInThisWindow(openPath, line); };
+    row.onmouseenter = () => { wsSel = idx; paintWsSel(); };
+    wsList.appendChild(row);
+    wsRows.push({ el: row, path: openPath, line });
+  };
+
+  const ctx = wsContext.filter((c) => !term || c.name.toLowerCase().includes(term));
+  if (ctx.length) { addGroup("Project context"); ctx.forEach((c) => addRow(c.name, c.path.replace(/\/[^/]*$/, ""), c.path)); }
+
+  const sess = wsSessions.filter((s) => !term || s.title.toLowerCase().includes(term));
+  if (sess.length) { addGroup(term ? "Sessions (title)" : "Recent Claude Code sessions"); sess.slice(0, 40).forEach((s) => addRow(s.title, tsLabel(s.ts), s.path)); }
+
+  if (!wsRows.length && !term) wsList.innerHTML = '<div class="sb-empty">No Claude Code sessions or context files for this folder.</div>';
+  paintWsSel();
+
+  if (term.length >= 2) {
+    clearTimeout(wsTimer);
+    wsTimer = setTimeout(async () => {
+      const hits = await window.plume.searchSessions(term, currentDir());
+      const shown = new Set(wsRows.map((r) => r.path));
+      const fresh = hits.filter((h) => !shown.has(h.path));
+      if (fresh.length) {
+        addGroup("Matches in transcript");
+        fresh.forEach((h) => addRow(h.title, h.snippet, h.path));
+        paintWsSel();
+      }
+    }, 200);
+  }
+}
+function paintWsSel() {
+  wsRows.forEach((r, i) => r.el.classList.toggle("sel", i === wsSel));
+  if (wsRows[wsSel]) wsRows[wsSel].el.scrollIntoView({ block: "nearest" });
+}
+wsInput.addEventListener("input", () => renderWorkspace(wsInput.value));
+wsInput.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { closeWorkspace(); view.focus(); }
+  else if (e.key === "ArrowDown") { e.preventDefault(); wsSel = Math.min(wsSel + 1, wsRows.length - 1); paintWsSel(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); wsSel = Math.max(wsSel - 1, 0); paintWsSel(); }
+  else if (e.key === "Enter") { const r = wsRows[wsSel]; if (r) { closeWorkspace(); window.plume.openInThisWindow(r.path, r.line); } }
+});
+wsEl.addEventListener("mousedown", (e) => { if (e.target === wsEl) closeWorkspace(); });
+
 /* ---------- Menu + IPC wiring ---------- */
 window.plume.onOpenFile(({ filePath, content, recovery, gotoLine }) => loadDocument(content, filePath, recovery, gotoLine));
 window.plume.onExternalChange(({ content }) => applyExternalChange(content));
@@ -1115,6 +1197,7 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:toggleSidebar": toggleSidebar(); break;
     case "menu:palette": openPalette(); break;
     case "menu:searchFolder": openSearch(); break;
+    case "menu:workspace": openWorkspace(); break;
     case "menu:toggleToolbar": applyToolbar(document.getElementById("toolbar").classList.contains("hidden")); break;
     case "menu:toggleReveal": applyReveal(localStorage.getItem("plume-reveal") !== "1"); break;
     case "menu:toggleFocus": applyFocus(localStorage.getItem("plume-focus") !== "1"); break;
@@ -1132,7 +1215,7 @@ buildWelcome();
 updateWelcome();
 
 // Automation surface (used for scripting / testing the UI).
-window.__plume = { toggleSidebar, openPalette, openSearch, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, view };
+window.__plume = { toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, view };
 
 // Agent surface — read by the main process (executeJavaScript) for the MCP server.
 window.__plumeAgent = {

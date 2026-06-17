@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld("plume", {
       "menu:theme", "menu:toggleToolbar", "menu:toggleReveal", "menu:formatDoc",
       "menu:copyRich", "menu:copyHtml", "menu:export",
       "menu:toggleSidebar", "menu:palette", "menu:searchFolder", "menu:toggleFocus",
+      "menu:workspace",
     ];
     channels.forEach((ch) =>
       ipcRenderer.on(ch, (_e, ...args) => cb(ch, ...args))
@@ -37,6 +38,9 @@ contextBridge.exposeInMainWorld("plume", {
   linkPreview: (url) => ipcRenderer.invoke("link:preview", { url }),
   listDir: (dir, depth) => ipcRenderer.invoke("dir:list", { dir, depth }),
   searchFiles: (dir, query) => ipcRenderer.invoke("search:files", { dir, query }),
+  listSessions: (dir) => ipcRenderer.invoke("sessions:list", { dir }),
+  searchSessions: (query, dir) => ipcRenderer.invoke("sessions:search", { query, dir }),
+  listContext: (dir) => ipcRenderer.invoke("context:list", { dir }),
   openInThisWindow: (filePath, gotoLine) =>
     ipcRenderer.invoke("file:openInThisWindow", { filePath, gotoLine }),
   loadAnnotations: (filePath) => ipcRenderer.invoke("annotations:load", { filePath }),

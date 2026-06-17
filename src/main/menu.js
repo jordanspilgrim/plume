@@ -114,6 +114,7 @@ function buildMenu({ createWindow, installCli }) {
       submenu: [
         { label: "Command Palette…", accelerator: "CmdOrCtrl+P", click: () => send("menu:palette") },
         { label: "Search in Folder…", accelerator: "CmdOrCtrl+Shift+F", click: () => send("menu:searchFolder") },
+        { label: "Sessions & Context…", accelerator: "CmdOrCtrl+Shift+P", click: () => send("menu:workspace") },
       ],
     },
     {

@@ -455,6 +455,92 @@ ipcMain.handle("file:openInThisWindow", async (event, { filePath, gotoLine }) =>
   if (win) await openInWindow(win, filePath, gotoLine);
 });
 
+// ---------- Claude Code sessions + project context ----------
+const CLAUDE_PROJECTS = path.join(os.homedir(), ".claude", "projects");
+// Claude Code dashifies the project's absolute path: both "/" and "." become "-".
+function dashify(dir) { return dir.replace(/[/.]/g, "-"); }
+const CONTEXT_FILES = ["CLAUDE.md", "AGENTS.md", "GEMINI.md", ".cursorrules", "README.md", "TODO.md"];
+
+async function projectDirsFor(dir) {
+  if (dir) { const d = path.join(CLAUDE_PROJECTS, dashify(dir)); if (await isDir(d)) return [d]; }
+  try {
+    const entries = await fs.readdir(CLAUDE_PROJECTS, { withFileTypes: true });
+    return entries.filter((e) => e.isDirectory()).map((e) => path.join(CLAUDE_PROJECTS, e.name));
+  } catch { return []; }
+}
+
+async function sessionMeta(file) {
+  let title = "(empty session)", ts = 0;
+  try {
+    const stat = await fs.stat(file); ts = stat.mtimeMs;
+    const fh = await fs.open(file, "r");
+    const buf = Buffer.alloc(32768);
+    const { bytesRead } = await fh.read(buf, 0, 32768, 0);
+    await fh.close();
+    for (const ln of buf.toString("utf8", 0, bytesRead).split("\n")) {
+      if (!ln.trim()) continue;
+      let o; try { o = JSON.parse(ln); } catch { continue; }
+      if (o.type === "user") {
+        const c = o.message?.content;
+        let t = typeof c === "string" ? c : Array.isArray(c) ? c.map((x) => x.text || "").join(" ") : "";
+        t = t.trim();
+        if (t && !t.startsWith("<") && !t.startsWith("Caveat")) { title = t.slice(0, 90); break; }
+      }
+    }
+  } catch { /* skip */ }
+  return { path: file, title, ts };
+}
+
+ipcMain.handle("sessions:list", async (_e, { dir }) => {
+  const out = [];
+  for (const pd of await projectDirsFor(dir)) {
+    let files; try { files = (await fs.readdir(pd)).filter((f) => f.endsWith(".jsonl")); } catch { continue; }
+    for (const f of files) out.push(await sessionMeta(path.join(pd, f)));
+  }
+  out.sort((a, b) => b.ts - a.ts);
+  return out.slice(0, 80);
+});
+
+ipcMain.handle("sessions:search", async (_e, { query, dir }) => {
+  if (!query || query.length < 2) return [];
+  const q = query.toLowerCase();
+  const results = []; let scanned = 0;
+  for (const pd of await projectDirsFor(dir)) {
+    let files; try { files = (await fs.readdir(pd)).filter((f) => f.endsWith(".jsonl")); } catch { continue; }
+    for (const f of files) {
+      if (results.length >= 40 || scanned > 500) break;
+      scanned++;
+      const full = path.join(pd, f);
+      // Cap per-file reads at 4 MB so searching across many large transcripts stays responsive.
+      let txt;
+      try {
+        const fh = await fs.open(full, "r");
+        const buf = Buffer.alloc(4 * 1024 * 1024);
+        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+        await fh.close();
+        txt = buf.toString("utf8", 0, bytesRead);
+      } catch { continue; }
+      const idx = txt.toLowerCase().indexOf(q);
+      if (idx >= 0) {
+        const snippet = txt.slice(Math.max(0, idx - 40), idx + 90).replace(/\s+/g, " ").trim();
+        results.push({ ...(await sessionMeta(full)), snippet });
+      }
+    }
+  }
+  results.sort((a, b) => b.ts - a.ts);
+  return results;
+});
+
+ipcMain.handle("context:list", async (_e, { dir }) => {
+  if (!dir) return [];
+  const out = [];
+  for (const name of CONTEXT_FILES) {
+    const full = path.join(dir, name);
+    try { if ((await fs.stat(full)).isFile()) out.push({ name, path: full }); } catch { /* absent */ }
+  }
+  return out;
+});
+
 ipcMain.handle("annotations:load", async (_e, { filePath }) => readAnnotations(filePath));
 
 ipcMain.handle("annotations:save", async (_e, { filePath, annotations }) => {
