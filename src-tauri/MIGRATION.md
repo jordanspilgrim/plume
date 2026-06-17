@@ -70,16 +70,14 @@ work against the Tauri build — the socket protocol is identical.
 | Export DOCX | `export_doc` docx → bundled Node sidecar (`html-to-docx`) | ✅ valid .docx bytes |
 | Google Docs publish | `publish_google` → sidecar (`gdocs.js`, openUrl injected) | ✅ NO_CREDS path; live gated on creds |
 
-## Remaining — one item
+### Also ported (batch 5)
 
-**Export PDF.** The genuine gap: WKWebView has no `printToPDF` exposed to JS, and
-Tauri doesn't wrap it. The correct fix is `WKWebView.createPDF` (public, macOS 11+)
-via objc2 — but that's unsafe Rust (raw webview-handle cast + an objc completion
-block + load-timing) that segfaults on mistakes, so it needs a focused, iterative
-pass rather than a blind one-shot. Until then, PDF export falls through (HTML and
-DOCX both work; the Electron build still does PDF).
+| Capability | Tauri | Verified |
+|---|---|---|
+| Export PDF | `export_pdf` → hidden WKWebView `loadHTMLString` + `WKWebView.createPDF` (objc2) | ✅ valid %PDF-1.3 bytes |
 
-`setDirty` is **N/A** (hidden title; the renderer shows its own dirty dot).
+The migration is now **feature-complete**. `setDirty` is N/A (hidden title; the
+renderer shows its own dirty dot).
 
 Not yet live-verified (renderer-observable; mirror the verified Electron impls):
 link-preview render, image save, recovery banner, HTML/DOCX dialog write.

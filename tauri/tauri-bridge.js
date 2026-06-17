@@ -82,7 +82,10 @@ window.plume = {
 
   openInNewWindow: (filePath) => invoke("open_in_new_window", { filePath }).catch(() => null),
   exportDoc: (format, html, defaultName) =>
-    invoke("export_doc", { format, html, defaultName }).catch(() => null),
+    (format === "pdf"
+      ? invoke("export_pdf", { html, defaultName })
+      : invoke("export_doc", { format, html, defaultName })
+    ).catch(() => null),
 
   publishGoogle: async (content, defaultName) => {
     const r = await invoke("publish_google", { markdown: content, defaultName }).catch(() => null);

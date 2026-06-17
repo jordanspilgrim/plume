@@ -208,6 +208,91 @@ async fn publish_google(app: AppHandle, markdown: String, default_name: Option<S
     run_sidecar(&app, &json!({ "cmd": "gdocs", "markdown": markdown, "defaultName": default_name }))
 }
 
+// ---- PDF export: render HTML in a hidden WKWebView, then WKWebView.createPDF ----
+#[cfg(target_os = "macos")]
+fn pdf_load_html(pw: &tauri::webview::PlatformWebview, html: &str) {
+    use objc2_foundation::NSString;
+    use objc2_web_kit::WKWebView;
+    unsafe {
+        let wv: &WKWebView = &*(pw.inner() as *const WKWebView);
+        let _ = wv.loadHTMLString_baseURL(&NSString::from_str(html), None);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pdf_create(pw: &tauri::webview::PlatformWebview, tx: std::sync::mpsc::Sender<Result<Vec<u8>, String>>) {
+    use block2::RcBlock;
+    use objc2::MainThreadMarker;
+    use objc2_foundation::{NSData, NSError};
+    use objc2_web_kit::{WKPDFConfiguration, WKWebView};
+    unsafe {
+        let wv: &WKWebView = &*(pw.inner() as *const WKWebView);
+        let mtm = MainThreadMarker::new().expect("pdf_create must run on the main thread");
+        let config = WKPDFConfiguration::new(mtm);
+        let block = RcBlock::new(move |data: *mut NSData, _err: *mut NSError| {
+            if data.is_null() {
+                let _ = tx.send(Err("createPDF returned no data".into()));
+            } else {
+                let d: &NSData = &*data;
+                let _ = tx.send(Ok(d.to_vec()));
+            }
+        });
+        wv.createPDFWithConfiguration_completionHandler(Some(&config), &block);
+    }
+}
+
+fn generate_pdf(app: &AppHandle, html: String) -> Result<Vec<u8>, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+    let label = format!("pdf{}", app.state::<AppState>().win_counter.fetch_add(1, Ordering::SeqCst));
+    let app_main = app.clone();
+    let label_main = label.clone();
+    app.run_on_main_thread(move || {
+        let win = match tauri::WebviewWindowBuilder::new(&app_main, &label_main, tauri::WebviewUrl::App("index.html".into()))
+            .visible(false)
+            .inner_size(816.0, 1056.0)
+            .build()
+        {
+            Ok(w) => w,
+            Err(e) => { let _ = tx.send(Err(e.to_string())); return; }
+        };
+        let _ = win.with_webview(move |pw| pdf_load_html(&pw, &html));
+        let app2 = app_main.clone();
+        let label2 = label_main.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1000));
+            let app3 = app2.clone();
+            let _ = app2.run_on_main_thread(move || {
+                if let Some(win) = app3.get_webview_window(&label2) {
+                    let _ = win.with_webview(move |pw| pdf_create(&pw, tx));
+                }
+            });
+        });
+    }).map_err(|e| e.to_string())?;
+
+    let result = rx.recv_timeout(Duration::from_secs(20)).map_err(|_| "pdf timeout".to_string())?;
+    let app_close = app.clone();
+    let label_close = label.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = app_close.get_webview_window(&label_close) { let _ = w.close(); }
+    });
+    result
+}
+
+#[tauri::command]
+async fn export_pdf(app: AppHandle, html: String, default_name: Option<String>) -> Option<String> {
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("PDF", &["pdf"])
+        .set_file_name(&format!("{}.pdf", default_name.unwrap_or_else(|| "document".into())))
+        .blocking_save_file()?;
+    let out = picked.into_path().ok()?.to_string_lossy().to_string();
+    match generate_pdf(&app, html) {
+        Ok(bytes) if !bytes.is_empty() => { fs::write(&out, bytes).ok()?; Some(out) }
+        _ => None,
+    }
+}
+
 #[tauri::command]
 fn open_external(url: String) {
     let _ = open::that(url);
@@ -947,6 +1032,7 @@ fn main() {
             initial_file,
             open_in_new_window,
             export_doc,
+            export_pdf,
             publish_google,
             open_external,
             open_dialog,
