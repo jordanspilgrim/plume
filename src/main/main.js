@@ -1,6 +1,6 @@
 "use strict";
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard } = require("electron");
 const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs/promises");
@@ -9,6 +9,7 @@ const { watch } = require("node:fs");
 const crypto = require("node:crypto");
 const { buildMenu } = require("./menu");
 const { startControlServer, stopControlServer } = require("./control");
+const { publishToGoogleDocs } = require("./gdocs");
 
 let controlServer = null;
 
@@ -637,6 +638,37 @@ ipcMain.handle("link:preview", async (_e, { url }) => {
       site: meta("og:site_name") || host,
     });
   } catch {
+    return null;
+  }
+});
+
+ipcMain.handle("doc:publishGoogle", async (event, { content, defaultName }) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  try {
+    const url = await publishToGoogleDocs(content, defaultName);
+    const choice = dialog.showMessageBoxSync(win, {
+      type: "info", message: "Published to Google Docs", detail: url,
+      buttons: ["Open in Browser", "Copy Link", "Done"], defaultId: 0, cancelId: 2,
+    });
+    if (choice === 0) shell.openExternal(url);
+    else if (choice === 1) clipboard.writeText(url);
+    return url;
+  } catch (e) {
+    if (e.code === "NO_CREDS") {
+      dialog.showMessageBox(win, {
+        type: "info", message: "Connect Plume to Google Docs (one-time setup)",
+        detail:
+          "Google requires your own OAuth client (Plume can't ship one).\n\n" +
+          "1. console.cloud.google.com → enable the Google Docs API.\n" +
+          "2. APIs & Services → Credentials → Create OAuth client ID → type \"Desktop app\".\n" +
+          "3. Save it to ~/.plume/google.json:\n     { \"client_id\": \"…\", \"client_secret\": \"…\" }\n" +
+          "4. Publish again — a browser tab will ask you to authorize.\n\n" +
+          "Details in docs/agent-setup.md.",
+      });
+      return null;
+    }
+    if (e.code === "EMPTY") { dialog.showMessageBox(win, { type: "warning", message: "Nothing to publish" }); return null; }
+    dialog.showMessageBox(win, { type: "error", message: "Publish to Google Docs failed", detail: String(e.message || e) });
     return null;
   }
 });

@@ -93,3 +93,27 @@ Tools the agent gets:
    `write_document`. Plume live-reloads to the new version.
 
 You steer in prose, on the exact text; the agent picks it up and applies it.
+
+## 6. Publish to Google Docs (one-time setup)
+
+Turn the Markdown you're viewing into a shareable Google Doc:
+**File ▸ Publish to Google Docs…** (or the command palette). Disk stays the
+source of truth — this is a one-way publish, not a sync.
+
+Google requires *your own* OAuth client (Plume can't ship one), so the first
+time you'll do a 5-minute setup:
+
+1. At [console.cloud.google.com](https://console.cloud.google.com): create/pick a
+   project and **enable the Google Docs API**.
+2. **APIs & Services ▸ Credentials ▸ Create credentials ▸ OAuth client ID**,
+   application type **Desktop app**.
+3. Save the client to `~/.plume/google.json`:
+   ```json
+   { "client_id": "…apps.googleusercontent.com", "client_secret": "…" }
+   ```
+   (Or set `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` in the environment.)
+4. Publish again — a browser tab asks you to authorize once; the token is cached
+   in `~/.plume/google-token.json`. Future publishes are one click.
+
+The Markdown is converted to native Google Docs formatting — headings, bold/
+italic, inline code, links, and bullet/numbered lists.

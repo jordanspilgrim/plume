@@ -46,6 +46,7 @@ function buildMenu({ createWindow, installCli }) {
             { label: "Word (.docx)…", click: () => send("menu:export", "docx") },
           ],
         },
+        { label: "Publish to Google Docs…", click: () => send("menu:publishGoogle") },
         { type: "separator" },
         { label: "Install 'plume' Shell Command…", click: () => installCli && installCli() },
         { type: "separator" },

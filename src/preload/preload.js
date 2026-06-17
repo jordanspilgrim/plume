@@ -15,7 +15,7 @@ contextBridge.exposeInMainWorld("plume", {
       "menu:open", "menu:save", "menu:saveAs", "menu:find", "menu:replace",
       "menu:format", "menu:heading", "menu:toggleOutline", "menu:toggleMode",
       "menu:theme", "menu:toggleToolbar", "menu:toggleReveal", "menu:formatDoc",
-      "menu:copyRich", "menu:copyHtml", "menu:export",
+      "menu:copyRich", "menu:copyHtml", "menu:export", "menu:publishGoogle",
       "menu:toggleSidebar", "menu:palette", "menu:searchFolder", "menu:toggleFocus",
       "menu:workspace",
     ];
@@ -33,6 +33,8 @@ contextBridge.exposeInMainWorld("plume", {
     ipcRenderer.invoke("file:openInNewWindow", { filePath }),
   exportDoc: (format, html, defaultName) =>
     ipcRenderer.invoke("doc:export", { format, html, defaultName }),
+  publishGoogle: (content, defaultName) =>
+    ipcRenderer.invoke("doc:publishGoogle", { content, defaultName }),
   saveImage: (bytes, ext) => ipcRenderer.invoke("image:save", { bytes, ext }),
   pickImage: () => ipcRenderer.invoke("image:pick"),
   linkPreview: (url) => ipcRenderer.invoke("link:preview", { url }),

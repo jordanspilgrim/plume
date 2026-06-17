@@ -447,6 +447,11 @@ async function exportAs(format) {
   const result = await window.plume.exportDoc(format, html, docBaseName());
   if (result) flashMessage("Exported " + result.split("/").pop());
 }
+async function publishGoogle() {
+  if (currentMode !== "markdown") { flashMessage("Publish to Google Docs works on Markdown documents."); return; }
+  flashMessage("Publishing to Google Docs…");
+  await window.plume.publishGoogle(view.state.doc.toString(), docBaseName());
+}
 
 /* ---------- File I/O ---------- */
 function loadDocument(content, filePath, recovery, gotoLine) {
@@ -999,6 +1004,7 @@ const COMMANDS = [
   { label: "Export to PDF", run: () => exportAs("pdf") },
   { label: "Export to HTML", run: () => exportAs("html") },
   { label: "Export to Word (.docx)", run: () => exportAs("docx") },
+  { label: "Publish to Google Docs", run: () => publishGoogle() },
   { label: "Format Document (JSON)", run: formatDocument },
   { label: "Appearance: Dark", run: () => applyTheme("dark") },
   { label: "Appearance: Light", run: () => applyTheme("light") },
@@ -1205,6 +1211,7 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:copyRich": copyAsRichText(); break;
     case "menu:copyHtml": copyAsHtml(); break;
     case "menu:export": exportAs(args[0]); break;
+    case "menu:publishGoogle": publishGoogle(); break;
     case "menu:toggleMode": toggleSourceView(); break;
     case "menu:theme": applyTheme(args[0]); break;
   }
