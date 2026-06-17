@@ -39,6 +39,9 @@ contextBridge.exposeInMainWorld("plume", {
   searchFiles: (dir, query) => ipcRenderer.invoke("search:files", { dir, query }),
   openInThisWindow: (filePath, gotoLine) =>
     ipcRenderer.invoke("file:openInThisWindow", { filePath, gotoLine }),
+  loadAnnotations: (filePath) => ipcRenderer.invoke("annotations:load", { filePath }),
+  saveAnnotations: (filePath, annotations) =>
+    ipcRenderer.invoke("annotations:save", { filePath, annotations }),
 
   // Fire-and-forget renderer → main
   setDirty: (dirty) => ipcRenderer.send("doc:dirty", dirty),

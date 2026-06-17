@@ -60,8 +60,10 @@ writes; Plume is where you read, steer, and ship it.
 
 - **`plume` CLI** — `plume plan.md`, `plume report.md --line 42`, `plume .` (folder), `plume --new`. Install via **File ▸ Install 'plume' Shell Command…**. Talks to a running Plume over a local socket (`~/.plume/plume.sock`); launches it if needed.
 - **Auto-reload** means the rendered view updates live as the agent writes.
+- **MCP server** (`plume-mcp`) — `claude mcp add plume -- plume-mcp`. The agent can open files, read your current selection, read the **margin notes** you leave, and write revisions (Plume live-reloads).
+- **Steer loop** — select a passage, **⌘J**, type what you want changed. The note lands in the **Notes** panel; the agent reads it via `get_annotations` and revises. You steer in prose, on the exact text.
 - **Deep links** — `plume://open?path=/abs/file.md&line=12`.
-- **Drop-in agent config** + an optional Claude Code hook so the agent opens its own output — see [docs/agent-setup.md](docs/agent-setup.md).
+- **Drop-in agent config** + an optional Claude Code hook — see [docs/agent-setup.md](docs/agent-setup.md).
 
 ## Develop
 

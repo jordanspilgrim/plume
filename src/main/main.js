@@ -53,6 +53,18 @@ async function clearRecovery(filePath) {
   try { await fs.unlink(recoveryFileFor(filePath).file); } catch { /* none */ }
 }
 
+// Steer-loop annotations live in a sidecar so the .md stays clean:
+//   /dir/foo.md  ->  /dir/.plume/foo.md.notes.json
+function annotationsFileFor(filePath) {
+  const dir = path.join(path.dirname(filePath), ".plume");
+  return { dir, file: path.join(dir, path.basename(filePath) + ".notes.json") };
+}
+async function readAnnotations(filePath) {
+  if (!filePath) return [];
+  try { return JSON.parse(await fs.readFile(annotationsFileFor(filePath).file, "utf8")); }
+  catch { return []; }
+}
+
 /** @type {Map<number, { filePath: string|null, dirty: boolean }>} */
 const windowState = new Map();
 
@@ -212,6 +224,14 @@ function focusFront(win) {
 
 async function isDir(p) {
   try { return (await fs.stat(p)).isDirectory(); } catch { return false; }
+}
+
+/** Evaluate an expression against the focused window's agent surface (main world). */
+async function askRenderer(expr) {
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows().find((w) => !w.isDestroyed());
+  if (!win) return null;
+  try { return await win.webContents.executeJavaScript(`(window.__plumeAgent ? ${expr} : null)`); }
+  catch { return null; }
 }
 
 /** Route an incoming path to a sensible window: focus if already open, reuse a blank one, else new. */
@@ -435,6 +455,19 @@ ipcMain.handle("file:openInThisWindow", async (event, { filePath, gotoLine }) =>
   if (win) await openInWindow(win, filePath, gotoLine);
 });
 
+ipcMain.handle("annotations:load", async (_e, { filePath }) => readAnnotations(filePath));
+
+ipcMain.handle("annotations:save", async (_e, { filePath, annotations }) => {
+  if (!filePath) return false;
+  try {
+    const { dir, file } = annotationsFileFor(filePath);
+    if (Array.isArray(annotations) && annotations.length === 0) { await fs.unlink(file).catch(() => {}); return true; }
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(file, JSON.stringify(annotations, null, 2), "utf8");
+    return true;
+  } catch { return false; }
+});
+
 ipcMain.handle("image:save", async (event, { bytes, ext }) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   const state = windowState.get(win.id);
@@ -570,7 +603,7 @@ app.whenReady().then(() => {
   appReady = true;
   buildMenu({ createWindow, installCli });
 
-  // The control socket: the `plume` CLI and (Wave 2) the MCP server talk to us here.
+  // The control socket: the `plume` CLI and the MCP server talk to us here.
   controlServer = startControlServer({
     ping: () => ({ ok: true, version: app.getVersion() }),
     focus: () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); focusFront(); return { ok: true }; },
@@ -580,6 +613,34 @@ app.whenReady().then(() => {
       if (!target) { focusFront(); return { ok: false, error: "no path" }; }
       routeOpen(target, { line: req.line, newWindow: req.newWindow });
       return { ok: true };
+    },
+    // ---- Agent surface (MCP) ----
+    getActiveDocument: async () => {
+      const data = await askRenderer("window.__plumeAgent.getActiveDocument()");
+      return data ? { ok: true, ...data } : { ok: false, error: "no active document" };
+    },
+    getSelection: async () => {
+      const data = await askRenderer("window.__plumeAgent.getSelection()");
+      return data ? { ok: true, ...data } : { ok: false, error: "no active document" };
+    },
+    listOpenFiles: () => {
+      const focused = BrowserWindow.getFocusedWindow();
+      const files = BrowserWindow.getAllWindows().map((w) => {
+        const st = windowState.get(w.id);
+        return { path: st?.filePath || null, dirty: !!st?.dirty, focused: w === focused };
+      });
+      return { ok: true, files };
+    },
+    getAnnotations: async (req) => {
+      let p = req.path;
+      if (!p) { const data = await askRenderer("window.__plumeAgent.getActiveDocument()"); p = data?.path; }
+      if (!p) return { ok: false, error: "no path" };
+      return { ok: true, path: p, annotations: await readAnnotations(p) };
+    },
+    writeDocument: async (req) => {
+      if (!req.path || typeof req.content !== "string") return { ok: false, error: "path and content required" };
+      try { await fs.writeFile(req.path, req.content, "utf8"); return { ok: true, path: req.path }; }
+      catch (err) { return { ok: false, error: String(err.message || err) }; }
     },
   });
 
@@ -612,29 +673,36 @@ app.on("window-all-closed", () => {
  * bundled bin/plume.js to the first writable bin dir and marks it executable.
  */
 async function installCli() {
-  const src = path.join(app.getAppPath(), "bin", "plume.js");
+  const bins = [
+    { src: path.join(app.getAppPath(), "bin", "plume.js"), name: "plume" },
+    { src: path.join(app.getAppPath(), "bin", "plume-mcp.js"), name: "plume-mcp" },
+  ];
   const targets = ["/usr/local/bin", path.join(os.homedir(), ".local", "bin")];
-  let script;
-  try { script = await fs.readFile(src, "utf8"); }
-  catch { dialog.showMessageBox({ type: "error", message: "Couldn't find the bundled plume command." }); return; }
   for (const dir of targets) {
-    const dest = path.join(dir, "plume");
     try {
       await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(dest, script, "utf8");
-      fsSync.chmodSync(dest, 0o755);
+      for (const b of bins) {
+        const script = await fs.readFile(b.src, "utf8");
+        const dest = path.join(dir, b.name);
+        await fs.writeFile(dest, script, "utf8");
+        fsSync.chmodSync(dest, 0o755);
+      }
       const onPath = (process.env.PATH || "").split(":").includes(dir);
       await dialog.showMessageBox({
         type: "info",
-        message: "Installed the 'plume' command",
-        detail: `Wrote ${dest}.` + (onPath ? "\n\nTry: plume <file.md>" : `\n\n${dir} isn't on your PATH yet — add it to use 'plume' from any shell.`),
+        message: "Installed 'plume' and 'plume-mcp'",
+        detail:
+          `Wrote them to ${dir}.` +
+          (onPath ? "" : `\n\n${dir} isn't on your PATH yet — add it first.`) +
+          `\n\nOpen files:    plume <file.md>` +
+          `\nConnect agent: claude mcp add plume -- plume-mcp`,
       });
       return;
     } catch { /* try next dir */ }
   }
   dialog.showMessageBox({
     type: "warning",
-    message: "Couldn't write the 'plume' command automatically",
-    detail: `Run this in a terminal instead:\n\nsudo cp "${src}" /usr/local/bin/plume && sudo chmod 755 /usr/local/bin/plume`,
+    message: "Couldn't write the commands automatically",
+    detail: `Run this in a terminal instead:\n\nsudo cp "${bins[0].src}" /usr/local/bin/plume && sudo cp "${bins[1].src}" /usr/local/bin/plume-mcp && sudo chmod 755 /usr/local/bin/plume /usr/local/bin/plume-mcp`,
   });
 }

@@ -14,6 +14,7 @@ import { codeLanguages, codeHighlightStyle } from "./editor/highlight.js";
 import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, setFocusMode, refreshEffect, renderMermaidInto, Highlight } from "./editor/livePreview.js";
 import { modeForPath, languageForExt, codeFeatures, extOf, baseName } from "./editor/modes.js";
 import { diffDecorations, logDecorations } from "./editor/decorators.js";
+import { annotField, setAnnotRanges, locateQuote } from "./editor/annotations.js";
 import { renderJsonl, renderCsv } from "./editor/viewers.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
@@ -82,9 +83,11 @@ const view = new EditorView({
       langConf.of(markdownLang()),
       previewConf.of(livePreview),
       codeConf.of([]),
+      annotField,
       syntaxHighlighting(codeHighlightStyle),
       search({ top: true }),
       keymap.of([
+        { key: "Mod-j", run: () => { addAnnotation(); return true; } },
         ...defaultKeymap,
         ...historyKeymap,
         ...searchKeymap,
@@ -176,6 +179,132 @@ function updateWelcome() {
   const empty = view.state.doc.length === 0 && !currentPath && currentMode === "markdown";
   welcomeEl.classList.toggle("hidden", !empty);
 }
+
+/* ---------- Steer-loop annotations (notes the agent can read via MCP) ---------- */
+let annotations = []; // { id, quote, note, line, resolved, ts }
+function annotId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
+function refreshAnnotRanges() {
+  const ranges = [];
+  for (const a of annotations) {
+    const loc = locateQuote(view.state, a.quote, a.line);
+    if (loc) {
+      ranges.push({ id: a.id, from: loc.from, to: loc.to, resolved: a.resolved });
+      a.line = view.state.doc.lineAt(loc.from).number; // re-anchor for display / agent
+    }
+    a.anchored = !!loc;
+  }
+  view.dispatch({ effects: setAnnotRanges.of(ranges) });
+  renderNotes();
+}
+
+const notesEl = document.getElementById("notes");
+let notesHidden = false;
+function renderNotes() {
+  const has = annotations.length > 0;
+  notesEl.classList.toggle("hidden", !has || notesHidden);
+  if (!has || notesHidden) { notesEl.innerHTML = ""; return; }
+  notesEl.innerHTML = "";
+  const header = document.createElement("div");
+  header.className = "notes-header";
+  header.textContent = `Notes · ${annotations.length}`;
+  const close = document.createElement("button");
+  close.className = "notes-close"; close.textContent = "×"; close.title = "Hide notes";
+  close.onclick = () => { notesHidden = true; renderNotes(); };
+  header.appendChild(close);
+  notesEl.appendChild(header);
+  for (const a of annotations.slice().sort((x, y) => x.line - y.line)) {
+    const row = document.createElement("div");
+    row.className = "note-item" + (a.resolved ? " resolved" : "") + (a.anchored ? "" : " orphan");
+    const quote = document.createElement("div");
+    quote.className = "note-quote";
+    quote.textContent = a.anchored ? `“${a.quote.slice(0, 70)}”` : `“${a.quote.slice(0, 70)}” (text changed)`;
+    const text = document.createElement("div");
+    text.className = "note-text"; text.textContent = a.note;
+    row.append(quote, text);
+    row.onclick = () => {
+      const loc = locateQuote(view.state, a.quote, a.line);
+      if (loc) { view.dispatch({ selection: { anchor: loc.from }, effects: EditorView.scrollIntoView(loc.from, { y: "center" }) }); view.focus(); }
+    };
+    const bar = document.createElement("div");
+    bar.className = "note-actions";
+    const res = document.createElement("button");
+    res.textContent = a.resolved ? "Unresolve" : "Resolve";
+    res.onclick = (e) => { e.stopPropagation(); a.resolved = !a.resolved; persistAnnotations(); refreshAnnotRanges(); };
+    const del = document.createElement("button");
+    del.textContent = "Delete"; del.className = "ghost";
+    del.onclick = (e) => { e.stopPropagation(); annotations = annotations.filter((x) => x !== a); persistAnnotations(); refreshAnnotRanges(); };
+    bar.append(res, del);
+    row.appendChild(bar);
+    notesEl.appendChild(row);
+  }
+}
+function persistAnnotations() { if (currentPath) window.plume.saveAnnotations(currentPath, annotations); }
+async function loadAnnotationsFor(filePath) {
+  annotations = filePath ? ((await window.plume.loadAnnotations(filePath)) || []) : [];
+  refreshAnnotRanges();
+}
+
+let floatBox = null;
+function closeFloat() { if (floatBox) { floatBox.remove(); floatBox = null; } }
+function showFloatAt(x, y, build) {
+  closeFloat();
+  floatBox = document.createElement("div");
+  floatBox.className = "annot-float";
+  floatBox.style.left = Math.max(8, Math.min(x, window.innerWidth - 330)) + "px";
+  floatBox.style.top = (y + 6) + "px";
+  build(floatBox);
+  document.body.appendChild(floatBox);
+}
+document.addEventListener("mousedown", (e) => {
+  if (floatBox && !floatBox.contains(e.target) && !e.target.closest(".tok-annot")) closeFloat();
+});
+
+function addAnnotation() {
+  const sel = view.state.selection.main;
+  if (sel.empty) { flashMessage("Select text, then ⌘J to add a note for the agent"); return; }
+  if (!currentPath) { flashMessage("Save the file first to add notes."); return; }
+  const quote = view.state.sliceDoc(sel.from, sel.to).slice(0, 400);
+  const coords = view.coordsAtPos(sel.from);
+  showFloatAt(coords ? coords.left : 120, coords ? coords.bottom : 120, (box) => {
+    const ta = document.createElement("textarea");
+    ta.className = "annot-ta"; ta.rows = 3; ta.placeholder = "Note for the agent…  (⌘↵ to save)";
+    const bar = document.createElement("div"); bar.className = "annot-bar";
+    const save = document.createElement("button"); save.textContent = "Add note";
+    const cancel = document.createElement("button"); cancel.textContent = "Cancel"; cancel.className = "ghost";
+    save.onclick = () => {
+      const note = ta.value.trim(); closeFloat();
+      if (!note) return;
+      notesHidden = false;
+      annotations.push({ id: annotId(), quote, note, line: view.state.doc.lineAt(sel.from).number, resolved: false, ts: Date.now() });
+      persistAnnotations(); refreshAnnotRanges(); flashMessage("Note added — the agent can read it via MCP");
+    };
+    cancel.onclick = closeFloat;
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save.click(); }
+      if (e.key === "Escape") { e.preventDefault(); closeFloat(); }
+    });
+    bar.append(save, cancel); box.append(ta, bar); ta.focus();
+  });
+}
+
+// Click a highlight → view/resolve/delete the note.
+view.dom.addEventListener("click", (e) => {
+  const el = e.target.closest(".tok-annot"); if (!el) return;
+  const id = el.getAttribute("data-annot");
+  const a = annotations.find((x) => String(x.id) === id); if (!a) return;
+  const r = el.getBoundingClientRect();
+  showFloatAt(r.left, r.bottom, (box) => {
+    const note = document.createElement("div"); note.className = "annot-note"; note.textContent = a.note;
+    const bar = document.createElement("div"); bar.className = "annot-bar";
+    const resolve = document.createElement("button");
+    resolve.textContent = a.resolved ? "Unresolve" : "Resolve";
+    resolve.onclick = () => { a.resolved = !a.resolved; persistAnnotations(); refreshAnnotRanges(); closeFloat(); };
+    const del = document.createElement("button"); del.textContent = "Delete"; del.className = "ghost";
+    del.onclick = () => { annotations = annotations.filter((x) => x !== a); persistAnnotations(); refreshAnnotRanges(); closeFloat(); };
+    bar.append(resolve, del); box.append(note, bar);
+  });
+});
 
 /* ---------- Mode dispatch ---------- */
 const RENDER_MODES = new Set(["jsonl", "csv", "mermaid"]);
@@ -334,6 +463,7 @@ function loadDocument(content, filePath, recovery, gotoLine) {
   updateStatus();
   if (isRenderMode()) renderCurrent();
   updateWelcome();
+  loadAnnotationsFor(filePath);
   if (recovery != null) showRecoveryBanner(recovery);
   else clearBanner();
   if (gotoLine) {
@@ -1002,4 +1132,28 @@ buildWelcome();
 updateWelcome();
 
 // Automation surface (used for scripting / testing the UI).
-window.__plume = { toggleSidebar, openPalette, openSearch, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome };
+window.__plume = { toggleSidebar, openPalette, openSearch, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, view };
+
+// Agent surface — read by the main process (executeJavaScript) for the MCP server.
+window.__plumeAgent = {
+  getActiveDocument: () => ({
+    path: currentPath,
+    content: view.state.doc.toString(),
+    mode: currentMode,
+    dirty: titlebar.classList.contains("dirty"),
+  }),
+  getSelection: () => {
+    const s = view.state.selection.main;
+    return {
+      path: currentPath,
+      text: view.state.sliceDoc(s.from, s.to),
+      fromLine: view.state.doc.lineAt(s.from).number,
+      toLine: view.state.doc.lineAt(s.to).number,
+      empty: s.empty,
+    };
+  },
+  getAnnotations: () => {
+    refreshAnnotRanges();
+    return annotations.map((a) => ({ id: a.id, quote: a.quote, note: a.note, line: a.line, resolved: !!a.resolved, ts: a.ts }));
+  },
+};

@@ -63,8 +63,33 @@ Anything that can open a URL can drive Plume:
 plume://open?path=/abs/path/to/file.md&line=12
 ```
 
----
+## 5. MCP — let the agent read and steer through Plume
 
-The same control channel (`~/.plume/plume.sock`, newline-delimited JSON) powers a
-first-party **MCP server** (next), so an agent can open files, read your current
-selection, and pick up margin notes you leave — closing the steer loop.
+Plume ships a first-party MCP server (`plume-mcp`, installed alongside `plume`).
+Connect it once:
+
+```bash
+claude mcp add plume -- plume-mcp        # Claude Code
+# Codex / Claude Desktop: add { "command": "plume-mcp" } to your MCP config
+```
+
+Tools the agent gets:
+
+| Tool | What it does |
+|---|---|
+| `open_in_plume` | Open a file (optionally at a line) and bring it to the front |
+| `get_active_document` | The path + full text of what you're viewing (incl. unsaved edits) |
+| `get_selection` | The text you currently have selected, with its line range |
+| `list_open_files` | Every file open in Plume |
+| `get_annotations` | Your margin notes — the steer instructions you left |
+| `write_document` | Write a revision to disk (Plume live-reloads) |
+
+### The steer loop
+
+1. The agent writes a draft and runs `plume draft.md`.
+2. You read it. Select a passage, press **⌘J**, and type what you want changed —
+   e.g. *"make it teal, not blue."* The note shows in the **Notes** panel.
+3. The agent calls `get_annotations`, reads your instruction, revises with
+   `write_document`. Plume live-reloads to the new version.
+
+You steer in prose, on the exact text; the agent picks it up and applies it.
