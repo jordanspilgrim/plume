@@ -83,10 +83,21 @@ npm run dist       # → release/mac-arm64/Plume.app
 Then drag `Plume.app` to `/Applications`, and set it as the default for `.md`:
 right-click any `.md` → Get Info → Open with → Plume → Change All.
 
+## Tauri shell (in progress)
+
+A Tauri v2 reshell is scaffolded in `src-tauri/` to replace Electron (~449 MB)
+with a native WKWebView + Rust binary (**4.7 MB**). The renderer runs unchanged
+via a `window.plume` bridge (`tauri/tauri-bridge.js`); the core file loop
+(open/save/list/open-external) is ported and **verified rendering in WKWebView**.
+Remaining native surface (dialogs, file watcher, control socket, menu, export/PDF,
+sessions, Google publish) is enumerated in [src-tauri/MIGRATION.md](src-tauri/MIGRATION.md).
+Build: `npm run tauri:build`. The shipping app is still the Electron build until
+the port is complete.
+
 ## Roadmap
 
+- Finish the Tauri port (see `src-tauri/MIGRATION.md`)
 - Live table cell editing (edit a rendered cell in place)
-- Reshell in Tauri for a ~10 MB instant-launch native binary
 - Per-document settings (front-matter driven)
 
 ## License

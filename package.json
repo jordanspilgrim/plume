@@ -14,7 +14,10 @@
     "start": "npm run build:renderer && electron .",
     "dev": "npm run build:renderer && electron .",
     "dist": "npm run build:renderer && electron-builder",
-    "dist:dir": "npm run build:renderer && electron-builder --dir"
+    "dist:dir": "npm run build:renderer && electron-builder --dir",
+    "tauri:frontend": "npm run build:renderer && node scripts/build-tauri.mjs",
+    "tauri:build": "npm run tauri:frontend && tauri build",
+    "tauri:dev": "npm run tauri:frontend && tauri dev"
   },
   "build": {
     "appId": "com.gabriel.plume",
@@ -135,6 +138,7 @@
     }
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.11.2",
     "electron": "^42.4.0",
     "electron-builder": "^26.15.3",
     "esbuild": "^0.28.1"
@@ -166,6 +170,7 @@
     "@lezer/common": "^1.5.2",
     "@lezer/highlight": "^1.2.3",
     "@lezer/markdown": "^1.6.4",
+    "@tauri-apps/api": "^2.11.0",
     "html-to-docx": "^1.8.0",
     "katex": "^0.17.0",
     "markdown-it": "^14.2.0",
