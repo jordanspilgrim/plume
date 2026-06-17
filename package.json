@@ -5,6 +5,9 @@
   "author": "Gabriel",
   "license": "MIT",
   "main": "src/main/main.js",
+  "bin": {
+    "plume": "bin/plume.js"
+  },
   "scripts": {
     "build:renderer": "node esbuild.config.mjs",
     "watch:renderer": "node esbuild.config.mjs --watch",
@@ -25,8 +28,17 @@
       "src/preload/**/*",
       "src/renderer/index.html",
       "src/renderer/styles.css",
+      "bin/**/*",
       "dist/**/*",
       "package.json"
+    ],
+    "protocols": [
+      {
+        "name": "Plume",
+        "schemes": [
+          "plume"
+        ]
+      }
     ],
     "mac": {
       "category": "public.app-category.productivity",

@@ -7,7 +7,7 @@ function send(channel, ...args) {
   if (win) win.webContents.send(channel, ...args);
 }
 
-function buildMenu({ createWindow }) {
+function buildMenu({ createWindow, installCli }) {
   const isMac = process.platform === "darwin";
 
   const template = [
@@ -46,6 +46,8 @@ function buildMenu({ createWindow }) {
             { label: "Word (.docx)…", click: () => send("menu:export", "docx") },
           ],
         },
+        { type: "separator" },
+        { label: "Install 'plume' Shell Command…", click: () => installCli && installCli() },
         { type: "separator" },
         { label: "Close Window", accelerator: "CmdOrCtrl+W", role: "close" },
       ],

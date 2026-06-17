@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld("plume", {
     ipcRenderer.on("file:opened", (_e, payload) => cb(payload)),
   onExternalChange: (cb) =>
     ipcRenderer.on("file:externalChange", (_e, payload) => cb(payload)),
+  onFolderOpen: (cb) =>
+    ipcRenderer.on("folder:open", (_e, payload) => cb(payload)),
   onMenu: (cb) => {
     const channels = [
       "menu:open", "menu:save", "menu:saveAs", "menu:find", "menu:replace",

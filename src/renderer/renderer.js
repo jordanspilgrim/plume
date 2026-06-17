@@ -815,7 +815,8 @@ view.dom.addEventListener("drop", (e) => {
 
 /* ---------- Folder sidebar ---------- */
 const sidebarEl = document.getElementById("sidebar");
-function currentDir() { return currentPath ? currentPath.replace(/\/[^/]*$/, "") : null; }
+let sidebarRoot = null; // explicit root from `plume .`; otherwise the open file's dir
+function currentDir() { return sidebarRoot || (currentPath ? currentPath.replace(/\/[^/]*$/, "") : null); }
 
 async function refreshSidebar() {
   if (sidebarEl.classList.contains("hidden")) return;
@@ -965,6 +966,11 @@ searchPanel.addEventListener("mousedown", (e) => { if (e.target === searchPanel)
 /* ---------- Menu + IPC wiring ---------- */
 window.plume.onOpenFile(({ filePath, content, recovery, gotoLine }) => loadDocument(content, filePath, recovery, gotoLine));
 window.plume.onExternalChange(({ content }) => applyExternalChange(content));
+window.plume.onFolderOpen(({ dir }) => {
+  sidebarRoot = dir;
+  sidebarEl.classList.remove("hidden");
+  refreshSidebar();
+});
 
 window.plume.onMenu((channel, ...args) => {
   switch (channel) {

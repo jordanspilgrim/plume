@@ -53,6 +53,16 @@ Plume detects the file type and renders it appropriately — ideal for living ne
 - **Link previews** — a line that's just a link or URL renders as a card (title/description/site, fetched from the page); if the URL is an image, it displays inline.
 - **Writer tools** — live word count + reading time, `==highlight==`, `> [!NOTE]` callouts, and **Focus mode** (⌘⇧L) that dims everything but the current paragraph.
 
+### In your agent stack
+
+Plume is the **human pane** for agentic coding — the terminal is where your agent
+writes; Plume is where you read, steer, and ship it.
+
+- **`plume` CLI** — `plume plan.md`, `plume report.md --line 42`, `plume .` (folder), `plume --new`. Install via **File ▸ Install 'plume' Shell Command…**. Talks to a running Plume over a local socket (`~/.plume/plume.sock`); launches it if needed.
+- **Auto-reload** means the rendered view updates live as the agent writes.
+- **Deep links** — `plume://open?path=/abs/file.md&line=12`.
+- **Drop-in agent config** + an optional Claude Code hook so the agent opens its own output — see [docs/agent-setup.md](docs/agent-setup.md).
+
 ## Develop
 
 ```bash

@@ -2,10 +2,45 @@
 
 const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
 const path = require("node:path");
+const os = require("node:os");
 const fs = require("node:fs/promises");
+const fsSync = require("node:fs");
 const { watch } = require("node:fs");
 const crypto = require("node:crypto");
 const { buildMenu } = require("./menu");
+const { startControlServer, stopControlServer } = require("./control");
+
+let controlServer = null;
+
+// Single instance: one process owns the control socket + all windows. A second
+// `open`/launch forwards its file args to the primary via `second-instance`.
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on("second-instance", (_e, argv) => {
+    const p = argv.slice(1).find((a) => looksLikeOpenableFile(a) && path.isAbsolute(a));
+    if (p) routeOpen(p, {});
+    else focusFront();
+  });
+}
+
+// Deep links: plume://open?path=/abs/file.md&line=12[&new=1]
+app.setAsDefaultProtocolClient("plume");
+function handlePlumeUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.host !== "open" && !u.pathname.includes("open")) return;
+    const p = u.searchParams.get("path");
+    if (!p) return;
+    const abs = decodeURIComponent(p);
+    const line = parseInt(u.searchParams.get("line"), 10) || undefined;
+    const newWindow = u.searchParams.get("new") === "1";
+    if (appReady) routeOpen(abs, { line, newWindow });
+    else pendingPaths.push(abs);
+  } catch { /* ignore malformed */ }
+}
+app.on("open-url", (event, url) => { event.preventDefault(); handlePlumeUrl(url); });
 
 function recoveryFileFor(filePath) {
   const dir = path.join(app.getPath("userData"), "recovery");
@@ -40,7 +75,8 @@ function looksLikeOpenableFile(p) {
   return ext === "" || TEXT_EXTENSIONS.has(ext);
 }
 
-function createWindow(filePath = null) {
+function createWindow(filePath = null, gotoLine = undefined) {
+  let pendingGoto = gotoLine;
   const win = new BrowserWindow({
     width: 920,
     height: 720,
@@ -66,7 +102,7 @@ function createWindow(filePath = null) {
   win.webContents.on("did-finish-load", async () => {
     const state = windowState.get(win.id);
     const target = state?.filePath || filePath;
-    if (target) await openInWindow(win, target);
+    if (target) { await openInWindow(win, target, pendingGoto); pendingGoto = undefined; }
   });
 
   win.on("closed", () => {
@@ -167,18 +203,55 @@ function setupWatcher(win, filePath) {
   } catch { /* directory may be unwatchable; skip */ }
 }
 
-/** Route an incoming path to a sensible window: reuse a blank/focused one or make a new one. */
-function openPath(filePath) {
-  const focused = BrowserWindow.getFocusedWindow();
-  // If the focused window is empty and clean, load into it; otherwise new window.
-  if (focused) {
-    const state = windowState.get(focused.id);
-    if (state && !state.filePath && !state.dirty) {
-      openInWindow(focused, filePath);
+/** Bring a window (or the app) to the foreground — used when opened from the CLI. */
+function focusFront(win) {
+  const w = win || BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  if (w) { if (w.isMinimized()) w.restore(); w.show(); w.focus(); }
+  try { app.focus({ steal: true }); } catch { /* not always available */ }
+}
+
+async function isDir(p) {
+  try { return (await fs.stat(p)).isDirectory(); } catch { return false; }
+}
+
+/** Route an incoming path to a sensible window: focus if already open, reuse a blank one, else new. */
+function routeOpen(filePath, { line, newWindow } = {}) {
+  if (newWindow) { focusFront(createWindow(filePath, line)); return; }
+  // Already open somewhere → focus it (and re-jump to the line if given).
+  for (const win of BrowserWindow.getAllWindows()) {
+    const st = windowState.get(win.id);
+    if (st && st.filePath === filePath) {
+      if (line) openInWindow(win, filePath, line);
+      focusFront(win);
       return;
     }
   }
-  createWindow(filePath);
+  // Reuse a blank, clean, focused window if there is one.
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused) {
+    const state = windowState.get(focused.id);
+    if (state && !state.filePath && !state.dirty) {
+      openInWindow(focused, filePath, line);
+      focusFront(focused);
+      return;
+    }
+  }
+  focusFront(createWindow(filePath, line));
+}
+
+/** Open a folder in the sidebar (no file loaded) — backs `plume .`. */
+function openFolder(dir) {
+  const focused = BrowserWindow.getFocusedWindow();
+  let win, fresh = false;
+  if (focused) {
+    const st = windowState.get(focused.id);
+    if (st && !st.filePath && !st.dirty) win = focused;
+  }
+  if (!win) { win = createWindow(); fresh = true; }
+  const send = () => { if (!win.isDestroyed()) win.webContents.send("folder:open", { dir }); };
+  if (fresh) win.webContents.once("did-finish-load", send);
+  else send();
+  focusFront(win);
 }
 
 // ---------- IPC ----------
@@ -489,13 +562,26 @@ ipcMain.handle("doc:export", async (event, { format, html, defaultName }) => {
 
 app.on("open-file", (event, filePath) => {
   event.preventDefault();
-  if (appReady) openPath(filePath);
+  if (appReady) routeOpen(filePath, {});
   else pendingPaths.push(filePath);
 });
 
 app.whenReady().then(() => {
   appReady = true;
-  buildMenu({ createWindow });
+  buildMenu({ createWindow, installCli });
+
+  // The control socket: the `plume` CLI and (Wave 2) the MCP server talk to us here.
+  controlServer = startControlServer({
+    ping: () => ({ ok: true, version: app.getVersion() }),
+    focus: () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); focusFront(); return { ok: true }; },
+    open: async (req) => {
+      const target = req.path;
+      if (req.dir || (target && (await isDir(target)))) { openFolder(req.dir || target); return { ok: true }; }
+      if (!target) { focusFront(); return { ok: false, error: "no path" }; }
+      routeOpen(target, { line: req.line, newWindow: req.newWindow });
+      return { ok: true };
+    },
+  });
 
   // CLI arg (e.g. `electron . note.md`)
   const argPath = process.argv
@@ -515,6 +601,40 @@ app.whenReady().then(() => {
   });
 });
 
+app.on("will-quit", () => stopControlServer(controlServer));
+
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
+
+/**
+ * Install the `plume` CLI onto PATH (the VS Code `code` pattern). Copies the
+ * bundled bin/plume.js to the first writable bin dir and marks it executable.
+ */
+async function installCli() {
+  const src = path.join(app.getAppPath(), "bin", "plume.js");
+  const targets = ["/usr/local/bin", path.join(os.homedir(), ".local", "bin")];
+  let script;
+  try { script = await fs.readFile(src, "utf8"); }
+  catch { dialog.showMessageBox({ type: "error", message: "Couldn't find the bundled plume command." }); return; }
+  for (const dir of targets) {
+    const dest = path.join(dir, "plume");
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(dest, script, "utf8");
+      fsSync.chmodSync(dest, 0o755);
+      const onPath = (process.env.PATH || "").split(":").includes(dir);
+      await dialog.showMessageBox({
+        type: "info",
+        message: "Installed the 'plume' command",
+        detail: `Wrote ${dest}.` + (onPath ? "\n\nTry: plume <file.md>" : `\n\n${dir} isn't on your PATH yet — add it to use 'plume' from any shell.`),
+      });
+      return;
+    } catch { /* try next dir */ }
+  }
+  dialog.showMessageBox({
+    type: "warning",
+    message: "Couldn't write the 'plume' command automatically",
+    detail: `Run this in a terminal instead:\n\nsudo cp "${src}" /usr/local/bin/plume && sudo chmod 755 /usr/local/bin/plume`,
+  });
+}
