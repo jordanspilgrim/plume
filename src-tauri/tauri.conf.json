@@ -40,6 +40,7 @@
       "icons/icon.icns"
     ],
     "category": "public.app-category.productivity",
+    "resources": ["sidecar/plume-sidecar.cjs"],
     "fileAssociations": [
       {
         "ext": ["md", "markdown", "mdown", "mkd", "mdx", "txt", "text"],

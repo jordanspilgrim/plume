@@ -84,8 +84,11 @@ window.plume = {
   exportDoc: (format, html, defaultName) =>
     invoke("export_doc", { format, html, defaultName }).catch(() => null),
 
-  // still pending the full port (stubbed)
-  publishGoogle: async () => null,   // TODO: gdocs via node sidecar
+  publishGoogle: async (content, defaultName) => {
+    const r = await invoke("publish_google", { markdown: content, defaultName }).catch(() => null);
+    if (r && r.ok && r.url) invoke("open_external", { url: r.url }).catch(noop);
+    return r;
+  },
   setDirty: noop,                    // N/A: window title is hidden (renderer shows the dot)
 };
 

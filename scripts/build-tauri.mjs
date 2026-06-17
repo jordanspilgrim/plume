@@ -23,6 +23,18 @@ await esbuild.build({
 cpSync("dist", "build-tauri", { recursive: true, filter: (src) => !src.endsWith(".map") });
 cpSync("src/renderer/styles.css", "build-tauri/styles.css");
 
+// Bundle the Node export sidecar (html-to-docx + gdocs.js) into one standalone
+// CJS, dropped where tauri.conf bundles it as a resource.
+mkdirSync("src-tauri/sidecar", { recursive: true });
+await esbuild.build({
+  entryPoints: ["bin/plume-sidecar.js"],
+  bundle: true,
+  format: "cjs",
+  platform: "node",
+  outfile: "src-tauri/sidecar/plume-sidecar.cjs",
+  logLevel: "error",
+});
+
 let html = readFileSync("src/renderer/index.html", "utf8");
 html = html
   .replace("../../dist/renderer.css", "renderer.css")

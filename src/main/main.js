@@ -645,7 +645,7 @@ ipcMain.handle("link:preview", async (_e, { url }) => {
 ipcMain.handle("doc:publishGoogle", async (event, { content, defaultName }) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   try {
-    const url = await publishToGoogleDocs(content, defaultName);
+    const url = await publishToGoogleDocs(content, defaultName, (u) => shell.openExternal(u));
     const choice = dialog.showMessageBoxSync(win, {
       type: "info", message: "Published to Google Docs", detail: url,
       buttons: ["Open in Browser", "Copy Link", "Done"], defaultId: 0, cancelId: 2,

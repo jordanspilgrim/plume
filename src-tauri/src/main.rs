@@ -150,6 +150,37 @@ fn open_in_new_window(app: AppHandle, file_path: String) -> Result<(), String> {
     spawn_window(&app, &file_path)
 }
 
+// Reuse verified Node code (html-to-docx, gdocs.js) via the bundled sidecar.
+fn sidecar_script(app: &AppHandle) -> Option<PathBuf> {
+    let p = app.path().resource_dir().ok()?.join("sidecar/plume-sidecar.cjs");
+    if p.exists() { Some(p) } else { None }
+}
+
+fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
+    use std::process::{Command, Stdio};
+    let script = match sidecar_script(app) {
+        Some(p) => p,
+        None => return json!({ "ok": false, "error": "export sidecar not found" }),
+    };
+    let mut child = match Command::new("node")
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return json!({ "ok": false, "error": "node not found on PATH" }),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(req.to_string().as_bytes());
+    }
+    match child.wait_with_output() {
+        Ok(o) => serde_json::from_slice(&o.stdout).unwrap_or(json!({ "ok": false, "error": "no result" })),
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
 #[tauri::command]
 async fn export_doc(app: AppHandle, format: String, html: String, default_name: Option<String>) -> Option<String> {
     let ext = match format.as_str() { "html" => "html", "pdf" => "pdf", "docx" => "docx", _ => "html" };
@@ -161,12 +192,20 @@ async fn export_doc(app: AppHandle, format: String, html: String, default_name: 
         .blocking_save_file()?;
     let path = picked.into_path().ok()?;
     let p = path.to_string_lossy().to_string();
-    // HTML is native; PDF/DOCX are wired in their own batches (see MIGRATION.md).
     if ext == "html" {
         fs::write(&p, html).ok()?;
         return Some(p);
     }
-    None
+    if ext == "docx" {
+        let res = run_sidecar(&app, &json!({ "cmd": "docx", "html": html, "out": p }));
+        return if res["ok"] == true { Some(p) } else { None };
+    }
+    None // pdf — see MIGRATION.md
+}
+
+#[tauri::command]
+async fn publish_google(app: AppHandle, markdown: String, default_name: Option<String>) -> Value {
+    run_sidecar(&app, &json!({ "cmd": "gdocs", "markdown": markdown, "defaultName": default_name }))
 }
 
 #[tauri::command]
@@ -908,6 +947,7 @@ fn main() {
             initial_file,
             open_in_new_window,
             export_doc,
+            publish_google,
             open_external,
             open_dialog,
             save_dialog,

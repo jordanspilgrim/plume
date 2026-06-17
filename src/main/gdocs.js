@@ -11,7 +11,6 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
-const { shell } = require("electron");
 const MarkdownIt = require("markdown-it");
 
 const md = new MarkdownIt({ html: false, linkify: true });
@@ -153,7 +152,7 @@ async function loadCreds() {
   return cid && cs ? { cid, cs } : null;
 }
 
-function runOAuthFlow(creds) {
+function runOAuthFlow(creds, openUrl) {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       try {
@@ -181,7 +180,7 @@ function runOAuthFlow(creds) {
         access_type: "offline",
         prompt: "consent",
       });
-      shell.openExternal(authUrl);
+      openUrl(authUrl);
     });
   });
 }
@@ -212,18 +211,21 @@ async function accessTokenFromRefresh(creds, refresh) {
   return (await res.json()).access_token;
 }
 
-async function getAccessToken(creds) {
+async function getAccessToken(creds, openUrl) {
   let refresh;
   try { refresh = JSON.parse(await fs.readFile(TOKEN_FILE, "utf8")).refresh_token; } catch { /* none */ }
-  if (!refresh) refresh = await runOAuthFlow(creds);
+  if (!refresh) refresh = await runOAuthFlow(creds, openUrl);
   return accessTokenFromRefresh(creds, refresh);
 }
 
 // ---------- Publish ----------
-async function publishToGoogleDocs(mdText, defaultName) {
+// openUrl: (url) => void — opens the consent page in the user's browser.
+// Injected so this works under both Electron (shell.openExternal) and a plain
+// Node sidecar (macOS `open`).
+async function publishToGoogleDocs(mdText, defaultName, openUrl) {
   const creds = await loadCreds();
   if (!creds) { const e = new Error("no-credentials"); e.code = "NO_CREDS"; throw e; }
-  const access = await getAccessToken(creds);
+  const access = await getAccessToken(creds, openUrl);
   const { title, requests } = markdownToDocsRequests(mdText);
   if (!requests.length) { const e = new Error("empty"); e.code = "EMPTY"; throw e; }
 

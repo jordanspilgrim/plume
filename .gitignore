@@ -13,3 +13,4 @@ test-image.png
 build-tauri/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/sidecar/
