@@ -54,20 +54,27 @@ work against the Tauri build — the socket protocol is identical.
 | Single-instance | `tauri-plugin-single-instance` | ✅ one process |
 | Crash-recovery restore | `recovery_for` in open paths | compiled |
 
+### Also ported (batch 3)
+
+| Capability | Tauri | Verified |
+|---|---|---|
+| Multi-window | `open_in_new_window` / `spawn_window` + per-window `initial_file`; socket `--new` | ✅ window count 1→2 |
+| Export HTML | `export_doc` (save dialog + write) | compiled (native modal) |
+| `plume://` scheme | `tauri-plugin-deep-link` + `on_open_url` | ✅ in Info.plist |
+| Focused-window agent query | `agent_query` targets focused window | — |
+
 ## Remaining
 
-1. **Export** — DOCX via `html-to-docx` (Node sidecar). **PDF is the real gap**:
-   no `printToPDF` in WKWebView via Tauri. Best path: `WKWebView.createPDF`
-   (public on macOS 11+) through objc2, or a small print sidecar.
-2. **Google Docs publish** — `gdocs.js` is plain Node; invoke via a Node sidecar,
-   or port the OAuth loopback + fetch to Rust.
-3. **Multi-window** — `openInNewWindow` (Wave-1 routeOpen semantics).
-4. **`plume://` custom scheme** — add `tauri-plugin-deep-link` (file association
-   + `RunEvent::Opened` already cover Finder "Open With").
-5. **`setDirty`** — reflect the edited state in the window proxy icon (cosmetic).
+1. **Export PDF** — the real gap: no `printToPDF` in WKWebView via Tauri. Best
+   path: `WKWebView.createPDF` (public on macOS 11+) through objc2.
+2. **Export DOCX + Google publish** — reuse the verified Node code
+   (`html-to-docx`, `gdocs.js`) via an esbuild-bundled Node sidecar spawned by
+   Rust (no node_modules at runtime).
+3. **`setDirty`** — N/A: the window title is hidden, and the renderer already
+   shows the dirty dot in its own titlebar.
 
 Not yet live-verified (renderer-observable, mirror the verified Electron impls):
-link-preview render, image save, recovery banner.
+link-preview render, image save, recovery banner, HTML export write.
 
 ## Notes / risks
 

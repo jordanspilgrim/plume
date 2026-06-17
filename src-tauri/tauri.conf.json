@@ -6,6 +6,13 @@
   "build": {
     "frontendDist": "../build-tauri"
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["plume"]
+      }
+    }
+  },
   "app": {
     "macOSPrivateApi": true,
     "windows": [

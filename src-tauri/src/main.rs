@@ -29,6 +29,8 @@ struct AppState {
     watcher: Mutex<Option<RecommendedWatcher>>,
     pending: Mutex<HashMap<u64, Sender<Value>>>,
     next_id: AtomicU64,
+    window_files: Mutex<HashMap<String, String>>,
+    win_counter: AtomicU64,
 }
 
 fn plume_dir() -> PathBuf {
@@ -117,12 +119,54 @@ struct InitialFile {
 }
 
 #[tauri::command]
-fn initial_file(app: AppHandle) -> Option<InitialFile> {
-    let p = app.state::<AppState>().initial.lock().unwrap().clone()?;
+fn initial_file(app: AppHandle, window: tauri::WebviewWindow) -> Option<InitialFile> {
+    let st = app.state::<AppState>();
+    // A window opened via open_in_new_window has its own target file.
+    let per_window = st.window_files.lock().unwrap().remove(window.label());
+    let p = per_window.or_else(|| st.initial.lock().unwrap().clone())?;
     let content = fs::read_to_string(&p).ok()?;
     let recovery = recovery_for(&p);
     set_current(&app, &p, &content);
     Some(InitialFile { path: p, content, recovery })
+}
+
+fn spawn_window(app: &AppHandle, file_path: &str) -> Result<(), String> {
+    let st = app.state::<AppState>();
+    let label = format!("w{}", st.win_counter.fetch_add(1, Ordering::SeqCst));
+    st.window_files.lock().unwrap().insert(label.clone(), file_path.to_string());
+    tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("index.html".into()))
+        .title("Plume")
+        .inner_size(920.0, 720.0)
+        .min_inner_size(480.0, 320.0)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn open_in_new_window(app: AppHandle, file_path: String) -> Result<(), String> {
+    spawn_window(&app, &file_path)
+}
+
+#[tauri::command]
+async fn export_doc(app: AppHandle, format: String, html: String, default_name: Option<String>) -> Option<String> {
+    let ext = match format.as_str() { "html" => "html", "pdf" => "pdf", "docx" => "docx", _ => "html" };
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter(&ext.to_uppercase(), &[ext])
+        .set_file_name(&format!("{}.{}", default_name.unwrap_or_else(|| "document".into()), ext))
+        .blocking_save_file()?;
+    let path = picked.into_path().ok()?;
+    let p = path.to_string_lossy().to_string();
+    // HTML is native; PDF/DOCX are wired in their own batches (see MIGRATION.md).
+    if ext == "html" {
+        fs::write(&p, html).ok()?;
+        return Some(p);
+    }
+    None
 }
 
 #[tauri::command]
@@ -634,7 +678,12 @@ fn agent_query(app: &AppHandle, kind: &str) -> Value {
     let id = state.next_id.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = std::sync::mpsc::channel();
     state.pending.lock().unwrap().insert(id, tx);
-    let _ = app.emit("agent-request", json!({ "id": id, "kind": kind }));
+    let payload = json!({ "id": id, "kind": kind });
+    // Target the focused window (correct with multiple windows open).
+    match app.webview_windows().into_values().find(|w| w.is_focused().unwrap_or(false)) {
+        Some(w) => { let _ = w.emit("agent-request", payload); }
+        None => { let _ = app.emit("agent-request", payload); }
+    }
     match rx.recv_timeout(Duration::from_secs(3)) {
         Ok(mut v) => {
             if let Some(obj) = v.as_object_mut() {
@@ -663,6 +712,14 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
             json!({ "ok": true })
         }
         "open" => {
+            if req["newWindow"].as_bool().unwrap_or(false) {
+                if let Some(p) = req["path"].as_str() {
+                    let appc = app.clone();
+                    let path = p.to_string();
+                    let _ = app.run_on_main_thread(move || { let _ = spawn_window(&appc, &path); });
+                    return json!({ "ok": true });
+                }
+            }
             if let Some(p) = req["path"].as_str() {
                 if let Ok(content) = fs::read_to_string(p) {
                     set_current(app, p, &content);
@@ -697,6 +754,10 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
         "listOpenFiles" => {
             let cur = app.state::<AppState>().current.lock().unwrap().clone();
             json!({ "ok": true, "files": [{ "path": cur, "dirty": false, "focused": true }] })
+        }
+        "windows" => {
+            let labels: Vec<String> = app.webview_windows().into_keys().collect();
+            json!({ "ok": true, "count": labels.len(), "labels": labels })
         }
         "getActiveDocument" => agent_query(app, "getActiveDocument"),
         "getSelection" => agent_query(app, "getSelection"),
@@ -839,11 +900,14 @@ fn main() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_deep_link::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             read_path,
             write_file,
             initial_file,
+            open_in_new_window,
+            export_doc,
             open_external,
             open_dialog,
             save_dialog,
@@ -883,7 +947,24 @@ fn main() {
                 }
             }
             let _ = build_and_set_menu(&handle);
-            start_socket(handle);
+            start_socket(handle.clone());
+
+            // plume://open?path=/abs/file.md deep links
+            use tauri_plugin_deep_link::DeepLinkExt;
+            let _ = app.deep_link().register("plume");
+            let dl_handle = handle.clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    let s = url.to_string();
+                    if let Some(q) = s.split('?').nth(1) {
+                        for kv in q.split('&') {
+                            if let Some(p) = kv.strip_prefix("path=") {
+                                open_external_file(&dl_handle, &urlencoding_decode(p));
+                            }
+                        }
+                    }
+                }
+            });
             Ok(())
         })
         .build(tauri::generate_context!())

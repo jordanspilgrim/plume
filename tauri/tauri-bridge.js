@@ -80,11 +80,13 @@ window.plume = {
   pickImage: () => invoke("pick_image").catch(() => null),
   linkPreview: (url) => invoke("link_preview", { url }).catch(() => null),
 
+  openInNewWindow: (filePath) => invoke("open_in_new_window", { filePath }).catch(() => null),
+  exportDoc: (format, html, defaultName) =>
+    invoke("export_doc", { format, html, defaultName }).catch(() => null),
+
   // still pending the full port (stubbed)
-  openInNewWindow: async () => null, // TODO: multi-window
-  exportDoc: async () => null,       // TODO: PDF (WKWebView createPDF) + DOCX
-  publishGoogle: async () => null,   // TODO: gdocs via sidecar
-  setDirty: noop,                    // window edited indicator (cosmetic)
+  publishGoogle: async () => null,   // TODO: gdocs via node sidecar
+  setDirty: noop,                    // N/A: window title is hidden (renderer shows the dot)
 };
 
 // Pull the launch file once the renderer has registered its handler.
