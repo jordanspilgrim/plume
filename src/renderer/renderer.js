@@ -790,8 +790,13 @@ async function copyForGoogleDocs() {
 }
 
 /* ---------- Toolbar ---------- */
-// Consistent 18px icon set (1.6–1.8 stroke, rounded) for the floating pill.
+// Consistent 18px icon set (1.6–1.8 stroke, rounded) — all icons, no text glyphs.
 const ICONS = {
+  heading: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M3.5 5h6" stroke-width="2.4"/><path d="M3.5 9.3h11" stroke-width="1.5"/><path d="M3.5 13h8" stroke-width="1.5"/></svg>',
+  bold: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5.6 4h4a2.4 2.4 0 0 1 0 4.8h-4zM5.6 8.8h4.6a2.6 2.6 0 0 1 0 5.2H5.6z"/></svg>',
+  italic: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 4.5H7.5M10.5 13.5H6.5M10 4.5 8 13.5"/></svg>',
+  strike: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 9h11"/><path d="M12.4 5.6C11.9 4.6 10.7 4 9.2 4 7.4 4 6.1 4.9 6.1 6.3c0 .7.3 1.2.9 1.6M6.2 11.8c.4 1.2 1.7 1.9 3.3 1.9 1.9 0 3.2-.9 3.2-2.3"/></svg>',
+  type: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6V5h10v1M9 5.2v8.6M7.4 13.8h3.2"/></svg>',
   code: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 5 2.5 9 6 13M12 5l3.5 4L12 13"/></svg>',
   link: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 11 11 7M8 5l1.2-1.2a3 3 0 0 1 4.2 4.2L12.2 9.2M10 13l-1.2 1.2a3 3 0 0 1-4.2-4.2L5.8 8.8"/></svg>',
   bullet: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="3.5" cy="5" r="1.2" fill="currentColor" stroke="none"/><circle cx="3.5" cy="9" r="1.2" fill="currentColor" stroke="none"/><circle cx="3.5" cy="13" r="1.2" fill="currentColor" stroke="none"/><path d="M7.5 5h7M7.5 9h7M7.5 13h7"/></svg>',
@@ -804,17 +809,16 @@ const ICONS = {
   image: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="13" height="11" rx="2.5"/><circle cx="6.2" cy="7.2" r="1.3" fill="currentColor" stroke="none"/><path d="M3 13l3.6-3.3 2.4 2.2L11.3 9 15 13"/></svg>',
   gdocs: '<svg viewBox="0 0 18 18"><path d="M4.5 2h4.6L12.5 5.4V15a.6.6 0 0 1-.6.6H4.5a.6.6 0 0 1-.6-.6V2.6A.6.6 0 0 1 4.5 2z" fill="none" stroke="#4285F4" stroke-width="1.3" stroke-linejoin="round"/><path d="M9 2.2v3.4h3.4" fill="none" stroke="#4285F4" stroke-width="1.3"/><path d="M6.2 8.6h5.4M6.2 10.7h5.4M6.2 12.8h3.8" stroke="#4285F4" stroke-width="1.1" stroke-linecap="round"/></svg>',
 };
+const CHEVRON = '<svg class="tb-chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5 6 7.5 9 4.5"/></svg>';
 
 const TOOLBAR_GROUPS = [
   [
-    { t: "Heading 1  ⌘1", text: "H1", fn: () => setHeading(1), active: (l) => /^# /.test(l) },
-    { t: "Heading 2  ⌘2", text: "H2", fn: () => setHeading(2), active: (l) => /^## /.test(l) },
-    { t: "Heading 3  ⌘3", text: "H3", fn: () => setHeading(3), active: (l) => /^### /.test(l) },
+    { t: "Paragraph style", svg: "heading", menu: "heading", active: (l) => /^#{1,6} /.test(l) },
   ],
   [
-    { t: "Bold  ⌘B", text: "<b>B</b>", fn: () => applyFormat("bold") },
-    { t: "Italic  ⌘I", text: "<i>I</i>", fn: () => applyFormat("italic") },
-    { t: "Strikethrough  ⌘⇧X", text: "<s>S</s>", fn: () => applyFormat("strike") },
+    { t: "Bold  ⌘B", svg: "bold", fn: () => applyFormat("bold") },
+    { t: "Italic  ⌘I", svg: "italic", fn: () => applyFormat("italic") },
+    { t: "Strikethrough  ⌘⇧X", svg: "strike", fn: () => applyFormat("strike") },
     { t: "Inline code  ⌘E", svg: "code", fn: () => applyFormat("code") },
     { t: "Link  ⌘K", svg: "link", fn: () => applyFormat("link") },
   ],
@@ -832,6 +836,9 @@ const TOOLBAR_GROUPS = [
   [
     { t: "Image alt text", svg: "image", fn: editImageAlt },
     { t: "Copy for Google Docs", svg: "gdocs", fn: copyForGoogleDocs },
+  ],
+  [
+    { t: "Editor font", svg: "type", menu: "font" },
   ],
 ];
 
@@ -884,22 +891,58 @@ function buildToolbar() {
     }
     for (const b of group) {
       const btn = document.createElement("button");
-      btn.className = "tb-btn";
+      btn.className = "tb-btn" + (b.menu ? " has-menu" : "");
       btn.title = b.t;
       btn.setAttribute("aria-label", b.t);
-      btn.innerHTML = b.svg ? ICONS[b.svg] : `<span class="tb-text">${b.text}</span>`;
+      btn.innerHTML = (b.svg ? ICONS[b.svg] : `<span class="tb-text">${b.text}</span>`) + (b.menu ? CHEVRON : "");
       btn.addEventListener("mousedown", (e) => e.preventDefault()); // keep editor selection
-      btn.addEventListener("click", b.fn);
+      if (b.menu) btn.addEventListener("click", () => openToolbarMenu(btn, b.menu));
+      else btn.addEventListener("click", b.fn);
       pill.appendChild(btn);
       if (b.active) toolbarButtons.push({ el: btn, active: b.active });
     }
   });
-  const div = document.createElement("span");
-  div.className = "tb-divider";
-  pill.appendChild(div);
-  pill.appendChild(buildFontPicker());
   tb.appendChild(pill);
   updateToolbarActive();
+}
+
+/* ---------- Toolbar dropdown menus (heading + font) ---------- */
+let openMenuEl = null;
+function closeToolbarMenu() { if (openMenuEl) { openMenuEl.remove(); openMenuEl = null; } }
+document.addEventListener("mousedown", (e) => {
+  if (openMenuEl && !openMenuEl.contains(e.target) && !e.target.closest(".tb-btn.has-menu")) closeToolbarMenu();
+});
+function headingMenuItems() {
+  const lvl = (view.state.doc.lineAt(view.state.selection.main.head).text.match(/^(#{1,6}) /) || [])[1]?.length || 0;
+  return [
+    { label: "Title", fn: () => setHeading(1), checked: lvl === 1 },
+    { label: "Heading", fn: () => setHeading(2), checked: lvl === 2 },
+    { label: "Subheading", fn: () => setHeading(3), checked: lvl === 3 },
+    { label: "Body text", fn: () => setHeading(0), checked: lvl === 0 },
+  ];
+}
+function fontMenuItems() {
+  const cur = localStorage.getItem("plume-font") || "inter";
+  return FONTS.map((f) => ({ label: f.label, fn: () => applyFont(f.id), checked: f.id === cur }));
+}
+function openToolbarMenu(anchor, kind) {
+  if (openMenuEl) { closeToolbarMenu(); return; }
+  const items = kind === "heading" ? headingMenuItems() : fontMenuItems();
+  const menu = document.createElement("div");
+  menu.className = "tb-menu";
+  for (const it of items) {
+    const row = document.createElement("button");
+    row.className = "tb-menu-item" + (it.checked ? " checked" : "");
+    row.innerHTML = `<span class="tbm-check">${it.checked ? "✓" : ""}</span><span>${it.label}</span>`;
+    row.addEventListener("mousedown", (e) => e.preventDefault());
+    row.addEventListener("click", () => { closeToolbarMenu(); it.fn(); view.focus(); });
+    menu.appendChild(row);
+  }
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  menu.style.left = Math.min(r.left, window.innerWidth - menu.offsetWidth - 10) + "px";
+  menu.style.top = r.bottom + 6 + "px";
+  openMenuEl = menu;
 }
 
 // Light up the buttons that match the current line (heading level, list, quote).

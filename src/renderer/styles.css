@@ -397,25 +397,19 @@ html, body {
 }
 #toolbar.hidden { display: none; }
 
-/* The detached, frosted pill */
+/* Outlined pill — border-defined, no drop shadow */
 .tb-pill {
   display: inline-flex;
   align-items: center;
   gap: 3px;
   max-width: 100%;
-  padding: 5px 8px;
-  border-radius: 15px;
-  background: color-mix(in srgb, var(--bg-elevated) 72%, transparent);
-  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
-  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  -webkit-backdrop-filter: blur(22px) saturate(1.4);
-  backdrop-filter: blur(22px) saturate(1.4);
+  padding: 5px 7px;
+  border-radius: 13px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--rule);
   overflow-x: auto;
 }
 .tb-pill::-webkit-scrollbar { height: 0; }
-[data-theme="light"] .tb-pill {
-  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.6);
-}
 
 .tb-btn {
   display: inline-flex;
@@ -441,6 +435,42 @@ html, body {
 .tb-text i { font-family: Georgia, "Times New Roman", serif; }
 .tb-text s { text-decoration: line-through; }
 .tb-divider { width: 1px; height: 20px; background: color-mix(in srgb, var(--text) 12%, transparent); margin: 0 6px; flex: 0 0 auto; }
+
+/* Menu buttons (heading / font) + chevron */
+.tb-btn.has-menu { padding: 0 6px 0 8px; gap: 3px; }
+.tb-btn .tb-chev { width: 10px; height: 10px; opacity: 0.55; }
+.tb-btn.active .tb-chev { opacity: 0.9; }
+
+/* Toolbar dropdown menu */
+.tb-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 184px;
+  padding: 5px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--rule);
+  border-radius: 11px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+  font-family: var(--font-ui);
+}
+.tb-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 7px 9px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+}
+.tb-menu-item:hover { background: var(--accent-soft); }
+.tb-menu-item.checked { font-weight: 600; }
+.tbm-check { width: 13px; color: var(--brand); font-size: 11px; flex: 0 0 auto; }
 
 /* ---------- Toolbar font picker + bullets ---------- */
 .tb-spacer { display: none; }
