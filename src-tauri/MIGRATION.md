@@ -19,45 +19,54 @@ viewers) is webview-portable; only the native layer (`window.plume`) changes.
 
 Build: `npm run tauri:build` (assembles frontend, then `tauri build`).
 
-## Ported (in this scaffold)
+## Ported + verified
 
-| Capability | Electron | Tauri |
+| Capability | Tauri | Verified |
 |---|---|---|
-| Open file (CLI arg) | `open-file` / argv | `initial_file` command + setup |
-| Open a path in window | `file:openInThisWindow` | `read_path` command |
-| Save (in place) | `file:save` | `write_file` command |
-| Folder listing (sidebar) | `dir:list` | `list_dir` command |
-| Open external URL | `file:openExternal` | `open_external` (open crate) |
-| Window chrome | `titleBarStyle: hiddenInset` | `titleBarStyle: Overlay` + hiddenTitle |
+| Open file (CLI arg) | `initial_file` + setup | ✅ renders in WKWebView |
+| Open a path in window | `read_path` | ✅ |
+| Save / Save As | `write_file` / `save_dialog` | save ✅ / dialog compiled |
+| Open dialog | `open_dialog` (plugin-dialog, Rust-side) | compiled (native modal) |
+| Folder listing + search | `list_dir` / `search_files` | ✅ |
+| Open external URL | `open_external` | ✅ |
+| **Live auto-reload (watcher)** | `notify`, re-read on dir event + content compare | ✅ external edit propagates |
+| **Control socket** | Rust `UnixListener`, full newline-JSON protocol | ✅ `plume --version`, open |
+| **Agent round-trip** | `agent-request` event → `agent_reply` | ✅ get_active_document / get_selection |
+| `getAnnotations` / `writeDocument` (socket) | sidecar read / fs write | ✅ full MCP steer loop |
+| Annotations sidecar | `load_annotations` / `save_annotations` | ✅ (read via socket) |
+| Sessions + context | `list_sessions` / `search_sessions` / `list_context` | compiled (same std::fs as Electron) |
+| Menu | Tauri `Menu` API → `menu` event → `onMenu` | compiled (native) |
+| Crash snapshot (write) | `snapshot` → `~/.plume/recovery` | compiled |
+| Resolve relative link | `resolve_link` | compiled |
+| Window chrome | `titleBarStyle: Overlay` + hiddenTitle | ✅ |
 
-## Remaining (stubbed in the bridge — ordered by effort)
+The CLI (`bin/plume.js`) and MCP server (`bin/plume-mcp.js`) are **unchanged** and
+work against the Tauri build — the socket protocol is identical.
 
-1. **Native dialogs** — `openDialog`, `saveAs`, image picker. Add
-   `tauri-plugin-dialog` + a capability entry; wire `open_dialog`/`save_dialog`.
-2. **File watcher (live auto-reload)** — the killer feature. Use the `notify`
-   crate, watch the open file's dir, emit `file-changed` (mirror `setupWatcher`'s
-   self-write guard via a `known_content` compare).
-3. **Control socket** — re-host the `~/.plume/plume.sock` server (Wave 1/2) in
-   Rust: a `UnixListener` + the same newline-JSON protocol, dispatching
-   `open`/`getActiveDocument`/`getSelection`/`getAnnotations`/`writeDocument` to
-   the focused webview via `eval`/`emit`. The CLI + MCP server are unchanged.
-4. **Menu** — rebuild the app menu with Tauri's `Menu` API; emit `menu:*` events
-   the bridge forwards to `onMenu`. (muda is already compiled in.)
-5. **Annotations sidecar** — port `annotations:load/save` (trivial std::fs).
-6. **Sessions + context** — port `sessions:list/search`, `context:list`
-   (std::fs walk of `~/.claude/projects`).
-7. **macOS file association + `plume://`** — `tauri.conf.json` `bundle ▸
-   fileAssociations` + `deep-link` plugin / `RunEvent::Opened`.
-8. **Export** — DOCX via the existing `html-to-docx` (run renderer-side or a Node
-   sidecar). **PDF is the real gap**: there is no `printToPDF` in WKWebView via
-   Tauri. Options: (a) a tiny bundled `wkhtmltopdf`/`weasyprint` sidecar, (b)
-   `WKWebView.createPDF` via objc2 (private-ish), (c) keep a headless print path.
-   Recommend (b) — `createPDF(configuration:)` is public on macOS 11+.
-9. **Link preview unfurl** — port `link:preview` to Rust `reqwest` + a small
-   OpenGraph regex (or keep it in a Node sidecar).
-10. **Google Docs publish** — `gdocs.js` is plain Node; run it via a Node sidecar
-    that the bridge invokes, or port the OAuth loopback + fetch to Rust.
-11. **Crash-recovery snapshots** — port `doc:snapshot` (std::fs to userData).
+## Remaining
+
+1. **Export** — DOCX via `html-to-docx` (Node sidecar). **PDF is the real gap**:
+   no `printToPDF` in WKWebView via Tauri. Best path: `WKWebView.createPDF`
+   (public on macOS 11+) through objc2, or a small print sidecar.
+2. **Google Docs publish** — `gdocs.js` is plain Node; invoke via a Node sidecar,
+   or port the OAuth loopback + fetch to Rust.
+3. **Images** — paste/drop save + `pickImage` (plugin-dialog).
+4. **Link preview unfurl** — port `link:preview` to Rust (`ureq` + OG parse).
+5. **macOS file association + `plume://`** — `tauri.conf` `fileAssociations` +
+   `deep-link` plugin / `RunEvent::Opened`.
+6. **Multi-window** — `openInNewWindow` (Wave-1 routeOpen semantics).
+7. **Crash-recovery restore-on-open** — snapshot writes already; wire the restore
+   banner (compare snapshot ts vs file mtime in `read_path`/`initial_file`).
+8. **Single-instance** — `tauri-plugin-single-instance` so the socket has one
+   owner (matches Electron's `requestSingleInstanceLock`).
+9. **`setDirty`** — reflect the edited state in the window proxy icon.
+
+## Notes / risks
+
+- **Socket ownership**: only one Plume (Electron *or* Tauri) can own
+  `~/.plume/plume.sock` at a time. Run one.
+- **CSP** is `null` for now; tighten before shipping. Relative `file:` image src
+  needs `convertFileSrc`.
 
 ## Notes / risks
 
