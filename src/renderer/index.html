@@ -12,10 +12,13 @@
   </head>
   <body>
     <div id="app" data-theme="system">
-      <div id="titlebar"><span id="titlebar-name">Plume</span></div>
+      <div id="titlebar">
+        <span id="titlebar-name">Plume</span>
+        <div id="titlebar-tools"></div>
+      </div>
       <button id="view-toggle" class="hidden" title="Toggle source / rendered (⌘/)"></button>
-      <div id="toolbar"></div>
       <div id="banner" class="hidden"></div>
+      <div id="selbar" class="hidden"></div>
       <div id="main">
         <aside id="sidebar" class="hidden" aria-label="Files"></aside>
         <aside id="outline" class="hidden" aria-label="Document outline"></aside>

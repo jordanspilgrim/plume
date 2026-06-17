@@ -60,7 +60,7 @@ function markdownLang() {
 const updateListener = EditorView.updateListener.of((u) => {
   if (u.docChanged) { scheduleSideEffects(); updateWelcome(); }
   if (u.selectionSet) updateStatus();
-  if (u.selectionSet || u.docChanged) updateToolbarActive();
+  if (u.selectionSet || u.docChanged) updateSelBar();
 });
 
 const view = new EditorView({
@@ -384,9 +384,14 @@ function applyMode(filePath) {
       codeConf.reconfigure(codeFeatures),
     ]});
   }
-  // Markdown-only chrome.
-  document.getElementById("toolbar").classList.toggle("mode-hidden", mode !== "markdown");
-  if (mode !== "markdown") outlineEl.classList.add("hidden");
+  // Markdown-only chrome: hide the formatting cluster + selection bubble in code/data modes.
+  const tools = document.getElementById("titlebar-tools");
+  if (tools) tools.style.display = mode === "markdown" ? "" : "none";
+  const sb = document.getElementById("selbar");
+  if (mode !== "markdown") {
+    outlineEl.classList.add("hidden");
+    if (sb) sb.classList.add("hidden");
+  }
   updateHosts();
 }
 
@@ -811,35 +816,22 @@ const ICONS = {
 };
 const CHEVRON = '<svg class="tb-chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5 6 7.5 9 4.5"/></svg>';
 
-const TOOLBAR_GROUPS = [
-  [
-    { t: "Paragraph style", svg: "heading", menu: "heading", active: (l) => /^#{1,6} /.test(l) },
-  ],
-  [
-    { t: "Bold  ⌘B", svg: "bold", fn: () => applyFormat("bold") },
-    { t: "Italic  ⌘I", svg: "italic", fn: () => applyFormat("italic") },
-    { t: "Strikethrough  ⌘⇧X", svg: "strike", fn: () => applyFormat("strike") },
-    { t: "Inline code  ⌘E", svg: "code", fn: () => applyFormat("code") },
-    { t: "Link  ⌘K", svg: "link", fn: () => applyFormat("link") },
-  ],
-  [
-    { t: "Bullet list", svg: "bullet", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- "), active: (l) => /^\s*[-*+] /.test(l) && !/^\s*[-*+] \[[ xX]\] /.test(l) },
-    { t: "Numbered list", svg: "ordered", fn: () => toggleLinePrefix(/^\s*\d+\. /, (i) => `${i + 1}. `), active: (l) => /^\s*\d+\. /.test(l) },
-    { t: "Task list", svg: "task", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] "), active: (l) => /^\s*[-*+] \[[ xX]\] /.test(l) },
-    { t: "Quote", svg: "quote", fn: () => toggleLinePrefix(/^> ?/, () => "> "), active: (l) => /^\s*> /.test(l) },
-  ],
-  [
-    { t: "Code block", svg: "codeblock", fn: insertCodeBlock },
-    { t: "Table", svg: "table", fn: insertTable },
-    { t: "Divider", svg: "hr", fn: insertHR },
-  ],
-  [
-    { t: "Image alt text", svg: "image", fn: editImageAlt },
-    { t: "Copy for Google Docs", svg: "gdocs", fn: copyForGoogleDocs },
-  ],
-  [
-    { t: "Editor font", svg: "type", menu: "font" },
-  ],
+ICONS.plus = '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 4v10M4 9h10"/></svg>';
+const CHEV_TT = '<svg class="tt-chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5 6 7.5 9 4.5"/></svg>';
+
+// Always-visible cluster folded into the title bar (block style · insert · font).
+const TITLE_CLUSTER = [
+  { t: "Paragraph style", svg: "heading", menu: "heading" },
+  { t: "Insert", svg: "plus", menu: "insert" },
+  { t: "Editor font", svg: "type", menu: "font" },
+];
+// Inline formatting — surfaced contextually in the selection bubble.
+const INLINE_FORMATS = [
+  { t: "Bold  ⌘B", svg: "bold", fn: () => applyFormat("bold") },
+  { t: "Italic  ⌘I", svg: "italic", fn: () => applyFormat("italic") },
+  { t: "Strikethrough  ⌘⇧X", svg: "strike", fn: () => applyFormat("strike") },
+  { t: "Inline code  ⌘E", svg: "code", fn: () => applyFormat("code") },
+  { t: "Link  ⌘K", svg: "link", fn: () => applyFormat("link") },
 ];
 
 /* ---------- Fonts ---------- */
@@ -858,59 +850,58 @@ function applyFont(id) {
   localStorage.setItem("plume-font", font.id);
 }
 
-function buildFontPicker() {
-  const wrap = document.createElement("label");
-  wrap.className = "tb-font";
-  wrap.title = "Editor font";
-  const select = document.createElement("select");
-  for (const f of FONTS) {
-    const opt = document.createElement("option");
-    opt.value = f.id;
-    opt.textContent = f.label;
-    select.appendChild(opt);
+/* ---------- Title-bar cluster ---------- */
+function buildTitleTools() {
+  const host = document.getElementById("titlebar-tools");
+  host.innerHTML = "";
+  for (const b of TITLE_CLUSTER) {
+    const btn = document.createElement("button");
+    btn.className = "tt-btn has-menu";
+    btn.title = b.t;
+    btn.setAttribute("aria-label", b.t);
+    btn.innerHTML = ICONS[b.svg] + CHEV_TT;
+    btn.addEventListener("click", () => openToolbarMenu(btn, b.menu));
+    host.appendChild(btn);
   }
-  select.value = localStorage.getItem("plume-font") || "inter";
-  select.addEventListener("change", () => { applyFont(select.value); view.focus(); });
-  wrap.appendChild(select);
-  return wrap;
 }
 
-/* ---------- Toolbar (floating glass pill) ---------- */
-let toolbarButtons = []; // { el, active } for live active-state
-function buildToolbar() {
-  const tb = document.getElementById("toolbar");
-  tb.innerHTML = "";
-  toolbarButtons = [];
-  const pill = document.createElement("div");
-  pill.className = "tb-pill";
-  TOOLBAR_GROUPS.forEach((group, gi) => {
-    if (gi > 0) {
-      const div = document.createElement("span");
-      div.className = "tb-divider";
-      pill.appendChild(div);
-    }
-    for (const b of group) {
-      const btn = document.createElement("button");
-      btn.className = "tb-btn" + (b.menu ? " has-menu" : "");
-      btn.title = b.t;
-      btn.setAttribute("aria-label", b.t);
-      btn.innerHTML = (b.svg ? ICONS[b.svg] : `<span class="tb-text">${b.text}</span>`) + (b.menu ? CHEVRON : "");
-      btn.addEventListener("mousedown", (e) => e.preventDefault()); // keep editor selection
-      if (b.menu) btn.addEventListener("click", () => openToolbarMenu(btn, b.menu));
-      else btn.addEventListener("click", b.fn);
-      pill.appendChild(btn);
-      if (b.active) toolbarButtons.push({ el: btn, active: b.active });
-    }
-  });
-  tb.appendChild(pill);
-  updateToolbarActive();
+/* ---------- Contextual selection bubble (inline formatting) ---------- */
+const selbar = document.getElementById("selbar");
+function buildSelBar() {
+  selbar.innerHTML = "";
+  for (const b of INLINE_FORMATS) {
+    const btn = document.createElement("button");
+    btn.className = "sel-btn";
+    btn.title = b.t;
+    btn.setAttribute("aria-label", b.t);
+    btn.innerHTML = ICONS[b.svg];
+    btn.addEventListener("mousedown", (e) => e.preventDefault()); // keep selection
+    btn.addEventListener("click", b.fn);
+    selbar.appendChild(btn);
+  }
+}
+function updateSelBar() {
+  const sel = view.state.selection.main;
+  if (currentMode !== "markdown" || sel.empty) { selbar.classList.add("hidden"); return; }
+  const a = view.coordsAtPos(sel.from);
+  const b = view.coordsAtPos(sel.to);
+  if (!a || !b) { selbar.classList.add("hidden"); return; }
+  selbar.classList.remove("hidden");
+  const bw = selbar.offsetWidth || 200;
+  const bh = selbar.offsetHeight || 38;
+  let left = (a.left + b.right) / 2 - bw / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - bw - 8));
+  let top = Math.min(a.top, b.top) - bh - 8;
+  if (top < 52) top = Math.max(a.bottom, b.bottom) + 8; // flip below if no room above
+  selbar.style.left = left + "px";
+  selbar.style.top = top + "px";
 }
 
-/* ---------- Toolbar dropdown menus (heading + font) ---------- */
+/* ---------- Dropdown menus (heading / insert / font) ---------- */
 let openMenuEl = null;
 function closeToolbarMenu() { if (openMenuEl) { openMenuEl.remove(); openMenuEl = null; } }
 document.addEventListener("mousedown", (e) => {
-  if (openMenuEl && !openMenuEl.contains(e.target) && !e.target.closest(".tb-btn.has-menu")) closeToolbarMenu();
+  if (openMenuEl && !openMenuEl.contains(e.target) && !e.target.closest(".has-menu")) closeToolbarMenu();
 });
 function headingMenuItems() {
   const lvl = (view.state.doc.lineAt(view.state.selection.main.head).text.match(/^(#{1,6}) /) || [])[1]?.length || 0;
@@ -921,16 +912,31 @@ function headingMenuItems() {
     { label: "Body text", fn: () => setHeading(0), checked: lvl === 0 },
   ];
 }
+function insertMenuItems() {
+  const l = view.state.doc.lineAt(view.state.selection.main.head).text;
+  return [
+    { label: "Bullet list", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- "), checked: /^\s*[-*+] /.test(l) && !/^\s*[-*+] \[[ xX]\] /.test(l) },
+    { label: "Numbered list", fn: () => toggleLinePrefix(/^\s*\d+\. /, (i) => `${i + 1}. `), checked: /^\s*\d+\. /.test(l) },
+    { label: "Task list", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] "), checked: /^\s*[-*+] \[[ xX]\] /.test(l) },
+    { label: "Quote", fn: () => toggleLinePrefix(/^> ?/, () => "> "), checked: /^\s*> /.test(l) },
+    { sep: true },
+    { label: "Code block", fn: insertCodeBlock },
+    { label: "Table", fn: insertTable },
+    { label: "Divider", fn: insertHR },
+    { label: "Image", fn: editImageAlt },
+  ];
+}
 function fontMenuItems() {
   const cur = localStorage.getItem("plume-font") || "inter";
   return FONTS.map((f) => ({ label: f.label, fn: () => applyFont(f.id), checked: f.id === cur }));
 }
 function openToolbarMenu(anchor, kind) {
   if (openMenuEl) { closeToolbarMenu(); return; }
-  const items = kind === "heading" ? headingMenuItems() : fontMenuItems();
+  const items = kind === "heading" ? headingMenuItems() : kind === "insert" ? insertMenuItems() : fontMenuItems();
   const menu = document.createElement("div");
   menu.className = "tb-menu";
   for (const it of items) {
+    if (it.sep) { const s = document.createElement("div"); s.className = "tb-menu-sep"; menu.appendChild(s); continue; }
     const row = document.createElement("button");
     row.className = "tb-menu-item" + (it.checked ? " checked" : "");
     row.innerHTML = `<span class="tbm-check">${it.checked ? "✓" : ""}</span><span>${it.label}</span>`;
@@ -943,19 +949,6 @@ function openToolbarMenu(anchor, kind) {
   menu.style.left = Math.min(r.left, window.innerWidth - menu.offsetWidth - 10) + "px";
   menu.style.top = r.bottom + 6 + "px";
   openMenuEl = menu;
-}
-
-// Light up the buttons that match the current line (heading level, list, quote).
-function updateToolbarActive() {
-  if (!toolbarButtons.length) return;
-  const on = currentMode === "markdown";
-  const line = on ? view.state.doc.lineAt(view.state.selection.main.head).text : "";
-  for (const t of toolbarButtons) t.el.classList.toggle("active", on && !!t.active(line));
-}
-
-function applyToolbar(visible) {
-  document.getElementById("toolbar").classList.toggle("hidden", !visible);
-  localStorage.setItem("plume-toolbar", visible ? "1" : "0");
 }
 
 /* ---------- Markdown mark visibility ---------- */
@@ -973,8 +966,9 @@ function applyFocus(on) {
 }
 
 applyFont(localStorage.getItem("plume-font") || "inter");
-buildToolbar();
-applyToolbar(localStorage.getItem("plume-toolbar") !== "0");
+buildTitleTools();
+buildSelBar();
+view.scrollDOM.addEventListener("scroll", () => { if (!selbar.classList.contains("hidden")) updateSelBar(); });
 applyReveal(localStorage.getItem("plume-reveal") === "1");
 applyFocus(localStorage.getItem("plume-focus") === "1");
 viewToggle.addEventListener("click", toggleSourceView);
@@ -1264,7 +1258,7 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:palette": openPalette(); break;
     case "menu:searchFolder": openSearch(); break;
     case "menu:workspace": openWorkspace(); break;
-    case "menu:toggleToolbar": applyToolbar(document.getElementById("toolbar").classList.contains("hidden")); break;
+    case "menu:toggleToolbar": break; // toolbar slab retired; controls live in the title bar
     case "menu:toggleReveal": applyReveal(localStorage.getItem("plume-reveal") !== "1"); break;
     case "menu:toggleFocus": applyFocus(localStorage.getItem("plume-focus") !== "1"); break;
     case "menu:formatDoc": formatDocument(); break;

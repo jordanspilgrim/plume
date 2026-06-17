@@ -92,7 +92,6 @@ function buildMenu({ createWindow, installCli }) {
       label: "View",
       submenu: [
         { label: "Toggle Files Sidebar", accelerator: "CmdOrCtrl+Shift+E", click: () => send("menu:toggleSidebar") },
-        { label: "Toggle Toolbar", accelerator: "CmdOrCtrl+Shift+T", click: () => send("menu:toggleToolbar") },
         { label: "Toggle Outline", accelerator: "CmdOrCtrl+Shift+O", click: () => send("menu:toggleOutline") },
         { label: "Reveal Markdown Marks While Editing", accelerator: "CmdOrCtrl+Shift+M", click: () => send("menu:toggleReveal") },
         { label: "Focus Mode", accelerator: "CmdOrCtrl+Shift+L", click: () => send("menu:toggleFocus") },
