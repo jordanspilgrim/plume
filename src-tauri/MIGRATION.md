@@ -43,6 +43,17 @@ Build: `npm run tauri:build` (assembles frontend, then `tauri build`).
 The CLI (`bin/plume.js`) and MCP server (`bin/plume-mcp.js`) are **unchanged** and
 work against the Tauri build — the socket protocol is identical.
 
+### Also ported
+
+| Capability | Tauri | Verified |
+|---|---|---|
+| Link-preview unfurl | `link_preview` (ureq + OG parse) | compiled |
+| Images (paste/drop save + pick) | `save_image` / `pick_image` | compiled |
+| macOS file association | `tauri.conf` fileAssociations | ✅ Info.plist |
+| Open file at runtime (Finder "Open With") | `RunEvent::Opened` | ✅ delivers file |
+| Single-instance | `tauri-plugin-single-instance` | ✅ one process |
+| Crash-recovery restore | `recovery_for` in open paths | compiled |
+
 ## Remaining
 
 1. **Export** — DOCX via `html-to-docx` (Node sidecar). **PDF is the real gap**:
@@ -50,16 +61,13 @@ work against the Tauri build — the socket protocol is identical.
    (public on macOS 11+) through objc2, or a small print sidecar.
 2. **Google Docs publish** — `gdocs.js` is plain Node; invoke via a Node sidecar,
    or port the OAuth loopback + fetch to Rust.
-3. **Images** — paste/drop save + `pickImage` (plugin-dialog).
-4. **Link preview unfurl** — port `link:preview` to Rust (`ureq` + OG parse).
-5. **macOS file association + `plume://`** — `tauri.conf` `fileAssociations` +
-   `deep-link` plugin / `RunEvent::Opened`.
-6. **Multi-window** — `openInNewWindow` (Wave-1 routeOpen semantics).
-7. **Crash-recovery restore-on-open** — snapshot writes already; wire the restore
-   banner (compare snapshot ts vs file mtime in `read_path`/`initial_file`).
-8. **Single-instance** — `tauri-plugin-single-instance` so the socket has one
-   owner (matches Electron's `requestSingleInstanceLock`).
-9. **`setDirty`** — reflect the edited state in the window proxy icon.
+3. **Multi-window** — `openInNewWindow` (Wave-1 routeOpen semantics).
+4. **`plume://` custom scheme** — add `tauri-plugin-deep-link` (file association
+   + `RunEvent::Opened` already cover Finder "Open With").
+5. **`setDirty`** — reflect the edited state in the window proxy icon (cosmetic).
+
+Not yet live-verified (renderer-observable, mirror the verified Electron impls):
+link-preview render, image save, recovery banner.
 
 ## Notes / risks
 

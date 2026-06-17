@@ -78,11 +78,18 @@ fn start_watcher(app: &AppHandle, path: &str) {
 }
 
 // ---- core file commands ----
+#[derive(serde::Serialize)]
+struct ReadResult {
+    content: String,
+    recovery: Option<String>,
+}
+
 #[tauri::command]
-fn read_path(app: AppHandle, path: String) -> Result<String, String> {
+fn read_path(app: AppHandle, path: String) -> Result<ReadResult, String> {
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let recovery = recovery_for(&path);
     set_current(&app, &path, &content);
-    Ok(content)
+    Ok(ReadResult { content, recovery })
 }
 
 #[tauri::command]
@@ -106,14 +113,16 @@ fn write_file(app: AppHandle, path: Option<String>, content: String) -> Result<S
 struct InitialFile {
     path: String,
     content: String,
+    recovery: Option<String>,
 }
 
 #[tauri::command]
 fn initial_file(app: AppHandle) -> Option<InitialFile> {
     let p = app.state::<AppState>().initial.lock().unwrap().clone()?;
     let content = fs::read_to_string(&p).ok()?;
+    let recovery = recovery_for(&p);
     set_current(&app, &p, &content);
-    Some(InitialFile { path: p, content })
+    Some(InitialFile { path: p, content, recovery })
 }
 
 #[tauri::command]
@@ -132,8 +141,9 @@ async fn open_dialog(app: AppHandle) -> Option<String> {
     let path = picked.into_path().ok()?;
     let p = path.to_string_lossy().to_string();
     if let Ok(content) = fs::read_to_string(&p) {
+        let recovery = recovery_for(&p);
         set_current(&app, &p, &content);
-        let _ = app.emit("file-opened", json!({ "filePath": p, "content": content }));
+        let _ = app.emit("file-opened", json!({ "filePath": p, "content": content, "recovery": recovery }));
     }
     Some(p)
 }
@@ -151,6 +161,163 @@ async fn save_dialog(app: AppHandle, content: String) -> Option<String> {
     fs::write(&p, &content).ok()?;
     set_current(&app, &p, &content);
     Some(p)
+}
+
+// ---- crash-recovery snapshot read ----
+fn recovery_for(path: &str) -> Option<String> {
+    let mut hash: u64 = 1469598103934665603;
+    for b in path.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    let file = plume_dir().join("recovery").join(format!("{:x}.json", hash));
+    let snap: Value = serde_json::from_str(&fs::read_to_string(&file).ok()?).ok()?;
+    let snap_content = snap["content"].as_str()?.to_string();
+    let disk = fs::read_to_string(path).ok()?;
+    // Only surface if the snapshot differs from disk (best-effort; ts compare omitted).
+    if snap_content != disk { Some(snap_content) } else { None }
+}
+
+// ---- images ----
+fn assets_rel(app: &AppHandle, ext: &str) -> Option<(PathBuf, String)> {
+    let cur = app.state::<AppState>().current.lock().unwrap().clone()?;
+    let dir = Path::new(&cur).parent()?.join("assets");
+    fs::create_dir_all(&dir).ok()?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let clean: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let name = format!("image-{}.{}", ts, if clean.is_empty() { "png".into() } else { clean });
+    Some((dir.join(&name), format!("assets/{}", name)))
+}
+
+#[tauri::command]
+fn save_image(app: AppHandle, bytes: Vec<u8>, ext: String) -> Option<String> {
+    let (path, rel) = assets_rel(&app, &ext)?;
+    fs::write(path, bytes).ok()?;
+    Some(rel)
+}
+
+#[tauri::command]
+async fn pick_image(app: AppHandle) -> Value {
+    if app.state::<AppState>().current.lock().unwrap().is_none() {
+        return json!({ "error": "unsaved" });
+    }
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "heic", "tiff"])
+        .blocking_pick_file();
+    let src = match picked.and_then(|p| p.into_path().ok()) {
+        Some(p) => p,
+        None => return Value::Null,
+    };
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    match assets_rel(&app, ext) {
+        Some((dest, rel)) if fs::copy(&src, &dest).is_ok() => json!({ "rel": rel }),
+        _ => Value::Null,
+    }
+}
+
+// ---- link preview unfurl ----
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let key = format!("{}=", attr);
+    let pos = lower.find(&key)? + key.len();
+    let rest = &tag[pos..];
+    let quote = rest.chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let end = rest[1..].find(quote)? + 1;
+        Some(rest[1..end].to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_meta(html: &str, prop: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let p = prop.to_lowercase();
+    let mut i = 0;
+    while let Some(rel) = lower[i..].find("<meta") {
+        let start = i + rel;
+        let end = lower[start..].find('>').map(|e| start + e + 1).unwrap_or(html.len());
+        let tag = &html[start..end];
+        let tl = tag.to_lowercase();
+        let hit = ["property", "name"].iter().any(|k| {
+            tl.contains(&format!("{}=\"{}\"", k, p)) || tl.contains(&format!("{}='{}'", k, p))
+        });
+        if hit {
+            if let Some(c) = extract_attr(tag, "content") {
+                return Some(c);
+            }
+        }
+        i = end;
+    }
+    None
+}
+
+fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or(url)
+        .trim_start_matches("www.")
+        .to_string()
+}
+
+fn fetch_preview(url: &str) -> Value {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(6)).build();
+    let resp = match agent
+        .get(url)
+        .set("User-Agent", "Mozilla/5.0 (Macintosh) Plume/1.0")
+        .call()
+    {
+        Ok(r) => r,
+        Err(_) => return Value::Null,
+    };
+    let final_url = resp.get_url().to_string();
+    let host = host_of(&final_url);
+    let ct = resp.content_type().to_string();
+    if ct.starts_with("image/") {
+        return json!({ "isImage": true, "image": final_url, "title": host, "site": host });
+    }
+    if !ct.contains("html") {
+        return json!({ "title": host, "description": "", "image": "", "site": host });
+    }
+    let body = resp.into_string().unwrap_or_default();
+    let body = &body[..body.len().min(600_000)];
+    let title = extract_meta(body, "og:title")
+        .or_else(|| {
+            let l = body.to_lowercase();
+            let s = l.find("<title")?;
+            let s = l[s..].find('>').map(|e| s + e + 1)?;
+            let e = l[s..].find("</title>").map(|e| s + e)?;
+            Some(body[s..e].trim().to_string())
+        })
+        .unwrap_or_else(|| host.clone());
+    let mut image = extract_meta(body, "og:image").or_else(|| extract_meta(body, "twitter:image")).unwrap_or_default();
+    if !image.is_empty() && !image.starts_with("http") {
+        if let Some(base) = final_url.split('/').take(3).collect::<Vec<_>>().get(..3).map(|s| s.join("/")) {
+            image = format!("{}/{}", base.trim_end_matches('/'), image.trim_start_matches('/'));
+        }
+    }
+    json!({
+        "title": title,
+        "description": extract_meta(body, "og:description").or_else(|| extract_meta(body, "description")).unwrap_or_default(),
+        "image": image,
+        "site": extract_meta(body, "og:site_name").unwrap_or(host),
+    })
+}
+
+#[tauri::command]
+async fn link_preview(url: String) -> Value {
+    if !url.starts_with("http") {
+        return Value::Null;
+    }
+    tauri::async_runtime::spawn_blocking(move || fetch_preview(&url))
+        .await
+        .unwrap_or(Value::Null)
 }
 
 #[tauri::command]
@@ -648,8 +815,29 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Open a file path into the running app (used by single-instance + Opened events).
+fn open_external_file(app: &AppHandle, p: &str) {
+    if !Path::new(p).is_file() {
+        return;
+    }
+    if let Ok(content) = fs::read_to_string(p) {
+        let recovery = recovery_for(p);
+        set_current(app, p, &content);
+        let _ = app.emit("file-opened", json!({ "filePath": p, "content": content, "recovery": recovery }));
+        focus_main(app);
+    }
+}
+
 fn main() {
     tauri::Builder::default()
+        // single-instance must be registered first; forwards a second launch's args.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(p) = argv.iter().skip(1).find(|a| !a.starts_with('-')) {
+                open_external_file(app, p);
+            } else {
+                focus_main(app);
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
@@ -668,6 +856,9 @@ fn main() {
             list_sessions,
             search_sessions,
             list_context,
+            save_image,
+            pick_image,
+            link_preview,
             agent_reply
         ])
         .on_menu_event(|app, event| {
@@ -695,6 +886,36 @@ fn main() {
             start_socket(handle);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Plume");
+        .build(tauri::generate_context!())
+        .expect("error while building Plume")
+        .run(|app, event| {
+            // macOS Finder "Open With" / deep links deliver files here at runtime.
+            if let tauri::RunEvent::Opened { urls } = event {
+                for url in urls {
+                    let s = url.to_string();
+                    let p = s.strip_prefix("file://").unwrap_or(&s);
+                    let p = urlencoding_decode(p);
+                    open_external_file(app, &p);
+                }
+            }
+        });
+}
+
+/// Minimal percent-decode for file:// paths delivered by RunEvent::Opened.
+fn urlencoding_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }

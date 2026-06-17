@@ -44,9 +44,9 @@ window.plume = {
   openDialog: () => invoke("open_dialog").catch(() => null),
   openInThisWindow: async (filePath, gotoLine) => {
     try {
-      const content = await invoke("read_path", { path: filePath });
+      const r = await invoke("read_path", { path: filePath });
       currentPath = filePath;
-      if (onOpenFile) onOpenFile({ filePath, content, gotoLine });
+      if (onOpenFile) onOpenFile({ filePath, content: r.content, recovery: r.recovery, gotoLine });
     } catch { /* ignore */ }
   },
   save: async (content) => {
@@ -75,13 +75,15 @@ window.plume = {
   searchSessions: (query, dir) => invoke("search_sessions", { query, dir }).catch(() => []),
   listContext: (dir) => invoke("list_context", { dir }).catch(() => []),
 
+  // images + link unfurl (ported)
+  saveImage: (bytes, ext) => invoke("save_image", { bytes: Array.from(bytes), ext }).catch(() => null),
+  pickImage: () => invoke("pick_image").catch(() => null),
+  linkPreview: (url) => invoke("link_preview", { url }).catch(() => null),
+
   // still pending the full port (stubbed)
   openInNewWindow: async () => null, // TODO: multi-window
   exportDoc: async () => null,       // TODO: PDF (WKWebView createPDF) + DOCX
   publishGoogle: async () => null,   // TODO: gdocs via sidecar
-  saveImage: async () => null,       // TODO
-  pickImage: async () => null,       // TODO: dialog image pick
-  linkPreview: async () => null,     // TODO: rust unfurl
   setDirty: noop,                    // window edited indicator (cosmetic)
 };
 
@@ -90,7 +92,7 @@ invoke("initial_file")
   .then((f) => {
     if (f && f.path) {
       currentPath = f.path;
-      const fire = () => { if (onOpenFile) onOpenFile({ filePath: f.path, content: f.content }); };
+      const fire = () => { if (onOpenFile) onOpenFile({ filePath: f.path, content: f.content, recovery: f.recovery }); };
       if (onOpenFile) fire(); else setTimeout(fire, 0);
     }
   })
