@@ -60,6 +60,7 @@ function markdownLang() {
 const updateListener = EditorView.updateListener.of((u) => {
   if (u.docChanged) { scheduleSideEffects(); updateWelcome(); }
   if (u.selectionSet) updateStatus();
+  if (u.selectionSet || u.docChanged) updateToolbarActive();
 });
 
 const view = new EditorView({
@@ -789,25 +790,26 @@ async function copyForGoogleDocs() {
 }
 
 /* ---------- Toolbar ---------- */
+// Consistent 18px icon set (1.6–1.8 stroke, rounded) for the floating pill.
 const ICONS = {
-  code: '<svg viewBox="0 0 16 16"><path d="M5.5 4 2.5 8l3 4M10.5 4l3 4-3 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-  link: '<svg viewBox="0 0 16 16"><path d="M6.3 9.7 9.7 6.3M7 4.6l1-1a2.7 2.7 0 0 1 3.8 3.8l-1 1M9 11.4l-1 1a2.7 2.7 0 0 1-3.8-3.8l1-1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
-  bullet: '<svg viewBox="0 0 16 16"><circle cx="3" cy="4.5" r="1.1" fill="currentColor"/><circle cx="3" cy="8" r="1.1" fill="currentColor"/><circle cx="3" cy="11.5" r="1.1" fill="currentColor"/><path d="M6.5 4.5h7M6.5 8h7M6.5 11.5h7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
-  ordered: '<svg viewBox="0 0 16 16"><text x="1.2" y="5.6" font-size="5" fill="currentColor" font-family="sans-serif">1</text><text x="1.2" y="10" font-size="5" fill="currentColor" font-family="sans-serif">2</text><text x="1.2" y="14.2" font-size="5" fill="currentColor" font-family="sans-serif">3</text><path d="M6.5 4.5h7M6.5 8.4h7M6.5 12.3h7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
-  task: '<svg viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="11" height="11" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 8.2l2 2 4-4.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-  quote: '<svg viewBox="0 0 16 16"><path d="M3 5.5h3.2v3.2c0 1.6-1 2.7-2.7 3.1M9 5.5h3.2v3.2c0 1.6-1 2.7-2.7 3.1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-  codeblock: '<svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M6 6.4 4.4 8 6 9.6M10 6.4 11.6 8 10 9.6" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-  table: '<svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M2 6.5h12M2 9.8h12M6.5 3.2v9.6M10 3.2v9.6" stroke="currentColor" stroke-width="1"/></svg>',
-  hr: '<svg viewBox="0 0 16 16"><path d="M2.5 8h11" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
-  image: '<svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"/><circle cx="5.6" cy="6.4" r="1.1" fill="currentColor"/><path d="M3 12l3.3-3 2.2 2 2.1-2.4L14 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>',
-  gdocs: '<svg viewBox="0 0 16 16"><path d="M4 1.6h4.6L12 5v8.9a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5V2.1a.5.5 0 0 1 .5-.5z" fill="none" stroke="#4285F4" stroke-width="1.2" stroke-linejoin="round"/><path d="M8.4 1.7v3.1h3.1" fill="none" stroke="#4285F4" stroke-width="1.2"/><path d="M5.6 7.7h4.8M5.6 9.6h4.8M5.6 11.5h3.4" stroke="#4285F4" stroke-width="1" stroke-linecap="round"/></svg>',
+  code: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 5 2.5 9 6 13M12 5l3.5 4L12 13"/></svg>',
+  link: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 11 11 7M8 5l1.2-1.2a3 3 0 0 1 4.2 4.2L12.2 9.2M10 13l-1.2 1.2a3 3 0 0 1-4.2-4.2L5.8 8.8"/></svg>',
+  bullet: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="3.5" cy="5" r="1.2" fill="currentColor" stroke="none"/><circle cx="3.5" cy="9" r="1.2" fill="currentColor" stroke="none"/><circle cx="3.5" cy="13" r="1.2" fill="currentColor" stroke="none"/><path d="M7.5 5h7M7.5 9h7M7.5 13h7"/></svg>',
+  ordered: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><text x="0.6" y="6.6" font-size="5.6" fill="currentColor" stroke="none" font-family="sans-serif" font-weight="650">1</text><text x="0.6" y="11.1" font-size="5.6" fill="currentColor" stroke="none" font-family="sans-serif" font-weight="650">2</text><text x="0.6" y="15.6" font-size="5.6" fill="currentColor" stroke="none" font-family="sans-serif" font-weight="650">3</text><path d="M7.5 5h7M7.5 9.3h7M7.5 13.6h7"/></svg>',
+  task: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="12" height="11" rx="2.5"/><path d="M6 9l2 2 4.5-5"/></svg>',
+  quote: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5h3.5v3.5c0 1.7-1.1 2.9-3 3.3M10 5.5h3.5v3.5c0 1.7-1.1 2.9-3 3.3"/></svg>',
+  codeblock: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="13" height="11" rx="2.5"/><path d="M7 7 5 9l2 2M11 7l2 2-2 2"/></svg>',
+  table: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="13" height="11" rx="2"/><path d="M2.5 7.5h13M2.5 11h13M7.3 3.7v10.6M11.3 3.7v10.6"/></svg>',
+  hr: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 9h12"/></svg>',
+  image: '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="13" height="11" rx="2.5"/><circle cx="6.2" cy="7.2" r="1.3" fill="currentColor" stroke="none"/><path d="M3 13l3.6-3.3 2.4 2.2L11.3 9 15 13"/></svg>',
+  gdocs: '<svg viewBox="0 0 18 18"><path d="M4.5 2h4.6L12.5 5.4V15a.6.6 0 0 1-.6.6H4.5a.6.6 0 0 1-.6-.6V2.6A.6.6 0 0 1 4.5 2z" fill="none" stroke="#4285F4" stroke-width="1.3" stroke-linejoin="round"/><path d="M9 2.2v3.4h3.4" fill="none" stroke="#4285F4" stroke-width="1.3"/><path d="M6.2 8.6h5.4M6.2 10.7h5.4M6.2 12.8h3.8" stroke="#4285F4" stroke-width="1.1" stroke-linecap="round"/></svg>',
 };
 
 const TOOLBAR_GROUPS = [
   [
-    { t: "Heading 1  ⌘1", text: "H1", fn: () => setHeading(1) },
-    { t: "Heading 2  ⌘2", text: "H2", fn: () => setHeading(2) },
-    { t: "Heading 3  ⌘3", text: "H3", fn: () => setHeading(3) },
+    { t: "Heading 1  ⌘1", text: "H1", fn: () => setHeading(1), active: (l) => /^# /.test(l) },
+    { t: "Heading 2  ⌘2", text: "H2", fn: () => setHeading(2), active: (l) => /^## /.test(l) },
+    { t: "Heading 3  ⌘3", text: "H3", fn: () => setHeading(3), active: (l) => /^### /.test(l) },
   ],
   [
     { t: "Bold  ⌘B", text: "<b>B</b>", fn: () => applyFormat("bold") },
@@ -817,10 +819,10 @@ const TOOLBAR_GROUPS = [
     { t: "Link  ⌘K", svg: "link", fn: () => applyFormat("link") },
   ],
   [
-    { t: "Bullet list", svg: "bullet", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- ") },
-    { t: "Numbered list", svg: "ordered", fn: () => toggleLinePrefix(/^\s*\d+\. /, (i) => `${i + 1}. `) },
-    { t: "Task list", svg: "task", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] ") },
-    { t: "Quote", svg: "quote", fn: () => toggleLinePrefix(/^> ?/, () => "> ") },
+    { t: "Bullet list", svg: "bullet", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- "), active: (l) => /^\s*[-*+] /.test(l) && !/^\s*[-*+] \[[ xX]\] /.test(l) },
+    { t: "Numbered list", svg: "ordered", fn: () => toggleLinePrefix(/^\s*\d+\. /, (i) => `${i + 1}. `), active: (l) => /^\s*\d+\. /.test(l) },
+    { t: "Task list", svg: "task", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] "), active: (l) => /^\s*[-*+] \[[ xX]\] /.test(l) },
+    { t: "Quote", svg: "quote", fn: () => toggleLinePrefix(/^> ?/, () => "> "), active: (l) => /^\s*> /.test(l) },
   ],
   [
     { t: "Code block", svg: "codeblock", fn: insertCodeBlock },
@@ -866,15 +868,19 @@ function buildFontPicker() {
   return wrap;
 }
 
-/* ---------- Toolbar ---------- */
+/* ---------- Toolbar (floating glass pill) ---------- */
+let toolbarButtons = []; // { el, active } for live active-state
 function buildToolbar() {
   const tb = document.getElementById("toolbar");
   tb.innerHTML = "";
+  toolbarButtons = [];
+  const pill = document.createElement("div");
+  pill.className = "tb-pill";
   TOOLBAR_GROUPS.forEach((group, gi) => {
     if (gi > 0) {
       const div = document.createElement("span");
       div.className = "tb-divider";
-      tb.appendChild(div);
+      pill.appendChild(div);
     }
     for (const b of group) {
       const btn = document.createElement("button");
@@ -884,13 +890,24 @@ function buildToolbar() {
       btn.innerHTML = b.svg ? ICONS[b.svg] : `<span class="tb-text">${b.text}</span>`;
       btn.addEventListener("mousedown", (e) => e.preventDefault()); // keep editor selection
       btn.addEventListener("click", b.fn);
-      tb.appendChild(btn);
+      pill.appendChild(btn);
+      if (b.active) toolbarButtons.push({ el: btn, active: b.active });
     }
   });
-  const spacer = document.createElement("span");
-  spacer.className = "tb-spacer";
-  tb.appendChild(spacer);
-  tb.appendChild(buildFontPicker());
+  const div = document.createElement("span");
+  div.className = "tb-divider";
+  pill.appendChild(div);
+  pill.appendChild(buildFontPicker());
+  tb.appendChild(pill);
+  updateToolbarActive();
+}
+
+// Light up the buttons that match the current line (heading level, list, quote).
+function updateToolbarActive() {
+  if (!toolbarButtons.length) return;
+  const on = currentMode === "markdown";
+  const line = on ? view.state.doc.lineAt(view.state.selection.main.head).text : "";
+  for (const t of toolbarButtons) t.el.classList.toggle("active", on && !!t.active(line));
 }
 
 function applyToolbar(visible) {
