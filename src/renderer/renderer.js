@@ -57,7 +57,7 @@ function markdownLang() {
 }
 
 const updateListener = EditorView.updateListener.of((u) => {
-  if (u.docChanged) scheduleSideEffects();
+  if (u.docChanged) { scheduleSideEffects(); updateWelcome(); }
   if (u.selectionSet) updateStatus();
 });
 
@@ -137,6 +137,44 @@ function setTitle(pathOrNull) {
   const name = pathOrNull ? pathOrNull.split("/").pop() : "Untitled";
   titlebarName.textContent = name;
   document.title = name;
+}
+
+/* ---------- 8-bit welcome / empty state ---------- */
+const WELCOME_ART = [
+  "██████╗ ██╗     ██╗   ██╗███╗   ███╗███████╗",
+  "██╔══██╗██║     ██║   ██║████╗ ████║██╔════╝",
+  "██████╔╝██║     ██║   ██║██╔████╔██║█████╗  ",
+  "██╔═══╝ ██║     ██║   ██║██║╚██╔╝██║██╔══╝  ",
+  "██║     ███████╗╚██████╔╝██║ ╚═╝ ██║███████╗",
+  "╚═╝     ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝",
+].join("\n");
+const welcomeEl = document.getElementById("welcome");
+function buildWelcome() {
+  if (welcomeEl.dataset.built) return;
+  welcomeEl.dataset.built = "1";
+  const art = document.createElement("pre");
+  art.className = "welcome-art";
+  art.textContent = WELCOME_ART;
+  const tag = document.createElement("div");
+  tag.className = "welcome-tag";
+  tag.textContent = "single-surface markdown — the human pane for agentic coding";
+  const hints = document.createElement("div");
+  hints.className = "welcome-hints";
+  for (const [k, label] of [["⌘O", "OPEN FILE"], ["⌘N", "NEW DOC"], ["⌘P", "COMMAND PALETTE"]]) {
+    const chip = document.createElement("span");
+    const key = document.createElement("b");
+    key.textContent = k;
+    chip.append(key, document.createTextNode(" " + label));
+    hints.appendChild(chip);
+  }
+  const blink = document.createElement("div");
+  blink.className = "welcome-blink";
+  blink.textContent = "▮ TYPE TO START";
+  welcomeEl.append(art, tag, hints, blink);
+}
+function updateWelcome() {
+  const empty = view.state.doc.length === 0 && !currentPath && currentMode === "markdown";
+  welcomeEl.classList.toggle("hidden", !empty);
 }
 
 /* ---------- Mode dispatch ---------- */
@@ -295,6 +333,7 @@ function loadDocument(content, filePath, recovery, gotoLine) {
   renderOutline();
   updateStatus();
   if (isRenderMode()) renderCurrent();
+  updateWelcome();
   if (recovery != null) showRecoveryBanner(recovery);
   else clearBanner();
   if (gotoLine) {
@@ -953,6 +992,8 @@ window.plume.onMenu((channel, ...args) => {
 });
 
 setTitle(null);
+buildWelcome();
+updateWelcome();
 
 // Automation surface (used for scripting / testing the UI).
-window.__plume = { toggleSidebar, openPalette, openSearch, refreshSidebar, exportAs, copyAsRichText, applyFocus };
+window.__plume = { toggleSidebar, openPalette, openSearch, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome };

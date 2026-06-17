@@ -104,7 +104,70 @@ html, body {
   margin-left: 6px;
 }
 
-#main { flex: 1 1 auto; display: flex; min-height: 0; }
+#main { flex: 1 1 auto; display: flex; min-height: 0; position: relative; }
+
+/* ---------- 8-bit welcome / empty state ---------- */
+#welcome {
+  position: absolute; inset: 0; z-index: 4;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 22px; pointer-events: none; user-select: none;
+  background: var(--bg);
+  overflow: hidden;
+}
+#welcome.hidden { display: none; }
+/* CRT scanlines */
+#welcome::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(109, 127, 245, 0.05) 0px,
+    rgba(109, 127, 245, 0.05) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+  mix-blend-mode: screen;
+}
+.welcome-art {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: clamp(8px, 1.45vw, 17px);
+  line-height: 1.04;
+  font-weight: 700;
+  color: var(--brand);
+  text-shadow: 0 0 18px rgba(109, 127, 245, 0.55), 0 0 2px rgba(109, 127, 245, 0.9);
+  white-space: pre;
+  letter-spacing: 0;
+  animation: welcome-flicker 4.5s steps(60) infinite;
+}
+@keyframes welcome-flicker {
+  0%, 96%, 100% { opacity: 1; }
+  97% { opacity: 0.86; }
+  98.5% { opacity: 0.97; }
+}
+.welcome-tag {
+  font-family: var(--font-mono);
+  font-size: 12px; letter-spacing: 0.04em;
+  color: var(--text-muted);
+  text-transform: lowercase;
+}
+.welcome-hints { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+.welcome-hints span {
+  font-family: var(--font-mono);
+  font-size: 10.5px; letter-spacing: 0.06em;
+  color: var(--text-muted);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 5px 9px;
+  background: var(--bg-elevated);
+}
+.welcome-hints b { color: var(--brand); font-weight: 700; margin-right: 3px; }
+.welcome-blink {
+  font-family: var(--font-mono);
+  font-size: 11px; letter-spacing: 0.18em;
+  color: var(--brand);
+  animation: welcome-blink 1.1s steps(1) infinite;
+}
+@keyframes welcome-blink { 50% { opacity: 0; } }
 
 #outline {
   width: 240px;
