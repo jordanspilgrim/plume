@@ -15,7 +15,7 @@ import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, setFocusMode,
 import { modeForPath, languageForExt, codeFeatures, extOf, baseName } from "./editor/modes.js";
 import { diffDecorations, logDecorations } from "./editor/decorators.js";
 import { annotField, setAnnotRanges, locateQuote } from "./editor/annotations.js";
-import { renderJsonl, renderCsv } from "./editor/viewers.js";
+import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from "./editor/viewers.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
 import "@fontsource-variable/inter/index.css";
@@ -315,13 +315,21 @@ const renderHost = document.getElementById("render-host");
 const viewToggle = document.getElementById("view-toggle");
 let currentMode = "markdown";
 let showSource = false;
+let isTranscript = false; // jsonl that looks like a Claude Code chat log
 
 function isRenderMode() { return RENDER_MODES.has(currentMode); }
+
+// Toggle label adapts: transcripts flip Conversation/Raw, other render modes Rendered/Source.
+function setToggleLabel() {
+  viewToggle.textContent = isTranscript
+    ? (showSource ? "Conversation" : "Raw")
+    : (showSource ? "Rendered" : "Source");
+}
 
 function updateHosts() {
   const render = isRenderMode();
   viewToggle.classList.toggle("hidden", !render);
-  viewToggle.textContent = showSource ? "Rendered" : "Source";
+  setToggleLabel();
   const showRendered = render && !showSource;
   editorHost.classList.toggle("hidden", showRendered);
   renderHost.classList.toggle("hidden", !showRendered);
@@ -331,10 +339,15 @@ function renderCurrent() {
   if (!isRenderMode()) return;
   const text = view.state.doc.toString();
   renderHost.innerHTML = "";
+  isTranscript = currentMode === "jsonl" && looksLikeTranscript(text);
   const body = document.createElement("div");
-  body.className = "render-body mode-" + currentMode;
+  body.className = "render-body mode-" + (isTranscript ? "conversation" : currentMode);
   renderHost.appendChild(body);
-  if (currentMode === "jsonl") renderJsonl(body, text);
+  if (currentMode === "jsonl") {
+    if (isTranscript) renderConversation(body, text);
+    else renderJsonl(body, text);
+    setToggleLabel();
+  }
   else if (currentMode === "csv") renderCsv(body, text, extOf(currentPath) === "tsv");
   else if (currentMode === "mermaid") {
     const d = document.createElement("div");
