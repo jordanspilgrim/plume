@@ -48,7 +48,7 @@
         "role": "Editor"
       },
       {
-        "ext": ["json", "jsonl", "ndjson", "yaml", "yml", "toml", "diff", "patch", "log", "csv", "tsv", "mmd"],
+        "ext": ["json", "jsonc", "jsonl", "ndjson", "yaml", "yml", "toml", "ini", "env", "conf", "cfg", "diff", "patch", "log", "csv", "tsv", "mmd", "xml", "svg", "js", "jsx", "mjs", "cjs", "ts", "tsx", "py", "rs", "go", "sh", "bash", "zsh", "sql", "css", "html"],
         "name": "Source & Data File",
         "role": "Editor"
       }
