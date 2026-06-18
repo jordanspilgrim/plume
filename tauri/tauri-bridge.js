@@ -74,6 +74,7 @@ window.plume = {
   listSessions: (dir) => invoke("list_sessions", { dir }).catch(() => []),
   searchSessions: (query, dir) => invoke("search_sessions", { query, dir }).catch(() => []),
   listContext: (dir) => invoke("list_context", { dir }).catch(() => []),
+  readSession: (filePath) => invoke("session_read", { path: filePath }).catch(() => ""),
 
   // images + link unfurl (ported)
   saveImage: (bytes, ext) => invoke("save_image", { bytes: Array.from(bytes), ext }).catch(() => null),

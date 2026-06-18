@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -789,6 +789,85 @@ fn list_context(dir: Option<String>) -> Vec<Value> {
     out
 }
 
+// Read a file for inline insertion. Claude Code `.jsonl` transcripts are distilled
+// to readable markdown — user/assistant prose only, most-recent kept. Transcripts
+// run to hundreds of MB, so we tail-read the last ~6 MB rather than load it all.
+#[tauri::command]
+fn session_read(path: String) -> String {
+    const TAIL: u64 = 6 * 1024 * 1024;
+    const CAP: usize = 40000;
+    let p = Path::new(&path);
+    let size = match fs::metadata(p) {
+        Ok(m) => m.len(),
+        Err(_) => return String::new(),
+    };
+    let raw: String = if size > TAIL {
+        let mut f = match fs::File::open(p) {
+            Ok(f) => f,
+            Err(_) => return String::new(),
+        };
+        if f.seek(SeekFrom::Start(size - TAIL)).is_err() {
+            return String::new();
+        }
+        let mut buf = vec![0u8; TAIL as usize];
+        let n = f.read(&mut buf).unwrap_or(0);
+        let mut s = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if let Some(idx) = s.find('\n') {
+            s = s[idx + 1..].to_string(); // drop the partial first line
+        }
+        s
+    } else {
+        match fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(_) => return String::new(),
+        }
+    };
+    if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+        return raw;
+    }
+    let mut out: Vec<String> = vec![];
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let o: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let msg = if o.get("message").is_some() { &o["message"] } else { &o };
+        let role = msg["role"].as_str().or_else(|| o["type"].as_str()).unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let c = &msg["content"];
+        let text = if c.is_string() {
+            c.as_str().unwrap_or("").to_string()
+        } else if let Some(arr) = c.as_array() {
+            arr.iter()
+                .filter(|b| b["type"] == "text")
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            String::new()
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let label = if role == "assistant" { "**Claude:**" } else { "**You:**" };
+        out.push(format!("{}\n\n{}", label, text));
+    }
+    let joined = out.join("\n\n");
+    let chars: Vec<char> = joined.chars().collect();
+    if chars.len() > CAP {
+        let tail: String = chars[chars.len() - CAP..].iter().collect();
+        return format!("_…earlier conversation trimmed…_\n\n{}", tail);
+    }
+    joined
+}
+
 // ---- agent round-trip (socket → webview → reply) ----
 #[tauri::command]
 fn agent_reply(app: AppHandle, id: u64, data: Value) {
@@ -1046,6 +1125,7 @@ fn main() {
             list_sessions,
             search_sessions,
             list_context,
+            session_read,
             save_image,
             pick_image,
             link_preview,
