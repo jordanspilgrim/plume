@@ -19,6 +19,29 @@ const td = new TurndownService({
   linkStyle: "inlined",
 });
 td.use(gfm);
+
+// Clean, tight list items. turndown's default emits "-   " (3 spaces) with a
+// 2-space nesting indent, which renders as a detached bullet + shallow nesting.
+// Use "- " / "N. " (one space) and a full 4-space tab per nesting level.
+const NEST_INDENT = "    ";
+td.addRule("cleanList", {
+  filter: "li",
+  replacement: (content, node, options) => {
+    content = content
+      .replace(/^\n+/, "")
+      .replace(/\n+$/, "\n")
+      .replace(/\n/gm, "\n" + NEST_INDENT);
+    let prefix = options.bulletListMarker + " ";
+    const parent = node.parentNode;
+    if (parent.nodeName === "OL") {
+      const start = parent.getAttribute("start");
+      const i = Array.prototype.indexOf.call(parent.children, node);
+      prefix = (start ? Number(start) + i : i + 1) + ". ";
+    }
+    return prefix + content + (node.nextSibling && !/\n$/.test(content) ? "\n" : "");
+  },
+});
+
 // Force GFM-standard double-tilde strikethrough — gfm's own rule emits a single
 // `~`, which most renderers (including Plume's) don't treat as strikethrough.
 // Added AFTER use(gfm) because turndown gives precedence to later-added rules.
