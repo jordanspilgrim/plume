@@ -561,6 +561,13 @@ function showDiskChangedBanner(content) {
 }
 
 async function save(thenClose = false) {
+  // Untitled docs have no path yet — route to Save As so the user picks a location.
+  // (Electron's backend prompted implicitly; Tauri's write_file errors on a null path.)
+  if (!currentPath) {
+    const saved = await saveAs();
+    if (saved && thenClose) window.close();
+    return;
+  }
   const content = view.state.doc.toString();
   const result = await window.plume.save(content);
   if (result) {
@@ -579,6 +586,7 @@ async function saveAs() {
     setTitle(result);
     setDirty(false);
   }
+  return result;
 }
 
 /* ---------- Outline ---------- */
