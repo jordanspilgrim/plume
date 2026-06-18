@@ -16,6 +16,7 @@ import { modeForPath, languageForExt, codeFeatures, extOf, baseName } from "./ed
 import { diffDecorations, logDecorations } from "./editor/decorators.js";
 import { annotField, setAnnotRanges, locateQuote } from "./editor/annotations.js";
 import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from "./editor/viewers.js";
+import { htmlToMarkdown, looksRich } from "./editor/paste.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
 import "@fontsource-variable/inter/index.css";
@@ -1220,7 +1221,18 @@ async function insertImageFile(file) {
 }
 view.dom.addEventListener("paste", (e) => {
   const img = [...(e.clipboardData?.items || [])].find((it) => it.kind === "file" && it.type.startsWith("image/"));
-  if (img) { e.preventDefault(); e.stopPropagation(); insertImageFile(img.getAsFile()); }
+  if (img) { e.preventDefault(); e.stopPropagation(); insertImageFile(img.getAsFile()); return; }
+  // Rich paste (Notes / Word / Google Docs) → Markdown, in markdown mode only.
+  if (currentMode !== "markdown") return;
+  const html = e.clipboardData?.getData("text/html");
+  if (!html || !looksRich(html)) return; // let CodeMirror do its plain-text paste
+  let md;
+  try { md = htmlToMarkdown(html); } catch { return; }
+  if (!md) return;
+  e.preventDefault(); e.stopPropagation();
+  const r = view.state.selection.main;
+  view.dispatch({ changes: { from: r.from, to: r.to, insert: md }, selection: { anchor: r.from + md.length }, scrollIntoView: true });
+  view.focus();
 }, true);
 view.dom.addEventListener("dragover", (e) => {
   if ([...(e.dataTransfer?.items || [])].some((it) => it.kind === "file" && it.type.startsWith("image/"))) e.preventDefault();
@@ -1514,7 +1526,7 @@ buildWelcome();
 updateWelcome();
 
 // Automation surface (used for scripting / testing the UI).
-window.__plume = { toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, view };
+window.__plume = { toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, htmlToMarkdown, view };
 
 // Agent surface — read by the main process (executeJavaScript) for the MCP server.
 window.__plumeAgent = {
