@@ -79,8 +79,11 @@ html, body {
   font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
 }
+/* Flex the whole height chain so #app always fills the window — robust against
+   any vh-on-resize quirk (which left the dark window bg bleeding through). */
+body { display: flex; flex-direction: column; }
 
-#app { display: flex; flex-direction: column; height: 100vh; }
+#app { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
 
 #titlebar {
   height: var(--title-h);

@@ -543,16 +543,32 @@ ipcMain.handle("context:list", async (_e, { dir }) => {
 });
 
 // Read a file for inline insertion. Claude Code `.jsonl` transcripts are distilled
-// to readable markdown (user/assistant prose only); other files insert as-is.
+// to readable markdown — user/assistant prose only, MOST RECENT first-on-screen.
+// Transcripts run to hundreds of MB, so we tail-read rather than load the whole file.
+const SESSION_TAIL_BYTES = 6 * 1024 * 1024; // distill from the last ~6 MB
+const SESSION_CHAR_CAP = 40000; // keep the most-recent ~40k chars of prose
 ipcMain.handle("session:read", async (_e, { filePath }) => {
   if (!filePath) return "";
+  let stat;
+  try { stat = await fs.stat(filePath); } catch { return ""; }
   let raw;
-  try { raw = await fs.readFile(filePath, "utf8"); } catch { return ""; }
+  try {
+    if (stat.size > SESSION_TAIL_BYTES) {
+      const fh = await fs.open(filePath, "r");
+      const buf = Buffer.alloc(SESSION_TAIL_BYTES);
+      const { bytesRead } = await fh.read(buf, 0, SESSION_TAIL_BYTES, stat.size - SESSION_TAIL_BYTES);
+      await fh.close();
+      raw = buf.toString("utf8", 0, bytesRead);
+      const nl = raw.indexOf("\n");
+      if (nl >= 0) raw = raw.slice(nl + 1); // drop the partial first line
+    } else {
+      raw = await fs.readFile(filePath, "utf8");
+    }
+  } catch { return ""; }
   if (!filePath.endsWith(".jsonl")) return raw;
+
   const out = [];
-  let budget = 40000;
   for (const line of raw.split("\n")) {
-    if (budget <= 0) break;
     let obj; try { obj = JSON.parse(line); } catch { continue; }
     const msg = obj.message || obj;
     const role = msg.role || obj.type;
@@ -565,11 +581,13 @@ ipcMain.handle("session:read", async (_e, { filePath }) => {
     }
     text = text.trim();
     if (!text) continue;
-    const chunk = `${role === "assistant" ? "**Claude:**" : "**You:**"}\n\n${text}\n`;
-    out.push(chunk.slice(0, budget));
-    budget -= chunk.length;
+    out.push(`${role === "assistant" ? "**Claude:**" : "**You:**"}\n\n${text}`);
   }
-  return out.join("\n");
+  let joined = out.join("\n\n");
+  if (joined.length > SESSION_CHAR_CAP) {
+    joined = "_…earlier conversation trimmed…_\n\n" + joined.slice(joined.length - SESSION_CHAR_CAP);
+  }
+  return joined;
 });
 
 ipcMain.handle("annotations:load", async (_e, { filePath }) => readAnnotations(filePath));

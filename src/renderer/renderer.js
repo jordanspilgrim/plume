@@ -616,6 +616,9 @@ function toggleOutline() {
 /* ---------- Theme ---------- */
 function applyTheme(theme) {
   appEl.dataset.theme = theme;
+  // Also theme <html> so the palette vars (--bg, --text) cascade to html/body —
+  // otherwise body's background is transparent and the window bg bleeds through.
+  document.documentElement.dataset.theme = theme;
   localStorage.setItem("plume-theme", theme);
   const dark =
     theme === "dark" ||
