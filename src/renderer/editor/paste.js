@@ -80,9 +80,100 @@ function normalize(doc) {
   });
 }
 
+// ---- Word "mso-list" fake lists → real <ul>/<ol> ----
+// Word emits list items as <p style='...mso-list:lN levelM lfoK'> with the
+// bullet/number glyph buried in a <![if !supportLists]>…<![endif]> block (which
+// DOMParser turns into bogus comment nodes). We strip that marker, read the
+// nesting level, infer ordered vs unordered from the glyph, then rebuild proper
+// nested lists so turndown can render them.
+function isMsoListItem(p) {
+  return p.nodeName === "P" && /mso-list:\s*l\d/i.test(p.getAttribute("style") || "");
+}
+function msoLevel(p) {
+  const m = (p.getAttribute("style") || "").match(/mso-list:[^;"]*level(\d+)/i);
+  return m ? parseInt(m[1], 10) : 1;
+}
+const ORDERED_RE = /^[0-9a-z]{1,3}[.)]|^[ivxlcdm]+[.)]/i;
+function stripMsoMarker(p) {
+  let ordered = false, found = false, inMarker = false;
+  for (const n of [...p.childNodes]) {
+    if (n.nodeType === 8) {
+      const d = n.data || "";
+      if (/supportLists/i.test(d)) { inMarker = true; found = true; n.remove(); continue; }
+      if (/endif/i.test(d)) { inMarker = false; n.remove(); continue; }
+    }
+    if (inMarker) {
+      const t = (n.textContent || "").replace(/ /g, " ").trim();
+      if (t && ORDERED_RE.test(t)) ordered = true;
+      n.remove();
+    }
+  }
+  if (!found) {
+    // No conditional-comment marker (some Word exports / pasteboards drop it).
+    // Fall back to a leading bullet/number span.
+    const first = p.firstElementChild;
+    if (first && first.nodeName === "SPAN") {
+      const t = (first.textContent || "").replace(/ /g, " ").trim();
+      if (/^[•·▪◦‣o*\-]/.test(t) || ORDERED_RE.test(t)) {
+        ordered = ORDERED_RE.test(t);
+        first.remove();
+        found = true;
+      }
+    }
+  }
+  return { found, ordered };
+}
+function buildLists(doc, items) {
+  const root = doc.createElement("div");
+  const stack = []; // { level, listEl, ordered }
+  for (const it of items) {
+    while (stack.length && stack[stack.length - 1].level > it.level) stack.pop();
+    let top = stack[stack.length - 1];
+    if (!top || top.level < it.level) {
+      const listEl = doc.createElement(it.ordered ? "ol" : "ul");
+      if (top) (top.listEl.lastElementChild || top.listEl).appendChild(listEl);
+      else root.appendChild(listEl);
+      top = { level: it.level, listEl, ordered: it.ordered };
+      stack.push(top);
+    } else if (top.level === it.level && top.ordered !== it.ordered) {
+      const listEl = doc.createElement(it.ordered ? "ol" : "ul");
+      (top.listEl.parentNode || root).appendChild(listEl);
+      top = { level: it.level, listEl, ordered: it.ordered };
+      stack[stack.length - 1] = top;
+    }
+    const li = doc.createElement("li");
+    while (it.p.firstChild) li.appendChild(it.p.firstChild);
+    top.listEl.appendChild(li);
+  }
+  return root;
+}
+function convertMsoLists(doc) {
+  const ps = [...doc.querySelectorAll("p")];
+  let i = 0;
+  while (i < ps.length) {
+    if (!isMsoListItem(ps[i])) { i++; continue; }
+    const run = [];
+    while (i < ps.length && isMsoListItem(ps[i])) run.push(ps[i++]);
+    const items = run.map((p) => {
+      const level = msoLevel(p);
+      const { ordered } = stripMsoMarker(p);
+      return { level, ordered, p };
+    });
+    const listRoot = buildLists(doc, items);
+    run[0].parentNode.insertBefore(listRoot, run[0]);
+    run.forEach((p) => p.remove());
+    while (listRoot.firstChild) listRoot.parentNode.insertBefore(listRoot.firstChild, listRoot);
+    listRoot.remove();
+  }
+}
+
 export function htmlToMarkdown(html) {
+  // Strip <!--…--> comments (incl. Word's <!--[if gte mso]>…--> cruft). The
+  // single-bracket <![if !supportLists]> list markers aren't <!-- so they survive
+  // to DOMParser as comment nodes, where stripMsoMarker() consumes them.
   const cleaned = String(html).replace(/<!--[\s\S]*?-->/g, "");
   const doc = new DOMParser().parseFromString(cleaned, "text/html");
+  convertMsoLists(doc);
   normalize(doc);
   let md = td.turndown(doc.body.innerHTML);
   return md.replace(/\n{3,}/g, "\n\n").trim();
