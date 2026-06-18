@@ -68,7 +68,7 @@ window.plume = {
   saveAnnotations: (filePath, annotations) =>
     invoke("save_annotations", { path: filePath, annotations }).catch(() => false),
   snapshot: (content) => { invoke("snapshot", { content }).catch(noop); },
-  discardRecovery: noop,
+  discardRecovery: () => { invoke("discard_recovery").catch(noop); },
 
   // Claude Code sessions + context
   listSessions: (dir) => invoke("list_sessions", { dir }).catch(() => []),

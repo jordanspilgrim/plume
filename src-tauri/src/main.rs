@@ -332,13 +332,18 @@ async fn save_dialog(app: AppHandle, content: String) -> Option<String> {
 }
 
 // ---- crash-recovery snapshot read ----
-fn recovery_for(path: &str) -> Option<String> {
+// Per-file snapshot path: FNV-1a hash of the absolute path → recovery/<hash>.json.
+fn recovery_path(path: &str) -> PathBuf {
     let mut hash: u64 = 1469598103934665603;
     for b in path.bytes() {
         hash ^= b as u64;
         hash = hash.wrapping_mul(1099511628211);
     }
-    let file = plume_dir().join("recovery").join(format!("{:x}.json", hash));
+    plume_dir().join("recovery").join(format!("{:x}.json", hash))
+}
+
+fn recovery_for(path: &str) -> Option<String> {
+    let file = recovery_path(path);
     let snap: Value = serde_json::from_str(&fs::read_to_string(&file).ok()?).ok()?;
     let snap_content = snap["content"].as_str()?.to_string();
     let disk = fs::read_to_string(path).ok()?;
@@ -642,15 +647,20 @@ fn save_annotations(path: Option<String>, annotations: Value) -> bool {
 fn snapshot(app: AppHandle, content: String) {
     let cur = app.state::<AppState>().current.lock().unwrap().clone();
     if let Some(path) = cur {
-        let dir = plume_dir().join("recovery");
-        let _ = fs::create_dir_all(&dir);
-        let mut hash: u64 = 1469598103934665603;
-        for b in path.bytes() {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(1099511628211);
+        let file = recovery_path(&path);
+        if let Some(dir) = file.parent() {
+            let _ = fs::create_dir_all(dir);
         }
-        let file = dir.join(format!("{:x}.json", hash));
         let _ = fs::write(file, json!({ "filePath": path, "content": content }).to_string());
+    }
+}
+
+// Discard the crash-recovery snapshot for the open file (banner "Discard").
+#[tauri::command]
+fn discard_recovery(app: AppHandle) {
+    let cur = app.state::<AppState>().current.lock().unwrap().clone();
+    if let Some(path) = cur {
+        let _ = fs::remove_file(recovery_path(&path));
     }
 }
 
@@ -1122,6 +1132,7 @@ fn main() {
             load_annotations,
             save_annotations,
             snapshot,
+            discard_recovery,
             list_sessions,
             search_sessions,
             list_context,
