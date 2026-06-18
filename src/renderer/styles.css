@@ -192,6 +192,9 @@ body { display: flex; flex-direction: column; }
 }
 .sel-btn:hover { background: var(--accent-soft); color: var(--text); }
 .sel-btn svg { width: 18px; height: 18px; display: block; }
+.sel-btn.sel-block { width: auto; padding: 0 5px 0 8px; gap: 2px; }
+.sel-btn.sel-block .tt-chev { width: 10px; height: 10px; opacity: 0.6; }
+.sel-div { width: 1px; height: 20px; background: var(--rule); margin: 0 3px; flex: 0 0 auto; }
 
 #main { flex: 1 1 auto; display: flex; min-height: 0; }
 

@@ -824,6 +824,8 @@ const ICONS = {
   link: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M117.18,188.74a12,12,0,0,1,0,17l-5.12,5.12A58.26,58.26,0,0,1,70.6,228h0A58.62,58.62,0,0,1,29.14,127.92L63.89,93.17a58.64,58.64,0,0,1,98.56,28.11,12,12,0,1,1-23.37,5.44,34.65,34.65,0,0,0-58.22-16.58L46.11,144.89A34.62,34.62,0,0,0,70.57,204h0a34.41,34.41,0,0,0,24.49-10.14l5.11-5.12A12,12,0,0,1,117.18,188.74ZM226.83,45.17a58.65,58.65,0,0,0-82.93,0l-5.11,5.11a12,12,0,0,0,17,17l5.12-5.12a34.63,34.63,0,1,1,49,49L175.1,145.86A34.39,34.39,0,0,1,150.61,156h0a34.63,34.63,0,0,1-33.69-26.72,12,12,0,0,0-23.38,5.44A58.64,58.64,0,0,0,150.56,180h.05a58.28,58.28,0,0,0,41.47-17.17l34.75-34.75a58.62,58.62,0,0,0,0-82.91Z\"/></svg>",
 };
 const CHEV_TT = '<svg class="tt-chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5 6 7.5 9 4.5"/></svg>';
+// "Turn into" block-type glyph (Phosphor heading) for the selection bubble.
+const BLOCK_ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M212,56V200a12,12,0,0,1-24,0V140H68v60a12,12,0,0,1-24,0V56a12,12,0,0,1,24,0v60H188V56a12,12,0,0,1,24,0Z"/></svg>';
 
 // Inline formatting — surfaced contextually in the selection bubble.
 const INLINE_FORMATS = [
@@ -916,8 +918,39 @@ function refreshRail() {
 
 /* ---------- Contextual selection bubble (inline formatting) ---------- */
 const selbar = document.getElementById("selbar");
+// "Turn into" — block-type transforms for the line(s) under the selection.
+function blockMenuItems() {
+  const line = view.state.doc.lineAt(view.state.selection.main.head).text;
+  const hLvl = (line.match(/^(#{1,6}) /) || [])[1]?.length || 0;
+  const isList = /^\s*([-*+] |\d+\. |> )/.test(line);
+  return [
+    { label: "Title", fn: () => setHeading(1), checked: hLvl === 1 },
+    { label: "Heading", fn: () => setHeading(2), checked: hLvl === 2 },
+    { label: "Subheading", fn: () => setHeading(3), checked: hLvl === 3 },
+    { label: "Body text", fn: () => setHeading(0), checked: hLvl === 0 && !isList },
+    { sep: true },
+    { label: "Bullet list", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- "), checked: /^\s*[-*+] /.test(line) && !/^\s*[-*+] \[[ xX]\] /.test(line) },
+    { label: "Numbered list", fn: () => toggleLinePrefix(/^\s*\d+\. /, (i) => `${i + 1}. `), checked: /^\s*\d+\. /.test(line) },
+    { label: "To-do list", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] "), checked: /^\s*[-*+] \[[ xX]\] /.test(line) },
+    { label: "Quote", fn: () => toggleLinePrefix(/^> ?/, () => "> "), checked: /^\s*> /.test(line) },
+    { sep: true },
+    { label: "Code block", fn: insertCodeBlock },
+  ];
+}
 function buildSelBar() {
   selbar.innerHTML = "";
+  // Lead with the block-type ("turn into") menu, then a divider, then inline formats.
+  const blockBtn = document.createElement("button");
+  blockBtn.className = "sel-btn sel-block has-menu";
+  blockBtn.title = "Turn into…  (heading, list, quote, code)";
+  blockBtn.setAttribute("aria-label", "Turn into");
+  blockBtn.innerHTML = BLOCK_ICON + CHEV_TT;
+  blockBtn.addEventListener("mousedown", (e) => e.preventDefault());
+  blockBtn.addEventListener("click", () => openMenu(blockBtn, blockMenuItems()));
+  selbar.appendChild(blockBtn);
+  const div = document.createElement("div");
+  div.className = "sel-div";
+  selbar.appendChild(div);
   for (const b of INLINE_FORMATS) {
     const btn = document.createElement("button");
     btn.className = "sel-btn";
