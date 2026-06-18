@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld("plume", {
   listSessions: (dir) => ipcRenderer.invoke("sessions:list", { dir }),
   searchSessions: (query, dir) => ipcRenderer.invoke("sessions:search", { query, dir }),
   listContext: (dir) => ipcRenderer.invoke("context:list", { dir }),
+  readSession: (filePath) => ipcRenderer.invoke("session:read", { filePath }),
   openInThisWindow: (filePath, gotoLine) =>
     ipcRenderer.invoke("file:openInThisWindow", { filePath, gotoLine }),
   loadAnnotations: (filePath) => ipcRenderer.invoke("annotations:load", { filePath }),

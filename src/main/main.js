@@ -542,6 +542,36 @@ ipcMain.handle("context:list", async (_e, { dir }) => {
   return out;
 });
 
+// Read a file for inline insertion. Claude Code `.jsonl` transcripts are distilled
+// to readable markdown (user/assistant prose only); other files insert as-is.
+ipcMain.handle("session:read", async (_e, { filePath }) => {
+  if (!filePath) return "";
+  let raw;
+  try { raw = await fs.readFile(filePath, "utf8"); } catch { return ""; }
+  if (!filePath.endsWith(".jsonl")) return raw;
+  const out = [];
+  let budget = 40000;
+  for (const line of raw.split("\n")) {
+    if (budget <= 0) break;
+    let obj; try { obj = JSON.parse(line); } catch { continue; }
+    const msg = obj.message || obj;
+    const role = msg.role || obj.type;
+    if (role !== "user" && role !== "assistant") continue;
+    let text = "";
+    const c = msg.content;
+    if (typeof c === "string") text = c;
+    else if (Array.isArray(c)) {
+      text = c.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n\n");
+    }
+    text = text.trim();
+    if (!text) continue;
+    const chunk = `${role === "assistant" ? "**Claude:**" : "**You:**"}\n\n${text}\n`;
+    out.push(chunk.slice(0, budget));
+    budget -= chunk.length;
+  }
+  return out.join("\n");
+});
+
 ipcMain.handle("annotations:load", async (_e, { filePath }) => readAnnotations(filePath));
 
 ipcMain.handle("annotations:save", async (_e, { filePath, annotations }) => {

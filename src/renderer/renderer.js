@@ -61,6 +61,7 @@ const updateListener = EditorView.updateListener.of((u) => {
   if (u.docChanged) { scheduleSideEffects(); updateWelcome(); }
   if (u.selectionSet) updateStatus();
   if (u.selectionSet || u.docChanged) updateSelBar();
+  handleSlash(u);
 });
 
 const view = new EditorView({
@@ -384,14 +385,16 @@ function applyMode(filePath) {
       codeConf.reconfigure(codeFeatures),
     ]});
   }
-  // Markdown-only chrome: hide the formatting cluster + selection bubble in code/data modes.
+  // Markdown-only chrome: hide the Share menu + selection bubble + slash menu in code/data modes.
   const tools = document.getElementById("titlebar-tools");
   if (tools) tools.style.display = mode === "markdown" ? "" : "none";
   const sb = document.getElementById("selbar");
+  closeSlash();
   if (mode !== "markdown") {
     outlineEl.classList.add("hidden");
     if (sb) sb.classList.add("hidden");
   }
+  if (typeof refreshRail === "function") refreshRail();
   updateHosts();
 }
 
@@ -607,6 +610,7 @@ function renderOutline() {
 function toggleOutline() {
   outlineEl.classList.toggle("hidden");
   renderOutline();
+  refreshRail();
 }
 
 /* ---------- Theme ---------- */
@@ -795,36 +799,16 @@ async function copyForGoogleDocs() {
 }
 
 /* ---------- Toolbar ---------- */
-// Consistent 18px icon set (1.6–1.8 stroke, rounded) — all icons, no text glyphs.
+// Inline-format glyphs (Phosphor Bold, 18px) used by the contextual selection bubble.
 const ICONS = {
-  heading: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M212,56V200a12,12,0,0,1-24,0V140H68v60a12,12,0,0,1-24,0V56a12,12,0,0,1,24,0v60H188V56a12,12,0,0,1,24,0Z\"/></svg>",
   bold: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M185.08,114.46A48,48,0,0,0,148,36H80A12,12,0,0,0,68,48V200a12,12,0,0,0,12,12h80a52,52,0,0,0,25.08-97.54ZM92,60h56a24,24,0,0,1,0,48H92Zm68,128H92V132h68a28,28,0,0,1,0,56Z\"/></svg>",
   italic: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M204,56a12,12,0,0,1-12,12H160.65l-40,120H144a12,12,0,0,1,0,24H64a12,12,0,0,1,0-24H95.35l40-120H112a12,12,0,0,1,0-24h80A12,12,0,0,1,204,56Z\"/></svg>",
   strike: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M228,128a12,12,0,0,1-12,12H185.86A41.48,41.48,0,0,1,196,168c0,14.45-7.81,28.32-21.43,38.05C162,215.05,145.44,220,128,220s-34-4.95-46.57-13.95C67.81,196.32,60,182.45,60,168a12,12,0,0,1,24,0c0,15.18,20.15,28,44,28s44-12.82,44-28c0-12.76-9.3-20.18-35.35-28H40a12,12,0,0,1,0-24H216A12,12,0,0,1,228,128ZM75.11,100a12,12,0,0,0,12-12c0-16,17.58-28,40.89-28,17.36,0,31.37,6.65,37.48,17.78a12,12,0,0,0,21-11.56C176.13,47.3,154.25,36,128,36,91,36,63.11,58.35,63.11,88A12,12,0,0,0,75.11,100Z\"/></svg>",
-  type: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M90.86,50.89a12,12,0,0,0-21.72,0l-64,136a12,12,0,0,0,21.71,10.22L42.44,164h75.12l15.58,33.11a12,12,0,0,0,21.72-10.22ZM53.74,140,80,84.18,106.27,140ZM200,84c-13.85,0-24.77,3.86-32.45,11.48a12,12,0,1,0,16.9,17c3-3,8.26-4.52,15.55-4.52,11,0,20,7.18,20,16v4.39A47.28,47.28,0,0,0,200,124c-24.26,0-44,17.94-44,40s19.74,40,44,40a47.18,47.18,0,0,0,22-5.38A12,12,0,0,0,244,192V124C244,101.94,224.26,84,200,84Zm0,96c-11,0-20-7.18-20-16s9-16,20-16,20,7.18,20,16S211,180,200,180Z\"/></svg>",
   code: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M71.68,97.22,34.74,128l36.94,30.78a12,12,0,1,1-15.36,18.44l-48-40a12,12,0,0,1,0-18.44l48-40A12,12,0,0,1,71.68,97.22Zm176,21.56-48-40a12,12,0,1,0-15.36,18.44L221.26,128l-36.94,30.78a12,12,0,1,0,15.36,18.44l48-40a12,12,0,0,0,0-18.44ZM164.1,28.72a12,12,0,0,0-15.38,7.18l-64,176a12,12,0,0,0,7.18,15.37A11.79,11.79,0,0,0,96,228a12,12,0,0,0,11.28-7.9l64-176A12,12,0,0,0,164.1,28.72Z\"/></svg>",
   link: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M117.18,188.74a12,12,0,0,1,0,17l-5.12,5.12A58.26,58.26,0,0,1,70.6,228h0A58.62,58.62,0,0,1,29.14,127.92L63.89,93.17a58.64,58.64,0,0,1,98.56,28.11,12,12,0,1,1-23.37,5.44,34.65,34.65,0,0,0-58.22-16.58L46.11,144.89A34.62,34.62,0,0,0,70.57,204h0a34.41,34.41,0,0,0,24.49-10.14l5.11-5.12A12,12,0,0,1,117.18,188.74ZM226.83,45.17a58.65,58.65,0,0,0-82.93,0l-5.11,5.11a12,12,0,0,0,17,17l5.12-5.12a34.63,34.63,0,1,1,49,49L175.1,145.86A34.39,34.39,0,0,1,150.61,156h0a34.63,34.63,0,0,1-33.69-26.72,12,12,0,0,0-23.38,5.44A58.64,58.64,0,0,0,150.56,180h.05a58.28,58.28,0,0,0,41.47-17.17l34.75-34.75a58.62,58.62,0,0,0,0-82.91Z\"/></svg>",
-  bullet: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M76,64A12,12,0,0,1,88,52H216a12,12,0,0,1,0,24H88A12,12,0,0,1,76,64Zm140,52H88a12,12,0,0,0,0,24H216a12,12,0,0,0,0-24Zm0,64H88a12,12,0,0,0,0,24H216a12,12,0,0,0,0-24ZM44,112a16,16,0,1,0,16,16A16,16,0,0,0,44,112Zm0-64A16,16,0,1,0,60,64,16,16,0,0,0,44,48Zm0,128a16,16,0,1,0,16,16A16,16,0,0,0,44,176Z\"/></svg>",
-  ordered: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M228,128a12,12,0,0,1-12,12H116a12,12,0,0,1,0-24H216A12,12,0,0,1,228,128ZM116,76H216a12,12,0,0,0,0-24H116a12,12,0,0,0,0,24ZM216,180H116a12,12,0,0,0,0,24H216a12,12,0,0,0,0-24ZM44,59.31V104a12,12,0,0,0,24,0V40A12,12,0,0,0,50.64,29.27l-16,8a12,12,0,0,0,9.36,22Zm39.73,96.86a27.7,27.7,0,0,0-11.2-18.63A28.89,28.89,0,0,0,32.9,143a27.71,27.71,0,0,0-4.17,7.54,12,12,0,0,0,22.55,8.21,4,4,0,0,1,.58-1,4.78,4.78,0,0,1,6.5-.82,3.82,3.82,0,0,1,1.61,2.6,3.63,3.63,0,0,1-.77,2.77l-.13.17L30.39,200.82A12,12,0,0,0,40,220H72a12,12,0,0,0,0-24H64l14.28-19.11A27.48,27.48,0,0,0,83.73,156.17Z\"/></svg>",
-  task: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M228,128a12,12,0,0,1-12,12H128a12,12,0,0,1,0-24h88A12,12,0,0,1,228,128ZM128,76h88a12,12,0,0,0,0-24H128a12,12,0,0,0,0,24Zm88,104H128a12,12,0,0,0,0,24h88a12,12,0,0,0,0-24ZM79.51,39.51,56,63l-7.51-7.52a12,12,0,0,0-17,17l16,16a12,12,0,0,0,17,0l32-32a12,12,0,0,0-17-17Zm0,64L56,127l-7.51-7.52a12,12,0,1,0-17,17l16,16a12,12,0,0,0,17,0l32-32a12,12,0,0,0-17-17Zm0,64L56,191l-7.51-7.52a12,12,0,1,0-17,17l16,16a12,12,0,0,0,17,0l32-32a12,12,0,0,0-17-17Z\"/></svg>",
-  quote: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M100,52H40A20,20,0,0,0,20,72v64a20,20,0,0,0,20,20H96v4a28,28,0,0,1-28,28,12,12,0,0,0,0,24,52.06,52.06,0,0,0,52-52V72A20,20,0,0,0,100,52Zm-4,80H44V76H96ZM216,52H156a20,20,0,0,0-20,20v64a20,20,0,0,0,20,20h56v4a28,28,0,0,1-28,28,12,12,0,0,0,0,24,52.06,52.06,0,0,0,52-52V72A20,20,0,0,0,216,52Zm-4,80H160V76h52Z\"/></svg>",
-  codeblock: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M51.51,104.49l-32-32a12,12,0,0,1,0-17l32-32a12,12,0,1,1,17,17L45,64,68.49,87.51a12,12,0,0,1-17,17Zm48,0a12,12,0,0,0,17,0l32-32a12,12,0,0,0,0-17l-32-32a12,12,0,1,0-17,17L123,64,99.51,87.51A12,12,0,0,0,99.51,104.49ZM200,36H180a12,12,0,0,0,0,24h16V196H60V140a12,12,0,0,0-24,0v60a20,20,0,0,0,20,20H200a20,20,0,0,0,20-20V56A20,20,0,0,0,200,36Z\"/></svg>",
-  table: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M224,44H32A12,12,0,0,0,20,56V192a20,20,0,0,0,20,20H216a20,20,0,0,0,20-20V56A12,12,0,0,0,224,44ZM44,116H76v24H44Zm56,0H212v24H100ZM212,68V92H44V68ZM44,164H76v24H44Zm56,24V164H212v24Z\"/></svg>",
-  hr: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M228,128a12,12,0,0,1-12,12H40a12,12,0,0,1,0-24H216A12,12,0,0,1,228,128Z\"/></svg>",
-  image: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\" fill=\"currentColor\"><path d=\"M144,96a16,16,0,1,1,16,16A16,16,0,0,1,144,96Zm92-40V200a20,20,0,0,1-20,20H40a20,20,0,0,1-20-20V56A20,20,0,0,1,40,36H216A20,20,0,0,1,236,56ZM44,60v79.72l33.86-33.86a20,20,0,0,1,28.28,0L147.31,147l17.18-17.17a20,20,0,0,1,28.28,0L212,149.09V60Zm0,136H162.34L92,125.66l-48,48Zm168,0V183l-33.37-33.37L164.28,164l32,32Z\"/></svg>",
-  gdocs: "<svg viewBox=\"0 0 18 18\"><path d=\"M4.5 2h4.6L12.5 5.4V15a.6.6 0 0 1-.6.6H4.5a.6.6 0 0 1-.6-.6V2.6A.6.6 0 0 1 4.5 2z\" fill=\"none\" stroke=\"#4285F4\" stroke-width=\"1.3\" stroke-linejoin=\"round\"/><path d=\"M9 2.2v3.4h3.4\" fill=\"none\" stroke=\"#4285F4\" stroke-width=\"1.3\"/><path d=\"M6.2 8.6h5.4M6.2 10.7h5.4M6.2 12.8h3.8\" stroke=\"#4285F4\" stroke-width=\"1.1\" stroke-linecap=\"round\"/></svg>",
 };
-const CHEVRON = '<svg class="tb-chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5 6 7.5 9 4.5"/></svg>';
-
-ICONS.plus = '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 4v10M4 9h10"/></svg>';
 const CHEV_TT = '<svg class="tt-chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5 6 7.5 9 4.5"/></svg>';
 
-// Always-visible cluster folded into the title bar (block style · insert · font).
-const TITLE_CLUSTER = [
-  { t: "Paragraph style", svg: "heading", menu: "heading" },
-  { t: "Insert", svg: "plus", menu: "insert" },
-  { t: "Editor font", svg: "type", menu: "font" },
-];
 // Inline formatting — surfaced contextually in the selection bubble.
 const INLINE_FORMATS = [
   { t: "Bold  ⌘B", svg: "bold", fn: () => applyFormat("bold") },
@@ -850,19 +834,68 @@ function applyFont(id) {
   localStorage.setItem("plume-font", font.id);
 }
 
-/* ---------- Title-bar cluster ---------- */
-function buildTitleTools() {
+/* ---------- Title bar: brand (left) + Share (right) ---------- */
+const BRAND_FEATHER = '<svg viewBox="0 0 18 18"><path d="M14.5 3.5a5.5 5.5 0 0 0-7.8 7.8L4.5 13.5v1.5h1.5l2.2-2.2A5.5 5.5 0 0 0 14.5 3.5z"/><path d="M11.5 6.5 6 12"/></svg>';
+const SHARE_ICON = '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v9"/><path d="M5.5 5.5 9 2l3.5 3.5"/><path d="M4 11v3.5A1.5 1.5 0 0 0 5.5 16h7a1.5 1.5 0 0 0 1.5-1.5V11"/></svg>';
+
+function buildBrand() {
+  const el = document.getElementById("titlebar-brand");
+  if (!el) return;
+  el.innerHTML = `<span class="brand-mark">${BRAND_FEATHER}</span><span class="brand-name">Plume</span>`;
+}
+function buildTitlebarTools() {
   const host = document.getElementById("titlebar-tools");
+  if (!host) return;
   host.innerHTML = "";
-  for (const b of TITLE_CLUSTER) {
+  const share = document.createElement("button");
+  share.className = "tt-btn has-menu";
+  share.title = "Share — copy, export, publish";
+  share.setAttribute("aria-label", "Share");
+  share.innerHTML = SHARE_ICON + CHEV_TT;
+  share.addEventListener("click", () => openMenu(share, shareMenuItems()));
+  host.appendChild(share);
+}
+
+/* ---------- Left rail: the app's surfaces ---------- */
+const RAIL_ICONS = {
+  feather: '<svg viewBox="0 0 22 22"><path d="M17.5 4.5a6.5 6.5 0 0 0-9.2 9.2L5.5 16.5v2h2l2.8-2.8a6.5 6.5 0 0 0 7.2-11.2z"/><path d="M14 7 7.5 13.5"/></svg>',
+  files: '<svg viewBox="0 0 22 22"><path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h3.5l1.8 2.2H17A1.5 1.5 0 0 1 18.5 8.7v7.3A1.5 1.5 0 0 1 17 17.5H5A1.5 1.5 0 0 1 3.5 16z"/></svg>',
+  sessions: '<svg viewBox="0 0 22 22"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h11A1.5 1.5 0 0 1 18 6.5v6A1.5 1.5 0 0 1 16.5 14H9l-3.5 3.2V14H5.5A1.5 1.5 0 0 1 4 12.5z"/><path d="M7.5 8.2h7M7.5 11h4.5"/></svg>',
+  outline: '<svg viewBox="0 0 22 22"><path d="M6 6h11M6 11h11M6 16h7"/><circle cx="3.4" cy="6" r="1.1" style="fill:currentColor;stroke:none"/><circle cx="3.4" cy="11" r="1.1" style="fill:currentColor;stroke:none"/><circle cx="3.4" cy="16" r="1.1" style="fill:currentColor;stroke:none"/></svg>',
+  search: '<svg viewBox="0 0 22 22"><circle cx="10" cy="10" r="5"/><path d="M17.5 17.5 13.6 13.6"/></svg>',
+  settings: '<svg viewBox="0 0 22 22"><circle cx="11" cy="11" r="2.6"/><path d="M11 3.5v2M11 16.5v2M3.5 11h2M16.5 11h2M5.7 5.7l1.4 1.4M14.9 14.9l1.4 1.4M16.3 5.7l-1.4 1.4M7.1 14.9l-1.4 1.4"/></svg>',
+};
+const RAIL = [
+  { icon: "feather", t: "Command palette  ⌘P", brand: true, fn: () => openPalette() },
+  { icon: "files", t: "Files  ⌘⇧E", id: "files", fn: () => toggleSidebar() },
+  { icon: "sessions", t: "Sessions & context  ⌘⇧P", fn: () => openWorkspace() },
+  { icon: "outline", t: "Outline  ⌘⇧O", id: "outline", fn: () => toggleOutline() },
+  { icon: "search", t: "Search in folder  ⌘⇧F", fn: () => openSearch() },
+  { icon: "settings", t: "Settings — appearance & fonts", bottom: true, fn: (el) => openMenu(el, settingsMenuItems()) },
+];
+function buildRail() {
+  const host = document.getElementById("rail");
+  if (!host) return;
+  host.innerHTML = "";
+  for (const r of RAIL) {
     const btn = document.createElement("button");
-    btn.className = "tt-btn has-menu";
-    btn.title = b.t;
-    btn.setAttribute("aria-label", b.t);
-    btn.innerHTML = ICONS[b.svg] + CHEV_TT;
-    btn.addEventListener("click", () => openToolbarMenu(btn, b.menu));
+    btn.className = "rail-item" + (r.brand ? " brand" : "") + (r.bottom ? " bottom" : "");
+    btn.title = r.t;
+    btn.setAttribute("aria-label", r.t);
+    if (r.id) btn.dataset.rail = r.id;
+    btn.innerHTML = RAIL_ICONS[r.icon];
+    btn.addEventListener("click", () => r.fn(btn));
     host.appendChild(btn);
   }
+  refreshRail();
+}
+function refreshRail() {
+  const host = document.getElementById("rail");
+  if (!host) return;
+  const f = host.querySelector('[data-rail="files"]');
+  if (f) f.classList.toggle("on", !sidebarEl.classList.contains("hidden"));
+  const o = host.querySelector('[data-rail="outline"]');
+  if (o) o.classList.toggle("on", !outlineEl.classList.contains("hidden"));
 }
 
 /* ---------- Contextual selection bubble (inline formatting) ---------- */
@@ -897,42 +930,42 @@ function updateSelBar() {
   selbar.style.top = top + "px";
 }
 
-/* ---------- Dropdown menus (heading / insert / font) ---------- */
+/* ---------- Dropdown menus (Share / Settings) ---------- */
 let openMenuEl = null;
 function closeToolbarMenu() { if (openMenuEl) { openMenuEl.remove(); openMenuEl = null; } }
 document.addEventListener("mousedown", (e) => {
-  if (openMenuEl && !openMenuEl.contains(e.target) && !e.target.closest(".has-menu")) closeToolbarMenu();
+  if (openMenuEl && !openMenuEl.contains(e.target) && !e.target.closest(".has-menu, .rail-item")) closeToolbarMenu();
 });
-function headingMenuItems() {
-  const lvl = (view.state.doc.lineAt(view.state.selection.main.head).text.match(/^(#{1,6}) /) || [])[1]?.length || 0;
+function shareMenuItems() {
   return [
-    { label: "Title", fn: () => setHeading(1), checked: lvl === 1 },
-    { label: "Heading", fn: () => setHeading(2), checked: lvl === 2 },
-    { label: "Subheading", fn: () => setHeading(3), checked: lvl === 3 },
-    { label: "Body text", fn: () => setHeading(0), checked: lvl === 0 },
-  ];
-}
-function insertMenuItems() {
-  const l = view.state.doc.lineAt(view.state.selection.main.head).text;
-  return [
-    { label: "Bullet list", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- "), checked: /^\s*[-*+] /.test(l) && !/^\s*[-*+] \[[ xX]\] /.test(l) },
-    { label: "Numbered list", fn: () => toggleLinePrefix(/^\s*\d+\. /, (i) => `${i + 1}. `), checked: /^\s*\d+\. /.test(l) },
-    { label: "Task list", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] "), checked: /^\s*[-*+] \[[ xX]\] /.test(l) },
-    { label: "Quote", fn: () => toggleLinePrefix(/^> ?/, () => "> "), checked: /^\s*> /.test(l) },
+    { label: "Copy as rich text", fn: copyAsRichText },
+    { label: "Copy as HTML", fn: copyAsHtml },
     { sep: true },
-    { label: "Code block", fn: insertCodeBlock },
-    { label: "Table", fn: insertTable },
-    { label: "Divider", fn: insertHR },
-    { label: "Image", fn: editImageAlt },
+    { label: "Export to PDF…", fn: () => exportAs("pdf") },
+    { label: "Export to HTML…", fn: () => exportAs("html") },
+    { label: "Export to Word (.docx)…", fn: () => exportAs("docx") },
+    { sep: true },
+    { label: "Publish to Google Docs…", fn: () => publishGoogle() },
   ];
 }
-function fontMenuItems() {
-  const cur = localStorage.getItem("plume-font") || "inter";
-  return FONTS.map((f) => ({ label: f.label, fn: () => applyFont(f.id), checked: f.id === cur }));
+function settingsMenuItems() {
+  const theme = localStorage.getItem("plume-theme") || "system";
+  const reveal = localStorage.getItem("plume-reveal") === "1";
+  const focus = localStorage.getItem("plume-focus") === "1";
+  const curFont = localStorage.getItem("plume-font") || "inter";
+  return [
+    { label: "Appearance: System", fn: () => applyTheme("system"), checked: theme === "system" },
+    { label: "Appearance: Light", fn: () => applyTheme("light"), checked: theme === "light" },
+    { label: "Appearance: Dark", fn: () => applyTheme("dark"), checked: theme === "dark" },
+    { sep: true },
+    { label: "Reveal markdown marks", fn: () => applyReveal(!reveal), checked: reveal },
+    { label: "Focus mode", fn: () => applyFocus(!focus), checked: focus },
+    { sep: true },
+    ...FONTS.map((f) => ({ label: `Font · ${f.label}`, fn: () => applyFont(f.id), checked: f.id === curFont })),
+  ];
 }
-function openToolbarMenu(anchor, kind) {
+function openMenu(anchor, items) {
   if (openMenuEl) { closeToolbarMenu(); return; }
-  const items = kind === "heading" ? headingMenuItems() : kind === "insert" ? insertMenuItems() : fontMenuItems();
   const menu = document.createElement("div");
   menu.className = "tb-menu";
   for (const it of items) {
@@ -946,9 +979,143 @@ function openToolbarMenu(anchor, kind) {
   }
   document.body.appendChild(menu);
   const r = anchor.getBoundingClientRect();
-  menu.style.left = Math.min(r.left, window.innerWidth - menu.offsetWidth - 10) + "px";
-  menu.style.top = r.bottom + 6 + "px";
+  // Rail menus open to the right of the rail; title-bar menus drop straight down.
+  let left = anchor.classList.contains("rail-item") ? r.right + 6 : r.left;
+  left = Math.max(8, Math.min(left, window.innerWidth - menu.offsetWidth - 10));
+  let top = r.bottom + 6;
+  if (top + menu.offsetHeight > window.innerHeight - 8) top = Math.max(8, window.innerHeight - menu.offsetHeight - 8);
+  menu.style.left = left + "px";
+  menu.style.top = top + "px";
   openMenuEl = menu;
+}
+
+/* ---------- Slash command menu ('/' to insert blocks + companion actions) ---------- */
+const SLASH_ICONS = {
+  heading: '<svg viewBox="0 0 18 18"><path d="M3.5 5h5" stroke-width="2.4"/><path d="M3.5 9.3h11"/><path d="M3.5 13h8"/></svg>',
+  bullet: '<svg viewBox="0 0 18 18"><circle cx="3.5" cy="5" r="1.2" style="fill:currentColor;stroke:none"/><circle cx="3.5" cy="9" r="1.2" style="fill:currentColor;stroke:none"/><circle cx="3.5" cy="13" r="1.2" style="fill:currentColor;stroke:none"/><path d="M7.5 5h7M7.5 9h7M7.5 13h7"/></svg>',
+  todo: '<svg viewBox="0 0 18 18"><rect x="3" y="3.5" width="12" height="11" rx="2.5"/><path d="M6 9l2 2 4.5-5"/></svg>',
+  code: '<svg viewBox="0 0 18 18"><rect x="2.5" y="3.5" width="13" height="11" rx="2.5"/><path d="M7 7 5 9l2 2M11 7l2 2-2 2"/></svg>',
+  table: '<svg viewBox="0 0 18 18"><rect x="2.5" y="3.5" width="13" height="11" rx="2"/><path d="M2.5 7.5h13M2.5 11h13M7.3 3.7v10.6M11.3 3.7v10.6"/></svg>',
+  session: '<svg viewBox="0 0 18 18"><path d="M3.5 6A1.5 1.5 0 0 1 5 4.5h8A1.5 1.5 0 0 1 14.5 6v4.5A1.5 1.5 0 0 1 13 12H7l-2.5 2.4V12H5A1.5 1.5 0 0 1 3.5 10.5z"/></svg>',
+  pdf: '<svg viewBox="0 0 18 18"><path d="M9 2.5v8"/><path d="M6 7.5 9 10.5l3-3"/><path d="M4 11v3A1.5 1.5 0 0 0 5.5 15.5h7A1.5 1.5 0 0 0 14 14v-3"/></svg>',
+  gdocs: '<svg viewBox="0 0 18 18"><path d="M4.5 2.5h4.6L12.5 5.9V15a.6.6 0 0 1-.6.6H4.5a.6.6 0 0 1-.6-.6V3.1A.6.6 0 0 1 4.5 2.5z"/><path d="M9 2.7v3.4h3.4"/></svg>',
+};
+const SLASH = [
+  { g: "Basic blocks", icon: "heading", b: "Heading", s: "Section title", kbd: "##", fn: () => setHeading(2) },
+  { g: "Basic blocks", icon: "bullet", b: "Bullet list", s: "A simple list", kbd: "-", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- ") },
+  { g: "Basic blocks", icon: "todo", b: "To-do list", s: "Track tasks with checkboxes", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] ") },
+  { g: "Basic blocks", icon: "code", b: "Code block", s: "Fenced snippet", fn: () => insertCodeBlock() },
+  { g: "Basic blocks", icon: "table", b: "Table", s: "Rows and columns", fn: () => insertTable() },
+  { g: "Companion", icon: "session", b: "Insert from session…", s: "Pull text from a Claude Code transcript", fn: () => openSessionInsert() },
+  { g: "Companion", icon: "pdf", b: "Export to PDF", s: "Render this document to a file", fn: () => exportAs("pdf") },
+  { g: "Companion", icon: "gdocs", b: "Publish to Google Docs", s: "Share with non-devs", fn: () => publishGoogle() },
+];
+const slashEl = document.createElement("div");
+slashEl.className = "slash hidden";
+document.body.appendChild(slashEl);
+let slashOpen = false, slashFrom = -1, slashRows = [], slashSel = 0;
+function filterSlash(q) {
+  const term = q.trim().toLowerCase();
+  return SLASH.filter((x) => !term || (x.b + " " + (x.s || "")).toLowerCase().includes(term));
+}
+function openSlash(fromPos) { slashOpen = true; slashFrom = fromPos; slashSel = 0; renderSlash(""); positionSlash(); }
+function closeSlash() { if (!slashOpen) return; slashOpen = false; slashEl.classList.add("hidden"); }
+function renderSlash(q) {
+  slashRows = filterSlash(q);
+  if (slashSel >= slashRows.length) slashSel = Math.max(0, slashRows.length - 1);
+  slashEl.classList.remove("hidden");
+  slashEl.innerHTML = "";
+  const field = document.createElement("div");
+  field.className = "slash-field";
+  field.innerHTML = `<span class="sf-q">/</span><span class="sf-hint">${q ? q.replace(/[<>&]/g, "") : "filter…"}</span>`;
+  slashEl.appendChild(field);
+  if (!slashRows.length) {
+    const empty = document.createElement("div");
+    empty.className = "slash-empty"; empty.textContent = "No matches";
+    slashEl.appendChild(empty);
+    return;
+  }
+  let lastGroup = null;
+  slashRows.forEach((it, i) => {
+    if (it.g !== lastGroup) {
+      lastGroup = it.g;
+      const h = document.createElement("div"); h.className = "slash-group"; h.textContent = it.g;
+      slashEl.appendChild(h);
+    }
+    const row = document.createElement("div");
+    row.className = "slash-item" + (i === slashSel ? " on" : "");
+    row.dataset.i = i;
+    row.innerHTML = `<span class="si-ic">${SLASH_ICONS[it.icon]}</span><span class="si-tx"><b>${it.b}</b><span>${it.s || ""}</span></span>${it.kbd ? `<span class="si-kbd">${it.kbd}</span>` : ""}`;
+    row.addEventListener("mousedown", (e) => { e.preventDefault(); runSlash(i); });
+    row.addEventListener("mouseenter", () => { slashSel = i; paintSlash(); });
+    slashEl.appendChild(row);
+  });
+}
+function paintSlash() {
+  slashEl.querySelectorAll(".slash-item").forEach((el) => el.classList.toggle("on", Number(el.dataset.i) === slashSel));
+}
+function positionSlash() {
+  const c = view.coordsAtPos(slashFrom);
+  if (!c) { closeSlash(); return; }
+  const w = slashEl.offsetWidth || 312;
+  const left = Math.max(8, Math.min(c.left, window.innerWidth - w - 10));
+  slashEl.style.left = left + "px";
+  let top = c.bottom + 6;
+  if (top + slashEl.offsetHeight > window.innerHeight - 8) top = Math.max(8, c.top - slashEl.offsetHeight - 6);
+  slashEl.style.top = top + "px";
+}
+function runSlash(i) {
+  const it = slashRows[i];
+  if (!it) return;
+  const head = view.state.selection.main.head;
+  // Remove the typed "/query" before running the action.
+  if (head >= slashFrom) view.dispatch({ changes: { from: slashFrom, to: head, insert: "" }, selection: { anchor: slashFrom } });
+  closeSlash();
+  it.fn();
+  view.focus();
+}
+function handleSlash(u) {
+  if (currentMode !== "markdown") { closeSlash(); return; }
+  const head = view.state.selection.main.head;
+  if (slashOpen) {
+    if (!view.state.selection.main.empty || head < slashFrom + 1) { closeSlash(); return; }
+    const q = view.state.doc.sliceString(slashFrom, head);
+    if (!q.startsWith("/") || /\s/.test(q)) { closeSlash(); return; }
+    renderSlash(q.slice(1));
+    positionSlash();
+    return;
+  }
+  if (!u.docChanged) return;
+  let opened = false;
+  u.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+    if (opened || inserted.toString() !== "/" || toB !== head) return;
+    const line = view.state.doc.lineAt(head);
+    const before = view.state.doc.sliceString(line.from, head - 1);
+    if (head - 1 === line.from || /\s$/.test(before)) { openSlash(head - 1); opened = true; }
+  });
+}
+view.dom.addEventListener("keydown", (e) => {
+  if (!slashOpen) return;
+  // Capture-phase: swallow nav keys so CodeMirror doesn't also act on them.
+  const stop = () => { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); };
+  if (e.key === "ArrowDown") { stop(); slashSel = Math.min(slashSel + 1, slashRows.length - 1); paintSlash(); }
+  else if (e.key === "ArrowUp") { stop(); slashSel = Math.max(slashSel - 1, 0); paintSlash(); }
+  else if (e.key === "Enter") { stop(); runSlash(slashSel); }
+  else if (e.key === "Escape") { stop(); closeSlash(); }
+}, true);
+document.addEventListener("mousedown", (e) => { if (slashOpen && !slashEl.contains(e.target)) closeSlash(); });
+
+/* ---------- Insert from a Claude Code session ---------- */
+function openSessionInsert() { wsInsertMode = true; openWorkspace(); }
+async function insertSessionText(filePath) {
+  const text = await window.plume.readSession(filePath);
+  if (!text || !text.trim()) { flashMessage("Nothing readable to insert from that file."); return; }
+  const r = view.state.selection.main;
+  const pre = freshLinePrefix(r.from);
+  const block = pre + text.trim() + "\n";
+  view.dispatch({ changes: { from: r.from, to: r.to, insert: block }, selection: { anchor: r.from + block.length } });
+  view.focus();
+  flashMessage("Inserted from session — edit freely.");
 }
 
 /* ---------- Markdown mark visibility ---------- */
@@ -966,9 +1133,13 @@ function applyFocus(on) {
 }
 
 applyFont(localStorage.getItem("plume-font") || "inter");
-buildTitleTools();
+buildBrand();
+buildTitlebarTools();
 buildSelBar();
-view.scrollDOM.addEventListener("scroll", () => { if (!selbar.classList.contains("hidden")) updateSelBar(); });
+view.scrollDOM.addEventListener("scroll", () => {
+  if (!selbar.classList.contains("hidden")) updateSelBar();
+  if (slashOpen) positionSlash();
+});
 applyReveal(localStorage.getItem("plume-reveal") === "1");
 applyFocus(localStorage.getItem("plume-focus") === "1");
 viewToggle.addEventListener("click", toggleSourceView);
@@ -1041,7 +1212,7 @@ function renderTree(nodes, parent, depth) {
     }
   }
 }
-function toggleSidebar() { sidebarEl.classList.toggle("hidden"); refreshSidebar(); }
+function toggleSidebar() { sidebarEl.classList.toggle("hidden"); refreshSidebar(); refreshRail(); }
 
 /* ---------- Command palette ---------- */
 const paletteEl = document.getElementById("palette");
@@ -1158,12 +1329,15 @@ searchPanel.addEventListener("mousedown", (e) => { if (e.target === searchPanel)
 const wsEl = document.getElementById("workspace");
 const wsInput = document.getElementById("ws-input");
 const wsList = document.getElementById("ws-list");
-let wsSessions = [], wsContext = [], wsTimer = null, wsRows = [], wsSel = 0;
+let wsSessions = [], wsContext = [], wsTimer = null, wsRows = [], wsSel = 0, wsInsertMode = false;
 
 async function openWorkspace() {
   closePalette(); closeSearch();
   wsEl.classList.remove("hidden");
   wsInput.value = "";
+  wsInput.placeholder = wsInsertMode
+    ? "Pick a session or context file to insert its text…"
+    : "Filter sessions & context, or search transcripts…";
   const dir = currentDir();
   [wsContext, wsSessions] = await Promise.all([
     window.plume.listContext(dir),
@@ -1172,7 +1346,13 @@ async function openWorkspace() {
   renderWorkspace("");
   wsInput.focus();
 }
-function closeWorkspace() { wsEl.classList.add("hidden"); }
+function closeWorkspace() { wsEl.classList.add("hidden"); wsInsertMode = false; }
+function activateWsRow(openPath, line) {
+  const insert = wsInsertMode;
+  closeWorkspace();
+  if (insert) insertSessionText(openPath);
+  else window.plume.openInThisWindow(openPath, line);
+}
 
 function tsLabel(ms) {
   const d = Date.now() - ms;
@@ -1193,7 +1373,7 @@ function renderWorkspace(q) {
     const s = document.createElement("div"); s.className = "ws-sub"; s.textContent = sub;
     row.append(t, s);
     const idx = wsRows.length;
-    row.onmousedown = (e) => { e.preventDefault(); closeWorkspace(); window.plume.openInThisWindow(openPath, line); };
+    row.onmousedown = (e) => { e.preventDefault(); activateWsRow(openPath, line); };
     row.onmouseenter = () => { wsSel = idx; paintWsSel(); };
     wsList.appendChild(row);
     wsRows.push({ el: row, path: openPath, line });
@@ -1231,7 +1411,7 @@ wsInput.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { closeWorkspace(); view.focus(); }
   else if (e.key === "ArrowDown") { e.preventDefault(); wsSel = Math.min(wsSel + 1, wsRows.length - 1); paintWsSel(); }
   else if (e.key === "ArrowUp") { e.preventDefault(); wsSel = Math.max(wsSel - 1, 0); paintWsSel(); }
-  else if (e.key === "Enter") { const r = wsRows[wsSel]; if (r) { closeWorkspace(); window.plume.openInThisWindow(r.path, r.line); } }
+  else if (e.key === "Enter") { const r = wsRows[wsSel]; if (r) activateWsRow(r.path, r.line); }
 });
 wsEl.addEventListener("mousedown", (e) => { if (e.target === wsEl) closeWorkspace(); });
 
@@ -1272,6 +1452,7 @@ window.plume.onMenu((channel, ...args) => {
 });
 
 setTitle(null);
+buildRail();
 buildWelcome();
 updateWelcome();
 
