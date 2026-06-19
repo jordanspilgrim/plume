@@ -180,7 +180,7 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return json!({ "ok": false, "error": "node not found on PATH" }),
+        Err(_) => return json!({ "ok": false, "error": "Node.js not found on PATH — it's required for DOCX and Google Docs export. Install Node 18+ and restart Plume." }),
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(req.to_string().as_bytes());
@@ -458,11 +458,20 @@ fn host_of(url: &str) -> String {
         .to_string()
 }
 
+// Link-preview fetch UA — advertise the host OS so sites that vary markup by
+// platform behave the same as a real browser on that machine.
+#[cfg(target_os = "macos")]
+const PREVIEW_UA: &str = "Mozilla/5.0 (Macintosh) Plume/1.0";
+#[cfg(target_os = "windows")]
+const PREVIEW_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Plume/1.0";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const PREVIEW_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) Plume/1.0";
+
 fn fetch_preview(url: &str) -> Value {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(6)).build();
     let resp = match agent
         .get(url)
-        .set("User-Agent", "Mozilla/5.0 (Macintosh) Plume/1.0")
+        .set("User-Agent", PREVIEW_UA)
         .call()
     {
         Ok(r) => r,
