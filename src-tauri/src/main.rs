@@ -382,9 +382,7 @@ fn pdf_print(
     out_path: String,
     tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
-    use webview2_com::Microsoft::Web::WebView2::Win32::{
-        EventRegistrationToken, ICoreWebView2PrintSettings, ICoreWebView2_7,
-    };
+    use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2PrintSettings, ICoreWebView2_7};
     use webview2_com::{NavigationCompletedEventHandler, PrintToPdfCompletedHandler};
     use windows::core::{Interface, HSTRING};
     unsafe {
@@ -402,7 +400,7 @@ fn pdf_print(
             };
             let tx_pdf = tx_nav.clone();
             let pdf_handler = PrintToPdfCompletedHandler::create(Box::new(move |hr, ok| {
-                if hr.is_ok() && ok.as_bool() {
+                if hr.is_ok() && ok {
                     let _ = tx_pdf.send(Ok(()));
                 } else {
                     let _ = tx_pdf.send(Err(format!("PrintToPdf failed: hr={hr:?} ok={ok:?}")));
@@ -418,7 +416,7 @@ fn pdf_print(
             }
             Ok(())
         }));
-        let mut token = EventRegistrationToken::default();
+        let mut token: i64 = 0;
         if let Err(e) = core.add_NavigationCompleted(&handler, &mut token) {
             let _ = tx.send(Err(e.to_string()));
             return;
