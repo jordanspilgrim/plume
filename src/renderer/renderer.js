@@ -65,6 +65,20 @@ const updateListener = EditorView.updateListener.of((u) => {
   handleSlash(u);
 });
 
+// List auto-continuation (Enter) already inserts the marker on the next line.
+// If the user then types the marker again out of habit, absorb the duplicate so
+// "- " + typed "- " doesn't become "- - " (and likewise for "1. ", "* ", "+ ").
+const listMarkerDedup = EditorView.inputHandler.of((view, from, to, text) => {
+  if (text !== " " || from !== to) return false;
+  const line = view.state.doc.lineAt(from);
+  const before = view.state.doc.sliceString(line.from, from);
+  const m = /^\s*(?:[-*+]|\d+[.)])\s+([-*+]|\d+[.)])$/.exec(before);
+  if (!m) return false;
+  const dupStart = from - m[1].length; // start of the just-typed redundant marker
+  view.dispatch({ changes: { from: dupStart, to: from }, selection: { anchor: dupStart } });
+  return true; // swallow the space; the original marker + its space remain
+});
+
 const view = new EditorView({
   parent: document.getElementById("editor-host"),
   state: EditorState.create({
@@ -86,6 +100,7 @@ const view = new EditorView({
       langConf.of(markdownLang()),
       previewConf.of(livePreview),
       codeConf.of([]),
+      listMarkerDedup,
       annotField,
       syntaxHighlighting(codeHighlightStyle),
       search({ top: true }),
