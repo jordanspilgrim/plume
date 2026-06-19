@@ -292,9 +292,134 @@ fn generate_pdf(app: &AppHandle, html: String) -> Result<Vec<u8>, String> {
     result
 }
 
+// Windows/Linux PDF export: render the HTML in a hidden webview, print it to a
+// temp PDF via the platform webview's print API, then read the bytes back so the
+// export_pdf flow (pick path -> write bytes) is identical across platforms.
+//
+// NOTE: this is compiled + CI-verified against the pinned webview2-com/webkit2gtk
+// versions, but the runtime print path is unverified pending Windows/Linux VM
+// testing. Failures surface as a normal export error (toast), never a crash.
 #[cfg(not(target_os = "macos"))]
-fn generate_pdf(_app: &AppHandle, _html: String) -> Result<Vec<u8>, String> {
-    Err("PDF export is not yet available on this platform".to_string())
+fn generate_pdf(app: &AppHandle, html: String) -> Result<Vec<u8>, String> {
+    let n = app.state::<AppState>().win_counter.fetch_add(1, Ordering::SeqCst);
+    let label = format!("pdf{}", n);
+    let tmp = std::env::temp_dir().join(format!("plume-export-{}.pdf", n));
+    let tmp_str = tmp.to_string_lossy().to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    let app_main = app.clone();
+    let label_main = label.clone();
+    app.run_on_main_thread(move || {
+        let win = match tauri::WebviewWindowBuilder::new(&app_main, &label_main, tauri::WebviewUrl::App("index.html".into()))
+            .visible(false)
+            .inner_size(816.0, 1056.0)
+            .build()
+        {
+            Ok(w) => w,
+            Err(e) => { let _ = tx.send(Err(e.to_string())); return; }
+        };
+        let _ = win.with_webview(move |pw| pdf_print(pw, html, tmp_str, tx));
+    }).map_err(|e| e.to_string())?;
+
+    let result = rx.recv_timeout(Duration::from_secs(25)).map_err(|_| "pdf timeout".to_string())?;
+    let app_close = app.clone();
+    let label_close = label.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = app_close.get_webview_window(&label_close) { let _ = w.close(); }
+    });
+    result?;
+    let bytes = fs::read(&tmp).map_err(|e| format!("read pdf: {e}"))?;
+    let _ = fs::remove_file(&tmp);
+    if bytes.is_empty() { return Err("generated PDF was empty".into()); }
+    Ok(bytes)
+}
+
+// Linux: load the HTML into the hidden WebKitGTK view, and once it finishes
+// loading run a print operation configured to write a PDF to `out_path`.
+#[cfg(target_os = "linux")]
+fn pdf_print(
+    pw: tauri::webview::PlatformWebview,
+    html: String,
+    out_path: String,
+    tx: std::sync::mpsc::Sender<Result<(), String>>,
+) {
+    use webkit2gtk::{LoadEvent, PrintOperation, PrintOperationExt, WebViewExt};
+    let web_view = pw.inner();
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    web_view.connect_load_changed(move |view, event| {
+        if event != LoadEvent::Finished || fired.get() {
+            return;
+        }
+        fired.set(true);
+        let op = PrintOperation::new(view);
+        let settings = gtk::PrintSettings::new();
+        settings.set("output-uri", Some(format!("file://{}", out_path).as_str()));
+        settings.set("output-file-format", Some("pdf"));
+        op.set_print_settings(&settings);
+        let tx_done = tx.clone();
+        op.connect_finished(move |_| {
+            let _ = tx_done.send(Ok(()));
+        });
+        // Keep the operation alive through the async print (bounded: one per export).
+        std::mem::forget(op);
+    });
+    web_view.load_html(&html, None);
+}
+
+// Windows: navigate the hidden WebView2 to the HTML string, and on navigation
+// completion call PrintToPdf to write a PDF to `out_path`.
+#[cfg(windows)]
+fn pdf_print(
+    pw: tauri::webview::PlatformWebview,
+    html: String,
+    out_path: String,
+    tx: std::sync::mpsc::Sender<Result<(), String>>,
+) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        EventRegistrationToken, ICoreWebView2PrintSettings, ICoreWebView2_7,
+    };
+    use webview2_com::{NavigationCompletedEventHandler, PrintToPdfCompletedHandler};
+    use windows::core::{Interface, HSTRING};
+    unsafe {
+        let core = match pw.controller().CoreWebView2() {
+            Ok(c) => c,
+            Err(e) => { let _ = tx.send(Err(e.to_string())); return; }
+        };
+        let core_for_print = core.clone();
+        let out = out_path.clone();
+        let tx_nav = tx.clone();
+        let handler = NavigationCompletedEventHandler::create(Box::new(move |_sender, _args| {
+            let wv7: ICoreWebView2_7 = match core_for_print.cast() {
+                Ok(w) => w,
+                Err(e) => { let _ = tx_nav.send(Err(e.to_string())); return Ok(()); }
+            };
+            let tx_pdf = tx_nav.clone();
+            let pdf_handler = PrintToPdfCompletedHandler::create(Box::new(move |hr, ok| {
+                if hr.is_ok() && ok.as_bool() {
+                    let _ = tx_pdf.send(Ok(()));
+                } else {
+                    let _ = tx_pdf.send(Err(format!("PrintToPdf failed: hr={hr:?} ok={ok:?}")));
+                }
+                Ok(())
+            }));
+            if let Err(e) = wv7.PrintToPdf(
+                &HSTRING::from(out.as_str()),
+                None::<&ICoreWebView2PrintSettings>,
+                &pdf_handler,
+            ) {
+                let _ = tx_nav.send(Err(e.to_string()));
+            }
+            Ok(())
+        }));
+        let mut token = EventRegistrationToken::default();
+        if let Err(e) = core.add_NavigationCompleted(&handler, &mut token) {
+            let _ = tx.send(Err(e.to_string()));
+            return;
+        }
+        if let Err(e) = core.NavigateToString(&HSTRING::from(html.as_str())) {
+            let _ = tx.send(Err(e.to_string()));
+        }
+    }
 }
 
 #[tauri::command]

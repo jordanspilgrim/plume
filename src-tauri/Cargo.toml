@@ -24,9 +24,18 @@ objc2-foundation = "0.3"
 objc2-web-kit = "0.3"
 block2 = "0.6"
 
+# Linux PDF export via WebKitGTK print-to-file.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "2.0"
+gtk = "0.18"
+glib = "0.18"
+
 # Windows control-socket transport (named pipe) — Unix uses std unix sockets.
+# Plus WebView2 PrintToPdf for PDF export.
 [target.'cfg(windows)'.dependencies]
 interprocess = "2"
+webview2-com = "0.38"
+windows = { version = "0.61", features = ["Win32_Foundation"] }
 
 [profile.release]
 opt-level = "s"
