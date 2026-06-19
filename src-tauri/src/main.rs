@@ -129,9 +129,16 @@ struct InitialFile {
 #[tauri::command]
 fn initial_file(app: AppHandle, window: tauri::WebviewWindow) -> Option<InitialFile> {
     let st = app.state::<AppState>();
-    // A window opened via open_in_new_window has its own target file.
+    // A window opened via open_in_new_window / "New" has its own target file.
+    // An empty per-window entry is the sentinel for a blank, untitled window:
+    // resolve to None so the renderer starts empty instead of inheriting the
+    // launch file held in `initial`.
     let per_window = st.window_files.lock().unwrap().remove(window.label());
-    let p = per_window.or_else(|| st.initial.lock().unwrap().clone())?;
+    let p = match per_window {
+        Some(p) if p.is_empty() => return None,
+        Some(p) => Some(p),
+        None => st.initial.lock().unwrap().clone(),
+    }?;
     let content = fs::read_to_string(&p).ok()?;
     let recovery = recovery_for(&p);
     set_current(&app, &p, &content);
@@ -1084,6 +1091,7 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
     };
 
     let file = SubmenuBuilder::new(app, "File")
+        .item(&mi("new", "New", Some("CmdOrCtrl+N"))?)
         .item(&mi("open", "Open…", Some("CmdOrCtrl+O"))?)
         .item(&mi("save", "Save", Some("CmdOrCtrl+S"))?)
         .item(&mi("saveAs", "Save As…", Some("CmdOrCtrl+Shift+S"))?)
@@ -1207,6 +1215,12 @@ fn main() {
         ])
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();
+            // "New" spawns a fresh blank window from the main process — the empty
+            // path is the sentinel `initial_file` reads as "untitled".
+            if id == "new" {
+                let _ = spawn_window(app, "");
+                return;
+            }
             let (base, arg) = match id.split_once(':') {
                 Some((b, a)) => (b, Some(a.to_string())),
                 None => (id, None),
