@@ -20,6 +20,14 @@ const td = new TurndownService({
 });
 td.use(gfm);
 
+// turndown escapes markdown-significant chars in text, including [ and ]. But
+// pasted prose like "[DEFAULT COLLAPSED]" is literal text, not a link, so the
+// backslashes are just visible noise in a live markdown editor. Drop bracket
+// escaping specifically (the escape fn only runs on text, never on real links
+// turndown emits via its own link rule, so this can't break "[text](url)").
+const defaultEscape = td.escape.bind(td);
+td.escape = (s) => defaultEscape(s).replace(/\\([[\]])/g, "$1");
+
 // Clean, tight list items. turndown's default emits "-   " (3 spaces) with a
 // 2-space nesting indent, which renders as a detached bullet + shallow nesting.
 // Use "- " / "N. " (one space) and a full 4-space tab per nesting level.
@@ -190,6 +198,30 @@ function convertMsoLists(doc) {
   }
 }
 
+// ---- Apple/Cocoa sibling-nested lists → proper nesting ----
+// Notes, TextEdit, and the macOS RTF→HTML bridge emit nested lists as a <ul>/<ol>
+// that is a DIRECT child of the parent list — a sibling of the <li> it belongs
+// under — rather than nested inside that <li>:
+//     <ul><li>Inbox</li><ul><li>Requests</li>...</ul>...</ul>
+// turndown only understands lists nested inside an <li>, so it flattens these and
+// pads each stray list with blank lines (losing the hierarchy and creating loose
+// spacing). Reparent every list-in-list into its preceding <li> sibling. Processed
+// in document order so deeper levels reparent correctly after their ancestors.
+function fixAppleNestedLists(doc) {
+  doc.querySelectorAll("ul, ol").forEach((list) => {
+    const parent = list.parentNode;
+    if (!parent || (parent.nodeName !== "UL" && parent.nodeName !== "OL")) return;
+    let host = list.previousElementSibling;
+    while (host && host.nodeName !== "LI") host = host.previousElementSibling;
+    if (!host) {
+      // No preceding <li> (list is the parent's first child) — give it one.
+      host = doc.createElement("li");
+      parent.insertBefore(host, list);
+    }
+    host.appendChild(list);
+  });
+}
+
 export function htmlToMarkdown(html) {
   // Strip <!--…--> comments (incl. Word's <!--[if gte mso]>…--> cruft). The
   // single-bracket <![if !supportLists]> list markers aren't <!-- so they survive
@@ -197,9 +229,13 @@ export function htmlToMarkdown(html) {
   const cleaned = String(html).replace(/<!--[\s\S]*?-->/g, "");
   const doc = new DOMParser().parseFromString(cleaned, "text/html");
   convertMsoLists(doc);
+  fixAppleNestedLists(doc);
   normalize(doc);
   let md = td.turndown(doc.body.innerHTML);
-  return md.replace(/\n{3,}/g, "\n\n").trim();
+  // Blank out whitespace-only lines (Notes' empty min-height spacer <p>s become
+  // stray "  " lines), then collapse the resulting blank runs. Leaves real
+  // trailing-space hard breaks (text + "  ") intact since those aren't blank.
+  return md.replace(/^[^\S\n]+$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 const RICH_RE = /<(h[1-6]|strong|b|em|i|u|s|del|ul|ol|li|blockquote|table|thead|tbody|tr|td|th|pre|code|a\b|img)\b/i;
