@@ -23,6 +23,17 @@ import "@fontsource-variable/inter/index.css";
 import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/700.css";
 
+/* ---------- Platform (drives per-OS chrome: traffic-light padding etc.) ---------- */
+// macOS uses a custom overlay title bar (traffic lights overlaid); Windows/Linux
+// get the native window frame, so they don't need the traffic-light left padding.
+{
+  const ua = navigator.userAgent;
+  const p = /Mac|iPhone|iPad/i.test(navigator.platform) || /Mac OS X/i.test(ua) ? "mac"
+    : /Win/i.test(navigator.platform) || /Windows/i.test(ua) ? "windows"
+    : "linux";
+  document.documentElement.dataset.platform = p;
+}
+
 /* ---------- State ---------- */
 let savedText = "";
 let currentPath = null;

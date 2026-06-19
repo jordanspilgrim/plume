@@ -92,7 +92,7 @@ body { display: flex; flex-direction: column; }
   position: relative;
   display: flex;
   align-items: center;
-  padding: 0 10px 0 78px; /* leave room for traffic lights */
+  padding: 0 10px 0 78px; /* default: macOS traffic-light room (the launch platform) */
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text);
@@ -100,6 +100,11 @@ body { display: flex; flex-direction: column; }
   user-select: none;
   background: var(--bg-elevated);
   border-bottom: 1px solid var(--rule);
+}
+/* Windows/Linux use the native window frame — no traffic lights to clear. */
+[data-platform="windows"] #titlebar,
+[data-platform="linux"] #titlebar {
+  padding-left: 12px;
 }
 #titlebar-brand {
   display: inline-flex;
