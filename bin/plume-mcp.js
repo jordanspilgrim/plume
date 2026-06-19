@@ -16,7 +16,9 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
-const SOCK = path.join(os.homedir(), ".plume", "plume.sock");
+const SOCK = process.platform === "win32"
+  ? "\\\\.\\pipe\\plume.sock"
+  : path.join(os.homedir(), ".plume", "plume.sock");
 
 function sockOnce(reqs) {
   return new Promise((resolve, reject) => {
@@ -44,7 +46,8 @@ async function plume(req) {
     return res;
   } catch {
     // Launch Plume, wait for the socket, retry once.
-    spawn("open", ["-a", "Plume"], { stdio: "ignore", detached: true }).unref();
+    if (process.platform === "darwin") spawn("open", ["-a", "Plume"], { stdio: "ignore", detached: true }).unref();
+    else if (process.platform === "win32") spawn("cmd", ["/c", "start", "", "Plume"], { stdio: "ignore", detached: true }).unref();
     const deadline = Date.now() + 12000;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 300));

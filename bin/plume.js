@@ -20,7 +20,10 @@ const path = require("node:path");
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 
-const SOCK = path.join(os.homedir(), ".plume", "plume.sock");
+// Unix domain socket on macOS/Linux; Windows named pipe (matches the Rust side).
+const SOCK = process.platform === "win32"
+  ? "\\\\.\\pipe\\plume.sock"
+  : path.join(os.homedir(), ".plume", "plume.sock");
 
 function sendOnce(reqs) {
   return new Promise((resolve, reject) => {
@@ -47,7 +50,9 @@ async function send(reqs) {
     return await sendOnce(reqs);
   } catch {
     // Not running — launch Plume, poll for the socket, then send.
-    spawn("open", ["-a", "Plume"], { stdio: "ignore", detached: true }).unref();
+    if (process.platform === "darwin") spawn("open", ["-a", "Plume"], { stdio: "ignore", detached: true }).unref();
+    else if (process.platform === "win32") spawn("cmd", ["/c", "start", "", "Plume"], { stdio: "ignore", detached: true }).unref();
+    // Linux: rely on Plume already running (launch-by-name varies by DE).
     const deadline = Date.now() + 12000;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 250));

@@ -142,14 +142,16 @@ fn spawn_window(app: &AppHandle, file_path: &str) -> Result<(), String> {
     let st = app.state::<AppState>();
     let label = format!("w{}", st.win_counter.fetch_add(1, Ordering::SeqCst));
     st.window_files.lock().unwrap().insert(label.clone(), file_path.to_string());
-    tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("index.html".into()))
+    let builder = tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("index.html".into()))
         .title("Plume")
         .inner_size(920.0, 720.0)
-        .min_inner_size(480.0, 320.0)
+        .min_inner_size(480.0, 320.0);
+    // The overlay title bar + hidden title are macOS-only builder methods.
+    #[cfg(target_os = "macos")]
+    let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .hidden_title(true)
-        .build()
-        .map_err(|e| e.to_string())?;
+        .hidden_title(true);
+    builder.build().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -995,36 +997,71 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
     }
 }
 
-fn start_socket(app: AppHandle) {
-    std::thread::spawn(move || {
-        let sock = plume_dir().join("plume.sock");
-        let _ = fs::create_dir_all(plume_dir());
-        let _ = fs::remove_file(&sock);
-        let listener = match std::os::unix::net::UnixListener::bind(&sock) {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        for stream in listener.incoming().flatten() {
-            let app = app.clone();
-            std::thread::spawn(move || {
-                let mut writer = match stream.try_clone() {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                let reader = BufReader::new(stream);
-                for line in reader.lines().map_while(Result::ok) {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-                    let resp = dispatch(&app, &req);
-                    if writeln!(writer, "{}", resp).is_err() {
-                        break;
-                    }
-                }
-            });
+// Per-connection handler: newline-delimited JSON request → response on the same
+// full-duplex stream (no try_clone — works for any Read+Write transport).
+fn handle_conn<S: Read + Write>(app: &AppHandle, stream: S) {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
-    });
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let req: Value = serde_json::from_str(t).unwrap_or(Value::Null);
+        let resp = dispatch(app, &req);
+        if writeln!(reader.get_mut(), "{}", resp).is_err() {
+            break;
+        }
+    }
+}
+
+// Control socket transport: Unix domain socket on macOS/Linux, Windows named
+// pipe on Windows. The name must match the Node CLI/MCP clients (bin/*.js).
+#[cfg(unix)]
+fn run_socket_server(app: AppHandle) {
+    let sock = plume_dir().join("plume.sock");
+    let _ = fs::create_dir_all(plume_dir());
+    let _ = fs::remove_file(&sock);
+    let listener = match std::os::unix::net::UnixListener::bind(&sock) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    for stream in listener.incoming().flatten() {
+        let app = app.clone();
+        std::thread::spawn(move || handle_conn(&app, stream));
+    }
+}
+
+#[cfg(windows)]
+fn run_socket_server(app: AppHandle) {
+    use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+    // Maps to \\.\pipe\plume.sock — the Node clients connect to the same name.
+    let name = match "plume.sock".to_ns_name::<GenericNamespaced>() {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    let listener = match ListenerOptions::new().name(name).create_sync() {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    loop {
+        match listener.accept() {
+            Ok(conn) => {
+                let app = app.clone();
+                std::thread::spawn(move || handle_conn(&app, conn));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn start_socket(app: AppHandle) {
+    std::thread::spawn(move || run_socket_server(app));
 }
 
 // ---- menu ----
@@ -1203,14 +1240,17 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("error while building Plume")
-        .run(|app, event| {
-            // macOS Finder "Open With" / deep links deliver files here at runtime.
-            if let tauri::RunEvent::Opened { urls } = event {
+        .run(|_app, _event| {
+            // macOS Finder "Open With" delivers files via RunEvent::Opened (a
+            // macOS-only variant). Windows/Linux receive paths via argv +
+            // single-instance + OS file associations instead.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = _event {
                 for url in urls {
                     let s = url.to_string();
                     let p = s.strip_prefix("file://").unwrap_or(&s);
                     let p = urlencoding_decode(p);
-                    open_external_file(app, &p);
+                    open_external_file(_app, &p);
                 }
             }
         });
