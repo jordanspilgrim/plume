@@ -1,6 +1,6 @@
 import { Decoration, WidgetType, EditorView, ViewPlugin } from "@codemirror/view";
 import { StateField, StateEffect } from "@codemirror/state";
-import { syntaxTree } from "@codemirror/language";
+import { syntaxTree, foldService, codeFolding, foldEffect, unfoldEffect, foldedRanges } from "@codemirror/language";
 import katex from "katex";
 import mermaid from "mermaid";
 
@@ -688,4 +688,92 @@ const focusPlugin = ViewPlugin.fromClass(
   { decorations: (v) => v.decorations }
 );
 
-export const livePreview = [docPathField, livePreviewField, listIndent, focusPlugin, linkClicker];
+/* ---------- Heading section folding (H1–H3) ---------- */
+// The section under a heading runs from the end of the heading line to the end
+// of the last line before the next heading of the same-or-higher level (or EOF).
+function headingFoldRange(state, line) {
+  const m = /^(#{1,3})\s/.exec(line.text);
+  if (!m) return null;
+  const level = m[1].length;
+  let endLine = line.number;
+  for (let n = line.number + 1; n <= state.doc.lines; n++) {
+    const hm = /^(#{1,6})\s/.exec(state.doc.line(n).text);
+    if (hm && hm[1].length <= level) break;
+    endLine = n;
+  }
+  if (endLine === line.number) return null; // nothing under the heading
+  return { from: line.to, to: state.doc.line(endLine).to };
+}
+
+const headingFoldService = foldService.of((state, lineStart) =>
+  headingFoldRange(state, state.doc.lineAt(lineStart))
+);
+
+function foldedRangeAt(state, pos) {
+  let r = null;
+  foldedRanges(state).between(pos, pos, (from, to) => { r = { from, to }; });
+  return r;
+}
+
+// A chevron in the heading's left margin. Hidden by default; CSS reveals it on
+// hover or when the line is active, and keeps it shown while collapsed.
+class FoldToggleWidget extends WidgetType {
+  constructor(folded, headFrom, active) { super(); this.folded = folded; this.headFrom = headFrom; this.active = active; }
+  eq(o) { return o.folded === this.folded && o.headFrom === this.headFrom && o.active === this.active; }
+  toDOM(view) {
+    const el = document.createElement("span");
+    el.className = "fold-toggle" + (this.folded ? " folded" : "") + (this.active ? " active" : "");
+    el.setAttribute("aria-label", this.folded ? "Expand section" : "Collapse section");
+    el.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const line = view.state.doc.lineAt(this.headFrom);
+      const existing = foldedRangeAt(view.state, line.to);
+      if (existing) {
+        view.dispatch({ effects: unfoldEffect.of(existing) });
+      } else {
+        const range = headingFoldRange(view.state, line);
+        if (range) view.dispatch({ effects: foldEffect.of(range) });
+      }
+    });
+    return el;
+  }
+  ignoreEvent() { return false; }
+}
+
+function buildFoldToggles(view) {
+  // Heading lines the cursor sits on — the toggle shows there too (markdown mode
+  // has no .cm-activeLine, so we track the cursor line ourselves).
+  const cursorLines = new Set(view.state.selection.ranges.map((r) => view.state.doc.lineAt(r.head).number));
+  const ranges = [];
+  for (const { from, to } of view.visibleRanges) {
+    let pos = from;
+    while (pos <= to) {
+      const line = view.state.doc.lineAt(pos);
+      if (headingFoldRange(view.state, line)) {
+        const folded = !!foldedRangeAt(view.state, line.to);
+        ranges.push(
+          Decoration.widget({ widget: new FoldToggleWidget(folded, line.from, cursorLines.has(line.number)), side: -1 }).range(line.from)
+        );
+      }
+      pos = line.to + 1;
+    }
+  }
+  return Decoration.set(ranges, true);
+}
+
+const headingFoldToggles = ViewPlugin.fromClass(
+  class {
+    constructor(view) { this.decorations = buildFoldToggles(view); }
+    update(u) {
+      const foldChanged = u.transactions.some((t) =>
+        t.effects.some((e) => e.is(foldEffect) || e.is(unfoldEffect)));
+      if (u.docChanged || u.viewportChanged || u.selectionSet || foldChanged) this.decorations = buildFoldToggles(u.view);
+    }
+  },
+  { decorations: (v) => v.decorations }
+);
+
+export const livePreview = [
+  docPathField, livePreviewField, listIndent, focusPlugin, linkClicker,
+  headingFoldService, codeFolding(), headingFoldToggles,
+];
