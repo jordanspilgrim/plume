@@ -33,8 +33,16 @@ struct AppState {
     win_counter: AtomicU64,
 }
 
+// Home directory, cross-platform: HOME on unix, USERPROFILE on Windows.
+fn home_dir() -> PathBuf {
+    let h = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    PathBuf::from(h)
+}
+
 fn plume_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".plume")
+    home_dir().join(".plume")
 }
 
 // ---- file watcher (live auto-reload) ----
@@ -241,6 +249,10 @@ fn pdf_create(pw: &tauri::webview::PlatformWebview, tx: std::sync::mpsc::Sender<
     }
 }
 
+// macOS PDF export via WKWebView.createPDF. Windows/Linux land in Phase 2
+// (WebView2 PrintToPdfAsync / WebKitGTK print) — for now a graceful stub so the
+// build is green on every platform.
+#[cfg(target_os = "macos")]
 fn generate_pdf(app: &AppHandle, html: String) -> Result<Vec<u8>, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
     let label = format!("pdf{}", app.state::<AppState>().win_counter.fetch_add(1, Ordering::SeqCst));
@@ -276,6 +288,11 @@ fn generate_pdf(app: &AppHandle, html: String) -> Result<Vec<u8>, String> {
         if let Some(w) = app_close.get_webview_window(&label_close) { let _ = w.close(); }
     });
     result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn generate_pdf(_app: &AppHandle, _html: String) -> Result<Vec<u8>, String> {
+    Err("PDF export is not yet available on this platform".to_string())
 }
 
 #[tauri::command]
@@ -666,7 +683,7 @@ fn discard_recovery(app: AppHandle) {
 
 // ---- Claude Code sessions + context ----
 fn claude_projects() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude/projects")
+    home_dir().join(".claude/projects")
 }
 fn dashify(dir: &str) -> String {
     dir.chars().map(|c| if c == '/' || c == '.' { '-' } else { c }).collect()
