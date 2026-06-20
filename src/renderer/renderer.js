@@ -37,6 +37,7 @@ import "@fontsource/jetbrains-mono/700.css";
 /* ---------- State ---------- */
 let savedText = "";
 let currentPath = null;
+let pendingName = null; // a name set via the title bar before an untitled doc is materialized
 const appEl = document.getElementById("app");
 const titlebar = document.getElementById("titlebar");
 const titlebarName = document.getElementById("titlebar-name");
@@ -150,12 +151,42 @@ function scheduleSideEffects() {
   autosaveTimer = setTimeout(autosave, 1300);
 }
 
+function autosaveEnabled() { return localStorage.getItem("plume-autosave") !== "0"; }
+function autosaveDir() { return localStorage.getItem("plume-autosave-dir") || ""; }
+
+// Derive a filename from the first non-empty line (heading/bullet markers
+// stripped, slugified); fall back to a timestamp.
+function deriveDocName(text) {
+  const first = (text.split("\n").find((l) => l.trim()) || "").trim();
+  const cleaned = first.replace(/^#{1,6}\s+/, "").replace(/^[-*+]\s+/, "").replace(/^\d+[.)]\s+/, "").trim();
+  const slug = cleaned.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+  if (slug) return slug;
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `note-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+let autosaving = false;
 async function autosave() {
-  if (!currentPath) return; // never auto-create files for untitled docs
+  if (!autosaveEnabled() || autosaving) return;
   const text = view.state.doc.toString();
-  if (text === savedText) return;
-  const result = await window.plume.save(text);
-  if (result) { savedText = text; setTitle(result); setDirty(false); }
+  autosaving = true;
+  try {
+    if (currentPath) {
+      if (text === savedText) return;
+      const result = await window.plume.save(text);
+      if (result) { savedText = text; setDirty(false); }
+      return;
+    }
+    // Untitled: auto-place into the configured folder once it has real content
+    // (markdown docs only — a code/config buffer shouldn't become a stray .md).
+    if (!text.trim() || currentMode !== "markdown") return;
+    const name = pendingName || deriveDocName(text);
+    const p = await window.plume.materializeDoc(autosaveDir(), name, text);
+    if (p) { pendingName = null; setTitle(p); savedText = text; setDirty(false); }
+  } finally {
+    autosaving = false;
+  }
 }
 
 function setDirty(dirty) {
@@ -163,13 +194,54 @@ function setDirty(dirty) {
   window.plume.setDirty(dirty);
 }
 
+// Flush a save when the window loses focus, so nothing is lost on app switch.
+window.addEventListener("blur", () => { autosave(); });
+
 /* ---------- Title ---------- */
 function setTitle(pathOrNull) {
   currentPath = pathOrNull;
-  const name = pathOrNull ? pathOrNull.split("/").pop() : "Untitled";
-  titlebarName.textContent = name;
+  const name = pathOrNull ? pathOrNull.split("/").pop() : (pendingName || "Untitled");
   document.title = name;
+  if (titlebarName.classList.contains("editing")) return; // don't clobber an in-progress rename
+  titlebarName.textContent = name;
 }
+
+/* ---------- Rename via the title bar (click the filename) ---------- */
+function startTitleRename() {
+  if (titlebarName.classList.contains("editing")) return;
+  const base = currentPath ? currentPath.split("/").pop().replace(/\.[^.]+$/, "") : (pendingName || "");
+  titlebarName.classList.add("editing");
+  titlebarName.contentEditable = "plaintext-only";
+  titlebarName.spellcheck = false;
+  titlebarName.textContent = base;
+  const range = document.createRange();
+  range.selectNodeContents(titlebarName);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  titlebarName.focus();
+}
+async function commitTitleRename(cancel) {
+  if (!titlebarName.classList.contains("editing")) return;
+  const raw = titlebarName.textContent.trim();
+  titlebarName.classList.remove("editing");
+  titlebarName.contentEditable = "false";
+  if (cancel || !raw) { setTitle(currentPath); return; }
+  if (currentPath) {
+    const p = await window.plume.renameFile(raw);
+    setTitle(p || currentPath);
+  } else {
+    pendingName = raw; // applied when the untitled doc materializes
+    setTitle(null);
+  }
+}
+titlebarName.addEventListener("mousedown", (e) => e.stopPropagation());
+titlebarName.addEventListener("click", (e) => { e.stopPropagation(); startTitleRename(); });
+titlebarName.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); titlebarName.blur(); }
+  else if (e.key === "Escape") { e.preventDefault(); commitTitleRename(true); titlebarName.blur(); }
+});
+titlebarName.addEventListener("blur", () => commitTitleRename(false));
 
 /* ---------- 8-bit welcome / empty state ---------- */
 const WELCOME_ART = [
@@ -1032,15 +1104,25 @@ function shareMenuItems() {
     { label: "Publish to Google Docs…", fn: () => publishGoogle() },
   ];
 }
+function applyAutosave(on) { localStorage.setItem("plume-autosave", on ? "1" : "0"); }
+async function pickAutosaveFolder() {
+  const dir = await window.plume.pickFolder();
+  if (dir) { localStorage.setItem("plume-autosave-dir", dir); flashMessage("New documents will save to " + dir); }
+}
 function settingsMenuItems() {
   const theme = localStorage.getItem("plume-theme") || "system";
   const reveal = localStorage.getItem("plume-reveal") === "1";
   const focus = localStorage.getItem("plume-focus") === "1";
   const curFont = localStorage.getItem("plume-font") || "inter";
+  const autosaveOn = localStorage.getItem("plume-autosave") !== "0";
+  const saveDir = localStorage.getItem("plume-autosave-dir") || "";
   return [
     { label: "Appearance: System", fn: () => applyTheme("system"), checked: theme === "system" },
     { label: "Appearance: Light", fn: () => applyTheme("light"), checked: theme === "light" },
     { label: "Appearance: Dark", fn: () => applyTheme("dark"), checked: theme === "dark" },
+    { sep: true },
+    { label: "Autosave (new docs auto-save to a folder)", fn: () => applyAutosave(!autosaveOn), checked: autosaveOn },
+    { label: saveDir ? `New docs folder · ${saveDir.split("/").pop()}…` : "New docs folder · Documents/Plume…", fn: () => pickAutosaveFolder() },
     { sep: true },
     { label: "Reveal markdown marks", fn: () => applyReveal(!reveal), checked: reveal },
     { label: "Focus mode", fn: () => applyFocus(!focus), checked: focus },

@@ -58,6 +58,19 @@ window.plume = {
     if (p) currentPath = p;
     return p;
   },
+  materializeDoc: async (dir, name, content) => {
+    const p = await invoke("materialize_doc", { dir, name, content }).catch(() => null);
+    if (p) currentPath = p;
+    return p;
+  },
+  renameFile: async (newName) => {
+    if (!currentPath) return null;
+    const p = await invoke("rename_file", { oldPath: currentPath, newName }).catch(() => null);
+    if (p) currentPath = p;
+    return p;
+  },
+  pickFolder: () => invoke("pick_folder").catch(() => null),
+  defaultDocsDir: () => invoke("default_docs_dir").catch(() => null),
   resolveLink: (href) => invoke("resolve_link", { href, base: currentPath }).catch(() => null),
   listDir: (dir, depth) => invoke("list_dir", { dir, depth: depth || 3 }).catch(() => []),
   searchFiles: (dir, query) => invoke("search_files", { dir, query }).catch(() => []),

@@ -342,6 +342,59 @@ ipcMain.handle("file:saveAs", async (event, { content }) => {
   return res.filePath;
 });
 
+// ---- autosave / auto-place (parity with the Tauri commands) ----
+function sanitizeStem(name) {
+  const s = String(name || "").replace(/[^A-Za-z0-9_-]+/g, "-").split("-").filter(Boolean).join("-").slice(0, 60);
+  return s || "untitled";
+}
+function uniquePath(dir, stem, ext) {
+  let p = path.join(dir, `${stem}.${ext}`);
+  let n = 2;
+  while (fsSync.existsSync(p)) { p = path.join(dir, `${stem}-${n}.${ext}`); n++; }
+  return p;
+}
+function defaultPlumeDir() { return path.join(os.homedir(), "Documents", "Plume"); }
+
+ipcMain.handle("file:defaultDocsDir", async () => defaultPlumeDir());
+ipcMain.handle("file:pickFolder", async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const res = await dialog.showOpenDialog(win, { properties: ["openDirectory", "createDirectory"] });
+  return res.canceled || !res.filePaths[0] ? null : res.filePaths[0];
+});
+ipcMain.handle("file:materialize", async (event, { dir, name, content }) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const state = windowState.get(win.id);
+  const base = dir && dir.trim() ? dir : defaultPlumeDir();
+  await fs.mkdir(base, { recursive: true });
+  const target = uniquePath(base, sanitizeStem(name), "md");
+  await fs.writeFile(target, content, "utf8");
+  if (state) { state.filePath = target; state.dirty = false; state.knownContent = content; }
+  win.setRepresentedFilename(target);
+  win.setTitle(path.basename(target));
+  win.setDocumentEdited(false);
+  app.addRecentDocument(target);
+  setupWatcher(win, target);
+  return target;
+});
+ipcMain.handle("file:rename", async (event, { newName }) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const state = windowState.get(win.id);
+  const old = state?.filePath;
+  if (!old) return null;
+  const dir = path.dirname(old);
+  const ext = path.extname(old).slice(1) || "md";
+  const stem = sanitizeStem(newName);
+  const candidate = path.join(dir, `${stem}.${ext}`);
+  const target = candidate === old ? candidate : uniquePath(dir, stem, ext);
+  if (target !== old) await fs.rename(old, target);
+  if (state) state.filePath = target;
+  win.setRepresentedFilename(target);
+  win.setTitle(path.basename(target));
+  app.addRecentDocument(target);
+  setupWatcher(win, target);
+  return target;
+});
+
 ipcMain.on("doc:snapshot", async (event, { content }) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   const state = windowState.get(win?.id);

@@ -480,6 +480,78 @@ async fn save_dialog(app: AppHandle, content: String) -> Option<String> {
     Some(p)
 }
 
+// ---- autosave / auto-place ----
+fn sanitize_stem(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let s = s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
+    let s: String = s.chars().take(60).collect();
+    if s.is_empty() { "untitled".into() } else { s }
+}
+
+fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    let mut p = dir.join(format!("{}.{}", stem, ext));
+    let mut n = 2;
+    while p.exists() {
+        p = dir.join(format!("{}-{}.{}", stem, n, ext));
+        n += 1;
+    }
+    p
+}
+
+fn default_plume_dir() -> PathBuf {
+    home_dir().join("Documents").join("Plume")
+}
+
+#[tauri::command]
+fn default_docs_dir() -> String {
+    default_plume_dir().to_string_lossy().to_string()
+}
+
+// Create a new file for a never-saved doc: resolve the target folder (default
+// ~/Documents/Plume), ensure it exists, pick a collision-free name, write, and
+// make it the current doc so autosave takes over.
+#[tauri::command]
+fn materialize_doc(app: AppHandle, dir: Option<String>, name: String, content: String) -> Option<String> {
+    let base = match dir.filter(|d| !d.trim().is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => default_plume_dir(),
+    };
+    fs::create_dir_all(&base).ok()?;
+    let path = unique_path(&base, &sanitize_stem(&name), "md");
+    fs::write(&path, &content).ok()?;
+    let p = path.to_string_lossy().to_string();
+    set_current(&app, &p, &content);
+    Some(p)
+}
+
+// Rename the current file in place (same folder, new stem), collision-safe and
+// never overwriting an existing file. Returns the new absolute path.
+#[tauri::command]
+fn rename_file(app: AppHandle, old_path: String, new_name: String) -> Option<String> {
+    let old = PathBuf::from(&old_path);
+    let dir = old.parent()?.to_path_buf();
+    let ext = old.extension().and_then(|e| e.to_str()).unwrap_or("md").to_string();
+    let stem = sanitize_stem(&new_name);
+    let candidate = dir.join(format!("{}.{}", stem, ext));
+    let new_path = if candidate == old { candidate } else { unique_path(&dir, &stem, &ext) };
+    if new_path != old {
+        fs::rename(&old, &new_path).ok()?;
+    }
+    let p = new_path.to_string_lossy().to_string();
+    let content = fs::read_to_string(&p).unwrap_or_default();
+    set_current(&app, &p, &content);
+    Some(p)
+}
+
+#[tauri::command]
+async fn pick_folder(app: AppHandle) -> Option<String> {
+    let picked = app.dialog().file().blocking_pick_folder()?;
+    picked.into_path().ok().map(|p| p.to_string_lossy().to_string())
+}
+
 // ---- crash-recovery snapshot read ----
 // Per-file snapshot path: FNV-1a hash of the absolute path → recovery/<hash>.json.
 fn recovery_path(path: &str) -> PathBuf {
@@ -1320,6 +1392,10 @@ fn main() {
             open_external,
             open_dialog,
             save_dialog,
+            materialize_doc,
+            rename_file,
+            pick_folder,
+            default_docs_dir,
             resolve_link,
             list_dir,
             search_files,

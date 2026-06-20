@@ -28,6 +28,10 @@ contextBridge.exposeInMainWorld("plume", {
   openDialog: () => ipcRenderer.invoke("file:openDialog"),
   save: (content) => ipcRenderer.invoke("file:save", { content }),
   saveAs: (content) => ipcRenderer.invoke("file:saveAs", { content }),
+  materializeDoc: (dir, name, content) => ipcRenderer.invoke("file:materialize", { dir, name, content }),
+  renameFile: (newName) => ipcRenderer.invoke("file:rename", { newName }),
+  pickFolder: () => ipcRenderer.invoke("file:pickFolder"),
+  defaultDocsDir: () => ipcRenderer.invoke("file:defaultDocsDir"),
   resolveLink: (href) => ipcRenderer.invoke("file:resolveLink", { href }),
   openInNewWindow: (filePath) =>
     ipcRenderer.invoke("file:openInNewWindow", { filePath }),
