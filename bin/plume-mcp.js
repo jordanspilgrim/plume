@@ -21,7 +21,12 @@ const SOCK = process.platform === "win32"
   ? "\\\\.\\pipe\\plume.sock"
   : path.join(os.homedir(), ".plume", "plume.sock");
 
-const ATTACH_DIR = path.join(os.homedir(), ".plume", "attachments");
+// Attachments are routed per project: Plume stages under
+// ~/.plume/attachments/<dashify(cwd)>/, and this server — spawned with the
+// session's working dir — reads only its own project's bucket. dashify matches
+// Claude Code's ~/.claude/projects naming (/ and . -> -).
+const dashify = (p) => p.replace(/[/.]/g, "-");
+const ATTACH_DIR = path.join(os.homedir(), ".plume", "attachments", dashify(process.cwd()));
 
 function sockOnce(reqs) {
   return new Promise((resolve, reject) => {

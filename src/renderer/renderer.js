@@ -1096,8 +1096,18 @@ async function pushToAgent() {
   const content = view.state.doc.toString();
   if (!content.trim()) { flashMessage("Nothing to push — the document is empty."); return; }
   const name = currentPath ? currentPath.split("/").pop() : (pendingName ? pendingName + ".md" : "Untitled.md");
-  const r = await window.plume.pushToAgent(name, content);
-  flashMessage(r ? `Pushed “${r}” to your agent — say “read what I pushed”.` : "Push to agent failed.");
+  const targets = (await window.plume.listSessionTargets()) || [];
+  if (!targets.length) { flashMessage("No Claude Code sessions found to push to."); return; }
+  const doPush = async (t) => {
+    const r = await window.plume.pushToAgent(t.key, name, content);
+    flashMessage(r ? `Pushed “${r}” to ${t.label} — tell that agent “read what I pushed”.` : "Push to agent failed.");
+  };
+  if (targets.length === 1) { return doPush(targets[0]); } // one project → no need to ask
+  // Multiple projects → pick the target thread (most-recently-active first).
+  openMenu(document.getElementById("titlebar-tools"), targets.map((t) => ({
+    label: `${t.label}${t.title ? " · " + String(t.title).slice(0, 38) : ""}`,
+    fn: () => doPush(t),
+  })));
 }
 function shareMenuItems() {
   return [

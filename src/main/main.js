@@ -395,14 +395,32 @@ ipcMain.handle("file:rename", async (event, { newName }) => {
   return target;
 });
 
-ipcMain.handle("attachment:push", async (_event, { name, content }) => {
-  const dir = path.join(os.homedir(), ".plume", "attachments");
+ipcMain.handle("attachment:push", async (_event, { projectKey, name, content }) => {
+  const key = projectKey && projectKey.trim() ? projectKey : "_global";
+  const dir = path.join(os.homedir(), ".plume", "attachments", key);
   await fs.mkdir(dir, { recursive: true });
   const ts = Date.now();
   const safe = String(name || "Untitled").replace(/[/\\:]/g, "_");
   const rec = JSON.stringify({ name: safe, content, pushedAt: ts });
   await fs.writeFile(path.join(dir, `${ts}-${Math.floor(Math.random() * 1e6)}.json`), rec, "utf8");
   return safe;
+});
+
+ipcMain.handle("sessions:targets", async () => {
+  const projLabel = (key) => {
+    const parts = key.split("-").filter(Boolean);
+    return parts.length >= 2 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : parts[0] || key;
+  };
+  const out = [];
+  for (const pd of await projectDirsFor(undefined)) {
+    const key = path.basename(pd);
+    let files; try { files = (await fs.readdir(pd)).filter((f) => f.endsWith(".jsonl")); } catch { continue; }
+    let best = null;
+    for (const f of files) { const m = await sessionMeta(path.join(pd, f)); if (!best || m.ts >= best.ts) best = m; }
+    if (best) out.push({ key, label: projLabel(key), title: best.title, ts: best.ts });
+  }
+  out.sort((a, b) => b.ts - a.ts);
+  return out.slice(0, 15);
 });
 
 ipcMain.on("doc:snapshot", async (event, { content }) => {

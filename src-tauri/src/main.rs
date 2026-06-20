@@ -552,13 +552,15 @@ async fn pick_folder(app: AppHandle) -> Option<String> {
     picked.into_path().ok().map(|p| p.to_string_lossy().to_string())
 }
 
-// Stage the current document for the agent: drop a JSON record in
-// ~/.plume/attachments/ that the plume-mcp `get_attachments` tool (and the alert
-// hook) read off disk. This is the "Push to agent" gesture — the agent pulls it
-// on its next turn ("read what I pushed").
+// Stage the current document for a specific project's agent: drop a JSON record
+// in ~/.plume/attachments/<project_key>/ that the plume-mcp `get_attachments`
+// tool (and the alert hook) read off disk, filtered to the agent's own project.
+// project_key is dashify(project_cwd) — the same key Claude Code uses for its
+// ~/.claude/projects/ dirs — so the agent running in that cwd finds its own.
 #[tauri::command]
-fn push_attachment(app: AppHandle, name: String, content: String) -> Result<String, String> {
-    let dir = plume_dir().join("attachments");
+fn push_attachment(app: AppHandle, project_key: String, name: String, content: String) -> Result<String, String> {
+    let key = if project_key.trim().is_empty() { "_global".to_string() } else { project_key };
+    let dir = plume_dir().join("attachments").join(&key);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -569,6 +571,46 @@ fn push_attachment(app: AppHandle, name: String, content: String) -> Result<Stri
     let rec = json!({ "name": safe, "content": content, "pushedAt": ts });
     fs::write(dir.join(format!("{}-{}.json", ts, n)), rec.to_string()).map_err(|e| e.to_string())?;
     Ok(safe)
+}
+
+// Readable label from a dashified project key, e.g. "-Users-me-code-plume" -> "code/plume".
+fn project_label(key: &str) -> String {
+    let parts: Vec<&str> = key.split('-').filter(|s| !s.is_empty()).collect();
+    match parts.len() {
+        0 => key.to_string(),
+        1 => parts[0].to_string(),
+        n => format!("{}/{}", parts[n - 2], parts[n - 1]),
+    }
+}
+
+// One target per Claude Code project (deduped — routing keys on project), with the
+// dashify(cwd) key the agent's MCP server matches, a readable label, and the most
+// recent session's title. Sorted most-recently-active first (≈ the thread you're in).
+#[tauri::command]
+fn list_session_targets() -> Vec<Value> {
+    let mut out = vec![];
+    for pd in project_dirs(&None) {
+        let key = match pd.file_name().and_then(|n| n.to_str()) {
+            Some(k) if !k.is_empty() => k.to_string(),
+            _ => continue,
+        };
+        let (mut best, mut best_ts) = (None, 0u64);
+        if let Ok(entries) = fs::read_dir(&pd) {
+            for e in entries.flatten() {
+                if e.path().extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                    let m = session_meta(&e.path());
+                    let ts = m["ts"].as_u64().unwrap_or(0);
+                    if ts >= best_ts { best_ts = ts; best = Some(m); }
+                }
+            }
+        }
+        if let Some(m) = best {
+            out.push(json!({ "key": key, "label": project_label(&key), "title": m["title"], "ts": best_ts }));
+        }
+    }
+    out.sort_by(|a, b| b["ts"].as_u64().cmp(&a["ts"].as_u64()));
+    out.truncate(15);
+    out
 }
 
 // ---- crash-recovery snapshot read ----
@@ -1416,6 +1458,7 @@ fn main() {
             pick_folder,
             default_docs_dir,
             push_attachment,
+            list_session_targets,
             resolve_link,
             list_dir,
             search_files,

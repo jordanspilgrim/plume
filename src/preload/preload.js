@@ -32,7 +32,8 @@ contextBridge.exposeInMainWorld("plume", {
   renameFile: (newName) => ipcRenderer.invoke("file:rename", { newName }),
   pickFolder: () => ipcRenderer.invoke("file:pickFolder"),
   defaultDocsDir: () => ipcRenderer.invoke("file:defaultDocsDir"),
-  pushToAgent: (name, content) => ipcRenderer.invoke("attachment:push", { name, content }),
+  pushToAgent: (projectKey, name, content) => ipcRenderer.invoke("attachment:push", { projectKey, name, content }),
+  listSessionTargets: () => ipcRenderer.invoke("sessions:targets"),
   resolveLink: (href) => ipcRenderer.invoke("file:resolveLink", { href }),
   openInNewWindow: (filePath) =>
     ipcRenderer.invoke("file:openInNewWindow", { filePath }),
