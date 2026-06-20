@@ -552,6 +552,25 @@ async fn pick_folder(app: AppHandle) -> Option<String> {
     picked.into_path().ok().map(|p| p.to_string_lossy().to_string())
 }
 
+// Stage the current document for the agent: drop a JSON record in
+// ~/.plume/attachments/ that the plume-mcp `get_attachments` tool (and the alert
+// hook) read off disk. This is the "Push to agent" gesture — the agent pulls it
+// on its next turn ("read what I pushed").
+#[tauri::command]
+fn push_attachment(app: AppHandle, name: String, content: String) -> Result<String, String> {
+    let dir = plume_dir().join("attachments");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = app.state::<AppState>().win_counter.fetch_add(1, Ordering::SeqCst);
+    let safe: String = name.chars().map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c }).collect();
+    let rec = json!({ "name": safe, "content": content, "pushedAt": ts });
+    fs::write(dir.join(format!("{}-{}.json", ts, n)), rec.to_string()).map_err(|e| e.to_string())?;
+    Ok(safe)
+}
+
 // ---- crash-recovery snapshot read ----
 // Per-file snapshot path: FNV-1a hash of the absolute path → recovery/<hash>.json.
 fn recovery_path(path: &str) -> PathBuf {
@@ -1396,6 +1415,7 @@ fn main() {
             rename_file,
             pick_folder,
             default_docs_dir,
+            push_attachment,
             resolve_link,
             list_dir,
             search_files,

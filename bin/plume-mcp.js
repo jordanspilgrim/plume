@@ -9,16 +9,19 @@
 // from anywhere with system node:  claude mcp add plume -- plume-mcp
 //
 // Tools: open_in_plume, get_active_document, get_selection, list_open_files,
-//        get_annotations, write_document.
+//        get_annotations, write_document, get_attachments.
 
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
+const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 
 const SOCK = process.platform === "win32"
   ? "\\\\.\\pipe\\plume.sock"
   : path.join(os.homedir(), ".plume", "plume.sock");
+
+const ATTACH_DIR = path.join(os.homedir(), ".plume", "attachments");
 
 function sockOnce(reqs) {
   return new Promise((resolve, reject) => {
@@ -131,6 +134,28 @@ const TOOLS = [
     run: async (a) => {
       const r = await plume({ cmd: "writeDocument", path: a.path, content: a.content });
       return r.ok ? `Wrote ${a.path}.` : `Failed: ${r.error}`;
+    },
+  },
+  {
+    name: "get_attachments",
+    description: "Read documents the user pushed to you from Plume with its \"Push to agent\" action. Returns each pushed file's name and full content, then clears the queue. When the user says \"read what I pushed\", \"look at the doc I sent you\", or similar, call this.",
+    inputSchema: { type: "object", properties: {} },
+    run: async () => {
+      let files;
+      try {
+        files = fs.readdirSync(ATTACH_DIR).filter((f) => f.endsWith(".json")).sort();
+      } catch (e) {
+        if (e.code === "ENOENT") return "No pending attachments — the user hasn't pushed any documents from Plume.";
+        return `Error reading attachments: ${e.message}`;
+      }
+      if (!files.length) return "No pending attachments — the user hasn't pushed any documents from Plume.";
+      const items = [];
+      for (const f of files) {
+        const fp = path.join(ATTACH_DIR, f);
+        try { items.push(JSON.parse(fs.readFileSync(fp, "utf8"))); } catch { /* skip bad record */ }
+        try { fs.unlinkSync(fp); } catch { /* best-effort consume */ }
+      }
+      return JSON.stringify(items.map((it) => ({ name: it.name, pushedAt: it.pushedAt, content: it.content })));
     },
   },
 ];

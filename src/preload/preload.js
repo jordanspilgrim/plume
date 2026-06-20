@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld("plume", {
   renameFile: (newName) => ipcRenderer.invoke("file:rename", { newName }),
   pickFolder: () => ipcRenderer.invoke("file:pickFolder"),
   defaultDocsDir: () => ipcRenderer.invoke("file:defaultDocsDir"),
+  pushToAgent: (name, content) => ipcRenderer.invoke("attachment:push", { name, content }),
   resolveLink: (href) => ipcRenderer.invoke("file:resolveLink", { href }),
   openInNewWindow: (filePath) =>
     ipcRenderer.invoke("file:openInNewWindow", { filePath }),

@@ -71,6 +71,7 @@ window.plume = {
   },
   pickFolder: () => invoke("pick_folder").catch(() => null),
   defaultDocsDir: () => invoke("default_docs_dir").catch(() => null),
+  pushToAgent: (name, content) => invoke("push_attachment", { name, content }).catch(() => null),
   resolveLink: (href) => invoke("resolve_link", { href, base: currentPath }).catch(() => null),
   listDir: (dir, depth) => invoke("list_dir", { dir, depth: depth || 3 }).catch(() => []),
   searchFiles: (dir, query) => invoke("search_files", { dir, query }).catch(() => []),

@@ -1092,8 +1092,17 @@ function closeToolbarMenu() { if (openMenuEl) { openMenuEl.remove(); openMenuEl 
 document.addEventListener("mousedown", (e) => {
   if (openMenuEl && !openMenuEl.contains(e.target) && !e.target.closest(".has-menu, .rail-item")) closeToolbarMenu();
 });
+async function pushToAgent() {
+  const content = view.state.doc.toString();
+  if (!content.trim()) { flashMessage("Nothing to push — the document is empty."); return; }
+  const name = currentPath ? currentPath.split("/").pop() : (pendingName ? pendingName + ".md" : "Untitled.md");
+  const r = await window.plume.pushToAgent(name, content);
+  flashMessage(r ? `Pushed “${r}” to your agent — say “read what I pushed”.` : "Push to agent failed.");
+}
 function shareMenuItems() {
   return [
+    { label: "Push to agent", fn: () => pushToAgent() },
+    { sep: true },
     { label: "Copy as rich text", fn: copyAsRichText },
     { label: "Copy as HTML", fn: copyAsHtml },
     { sep: true },
@@ -1418,6 +1427,7 @@ const COMMANDS = [
   { label: "Export to HTML", run: () => exportAs("html") },
   { label: "Export to Word (.docx)", run: () => exportAs("docx") },
   { label: "Publish to Google Docs", run: () => publishGoogle() },
+  { label: "Push to agent", run: () => pushToAgent() },
   { label: "Format Document (JSON)", run: formatDocument },
   { label: "Appearance: Dark", run: () => applyTheme("dark") },
   { label: "Appearance: Light", run: () => applyTheme("light") },

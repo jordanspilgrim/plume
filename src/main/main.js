@@ -395,6 +395,16 @@ ipcMain.handle("file:rename", async (event, { newName }) => {
   return target;
 });
 
+ipcMain.handle("attachment:push", async (_event, { name, content }) => {
+  const dir = path.join(os.homedir(), ".plume", "attachments");
+  await fs.mkdir(dir, { recursive: true });
+  const ts = Date.now();
+  const safe = String(name || "Untitled").replace(/[/\\:]/g, "_");
+  const rec = JSON.stringify({ name: safe, content, pushedAt: ts });
+  await fs.writeFile(path.join(dir, `${ts}-${Math.floor(Math.random() * 1e6)}.json`), rec, "utf8");
+  return safe;
+});
+
 ipcMain.on("doc:snapshot", async (event, { content }) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   const state = windowState.get(win?.id);
