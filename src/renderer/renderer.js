@@ -9,7 +9,7 @@ import { GFM } from "@lezer/markdown";
 import {
   search, searchKeymap, openSearchPanel,
 } from "@codemirror/search";
-import { syntaxTree, syntaxHighlighting } from "@codemirror/language";
+import { syntaxTree, syntaxHighlighting, indentUnit } from "@codemirror/language";
 import { codeLanguages, codeHighlightStyle } from "./editor/highlight.js";
 import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, setFocusMode, refreshEffect, renderMermaidInto, Highlight } from "./editor/livePreview.js";
 import { modeForPath, languageForExt, codeFeatures, extOf, baseName } from "./editor/modes.js";
@@ -103,6 +103,9 @@ const view = new EditorView({
       crosshairCursor(),
       EditorView.lineWrapping,
       EditorState.allowMultipleSelections.of(true),
+      // Tab nests list items a full 4-space "tab" — matching pasted nesting,
+      // instead of CodeMirror's narrow 2-space default.
+      indentUnit.of("    "),
       // Override CodeMirror's default monospace content font with the themeable body font.
       EditorView.theme({
         "&": { fontFamily: "var(--font-body)" },
@@ -235,8 +238,26 @@ async function commitTitleRename(cancel) {
     setTitle(null);
   }
 }
-titlebarName.addEventListener("mousedown", (e) => e.stopPropagation());
-titlebarName.addEventListener("click", (e) => { e.stopPropagation(); startTitleRename(); });
+// The title name is no-drag so it's clickable to rename — but that would make
+// the center of the title bar (the prime grab spot) undraggable. Disambiguate:
+// move past a small threshold → start an OS window drag; release without moving
+// → treat it as a click and rename.
+titlebarName.addEventListener("mousedown", (e) => {
+  if (e.button !== 0 || titlebarName.classList.contains("editing")) return;
+  const sx = e.clientX, sy = e.clientY;
+  let dragging = false;
+  const cleanup = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+  const move = (ev) => {
+    if (!dragging && Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) > 4) {
+      dragging = true;
+      cleanup();
+      window.plume.startWindowDrag && window.plume.startWindowDrag();
+    }
+  };
+  const up = () => { cleanup(); if (!dragging) startTitleRename(); };
+  window.addEventListener("mousemove", move);
+  window.addEventListener("mouseup", up);
+});
 titlebarName.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); titlebarName.blur(); }
   else if (e.key === "Escape") { e.preventDefault(); commitTitleRename(true); titlebarName.blur(); }

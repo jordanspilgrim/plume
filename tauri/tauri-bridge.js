@@ -4,6 +4,7 @@
 
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 let onOpenFile = null;
 let onExternalChange = null;
@@ -73,6 +74,9 @@ window.plume = {
   defaultDocsDir: () => invoke("default_docs_dir").catch(() => null),
   pushToAgent: (projectKey, name, content) => invoke("push_attachment", { projectKey, name, content }).catch(() => null),
   listSessionTargets: () => invoke("list_session_targets").catch(() => []),
+  // Begin an OS window drag (used for click-or-drag on the title name, which is
+  // no-drag so it can be clicked to rename). Needs core:window:allow-start-dragging.
+  startWindowDrag: () => getCurrentWindow().startDragging().catch(() => {}),
   resolveLink: (href) => invoke("resolve_link", { href, base: currentPath }).catch(() => null),
   listDir: (dir, depth) => invoke("list_dir", { dir, depth: depth || 3 }).catch(() => []),
   searchFiles: (dir, query) => invoke("search_files", { dir, query }).catch(() => []),

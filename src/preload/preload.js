@@ -34,6 +34,8 @@ contextBridge.exposeInMainWorld("plume", {
   defaultDocsDir: () => ipcRenderer.invoke("file:defaultDocsDir"),
   pushToAgent: (projectKey, name, content) => ipcRenderer.invoke("attachment:push", { projectKey, name, content }),
   listSessionTargets: () => ipcRenderer.invoke("sessions:targets"),
+  startWindowDrag: () => {}, // Electron drags via CSS app-region; no-op here
+
   resolveLink: (href) => ipcRenderer.invoke("file:resolveLink", { href }),
   openInNewWindow: (filePath) =>
     ipcRenderer.invoke("file:openInNewWindow", { filePath }),
