@@ -16,7 +16,7 @@ import { modeForPath, languageForExt, codeFeatures, extOf, baseName } from "./ed
 import { diffDecorations, logDecorations } from "./editor/decorators.js";
 import { annotField, setAnnotRanges, locateQuote } from "./editor/annotations.js";
 import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from "./editor/viewers.js";
-import { htmlToMarkdown, looksRich } from "./editor/paste.js";
+import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
 import "@fontsource-variable/inter/index.css";
@@ -1252,13 +1252,24 @@ view.dom.addEventListener("paste", (e) => {
   if (currentMode !== "markdown") return;
   const html = e.clipboardData?.getData("text/html");
   if (!html || !looksRich(html)) return; // let CodeMirror do its plain-text paste
-  let md;
-  try { md = htmlToMarkdown(html); } catch { return; }
-  if (!md) return;
   e.preventDefault(); e.stopPropagation();
   const r = view.state.selection.main;
-  view.dispatch({ changes: { from: r.from, to: r.to, insert: md }, selection: { anchor: r.from + md.length }, scrollIntoView: true });
-  view.focus();
+  const insertMd = (md) => {
+    if (!md) return;
+    view.dispatch({ changes: { from: r.from, to: r.to, insert: md }, selection: { anchor: r.from + md.length }, scrollIntoView: true });
+    view.focus();
+  };
+  const hasImg = /<img\b/i.test(html);
+  if (hasImg && currentPath) {
+    // Save embedded images to assets/ next to the doc, then convert (async).
+    inlinePastedImages(html, window.plume.saveImage)
+      .then((processed) => { try { insertMd(htmlToMarkdown(processed)); } catch {} })
+      .catch(() => { try { insertMd(htmlToMarkdown(html)); } catch {} });
+    return;
+  }
+  // No images, or unsaved doc (no assets/ folder to anchor) → text only.
+  try { insertMd(htmlToMarkdown(html)); } catch { return; }
+  if (hasImg && !currentPath) flashMessage("Pasted text — save the doc to keep pasted images.");
 }, true);
 view.dom.addEventListener("dragover", (e) => {
   if ([...(e.dataTransfer?.items || [])].some((it) => it.kind === "file" && it.type.startsWith("image/"))) e.preventDefault();

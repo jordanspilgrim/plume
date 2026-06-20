@@ -2,7 +2,7 @@
 // (built for Electron's contextBridge) run unchanged in WKWebView. See
 // src-tauri/MIGRATION.md for what's ported vs remaining.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 let onOpenFile = null;
@@ -78,6 +78,9 @@ window.plume = {
 
   // images + link unfurl (ported)
   saveImage: (bytes, ext) => invoke("save_image", { bytes: Array.from(bytes), ext }).catch(() => null),
+  // Local images can't load via file:// from the tauri://localhost origin — route
+  // them through Tauri's asset protocol so WKWebView/WebView2/WebKitGTK can render them.
+  toAssetUrl: (absPath) => convertFileSrc(absPath),
   pickImage: () => invoke("pick_image").catch(() => null),
   linkPreview: (url) => invoke("link_preview", { url }).catch(() => null),
 

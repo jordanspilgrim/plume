@@ -36,6 +36,8 @@ contextBridge.exposeInMainWorld("plume", {
   publishGoogle: (content, defaultName) =>
     ipcRenderer.invoke("doc:publishGoogle", { content, defaultName }),
   saveImage: (bytes, ext) => ipcRenderer.invoke("image:save", { bytes, ext }),
+  // Electron loads file:// fine from the app origin; mirror the Tauri bridge's API.
+  toAssetUrl: (absPath) => "file://" + absPath.split("/").map(encodeURIComponent).join("/"),
   pickImage: () => ipcRenderer.invoke("image:pick"),
   linkPreview: (url) => ipcRenderer.invoke("link:preview", { url }),
   listDir: (dir, depth) => ipcRenderer.invoke("dir:list", { dir, depth }),

@@ -85,9 +85,11 @@ function unwrap(el) {
 
 function normalize(doc) {
   doc.querySelectorAll("style, script, meta, link, title, o\\:p").forEach((e) => e.remove());
-  // Drop images we can't resolve (data:/blob:/file:); keep real web images.
+  // Keep web URLs and saved relative paths (assets/… written by inlinePastedImages);
+  // drop unresolvable in-memory refs (blob:/data:/file:/cid:) that weren't saved.
   doc.querySelectorAll("img").forEach((img) => {
-    if (!/^https?:\/\//i.test(img.getAttribute("src") || "")) img.remove();
+    const src = img.getAttribute("src") || "";
+    if (!src || /^(blob:|data:|file:|cid:|webkit-fake-url:)/i.test(src)) img.remove();
   });
   // Neutralize Google Docs' non-bold <b> wrapper so it doesn't bold everything.
   doc.querySelectorAll("b, strong").forEach((el) => {
@@ -220,6 +222,46 @@ function fixAppleNestedLists(doc) {
     }
     host.appendChild(list);
   });
+}
+
+// Pasted rich content (Notes/Word/Docs) carries embedded images as blob: URLs
+// (WKWebView) or data: URIs — both in-memory, not on disk. Fetch/decode each to
+// bytes, persist via the host's saveImage (writes assets/<name> next to the doc),
+// and rewrite the <img> src to that relative path so it survives normalize() and
+// lands as ![alt](assets/…) at its original position. saveImage is injected (the
+// renderer passes window.plume.saveImage). Returns the rewritten HTML string.
+// Images that can't be fetched/saved are left as-is (normalize() then drops them).
+export async function inlinePastedImages(html, saveImage) {
+  const doc = new DOMParser().parseFromString(String(html), "text/html");
+  const imgs = [...doc.querySelectorAll("img")];
+  await Promise.all(
+    imgs.map(async (img) => {
+      const src = img.getAttribute("src") || "";
+      try {
+        let bytes, type;
+        if (/^blob:/i.test(src)) {
+          const blob = await (await fetch(src)).blob();
+          bytes = new Uint8Array(await blob.arrayBuffer());
+          type = blob.type;
+        } else if (/^data:/i.test(src)) {
+          const m = src.match(/^data:([^;,]*)[^,]*,(.*)$/s);
+          if (!m) return;
+          type = m[1] || "image/png";
+          const bin = atob(m[2].replace(/\s/g, ""));
+          bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        } else {
+          return; // http(s) kept as-is; other schemes left for normalize() to drop
+        }
+        const ext = ((type || "image/png").split("/")[1] || "png").replace("jpeg", "jpg").replace("svg+xml", "svg");
+        const rel = await saveImage(bytes, ext);
+        if (rel) img.setAttribute("src", rel);
+      } catch {
+        /* leave the src untouched; normalize() drops what it can't resolve */
+      }
+    }),
+  );
+  return doc.body.innerHTML;
 }
 
 export function htmlToMarkdown(html) {
