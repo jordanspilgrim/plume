@@ -769,6 +769,14 @@ function applyTheme(theme) {
 }
 applyTheme(localStorage.getItem("plume-theme") || "system");
 
+// Wide mode — full-width content (for tables / wide docs); off keeps the
+// readable prose measure. Toggled from Settings or the command palette.
+function applyWide(on) {
+  document.documentElement.dataset.wide = on ? "1" : "0";
+  localStorage.setItem("plume-wide", on ? "1" : "0");
+}
+applyWide(localStorage.getItem("plume-wide") === "1");
+
 /* ---------- Formatting commands ---------- */
 function wrapSelection(before, after = before) {
   const changes = [];
@@ -1156,11 +1164,13 @@ function settingsMenuItems() {
   const curFont = localStorage.getItem("plume-font") || "inter";
   const autosaveOn = localStorage.getItem("plume-autosave") !== "0";
   const saveDir = localStorage.getItem("plume-autosave-dir") || "";
+  const wide = localStorage.getItem("plume-wide") === "1";
   return [
     { label: "Appearance: System", fn: () => applyTheme("system"), checked: theme === "system" },
     { label: "Appearance: Light", fn: () => applyTheme("light"), checked: theme === "light" },
     { label: "Appearance: Dark", fn: () => applyTheme("dark"), checked: theme === "dark" },
     { sep: true },
+    { label: "Wide mode (full width — for tables)", fn: () => applyWide(!wide), checked: wide },
     { label: "Autosave (new docs auto-save to a folder)", fn: () => applyAutosave(!autosaveOn), checked: autosaveOn },
     { label: saveDir ? `New docs folder · ${saveDir.split("/").pop()}…` : "New docs folder · Documents/Plume…", fn: () => pickAutosaveFolder() },
     { sep: true },
@@ -1373,6 +1383,12 @@ view.dom.addEventListener("paste", (e) => {
   // Rich paste (Notes / Word / Google Docs) → Markdown, in markdown mode only.
   if (currentMode !== "markdown") return;
   const html = e.clipboardData?.getData("text/html");
+  // A copy made INSIDE Plume serializes the rendered editor DOM (table/code
+  // widgets carrying our CSS vars + the contenteditable's transparent caret).
+  // Re-converting that produces gray-backed, mangled output — so when we see
+  // those signatures, fall through to CodeMirror's plain-text paste (the clean
+  // Markdown source, which is also on the clipboard).
+  if (html && /var\(--|caret-color/.test(html)) return;
   if (!html || !looksRich(html)) return; // let CodeMirror do its plain-text paste
   e.preventDefault(); e.stopPropagation();
   const r = view.state.selection.main;
@@ -1465,6 +1481,7 @@ const COMMANDS = [
   { label: "Appearance: System", run: () => applyTheme("system") },
   { label: "Reveal Markdown Marks While Editing", run: () => applyReveal(localStorage.getItem("plume-reveal") !== "1") },
   { label: "Toggle Focus Mode", run: () => applyFocus(localStorage.getItem("plume-focus") !== "1") },
+  { label: "Toggle Wide Mode (full width)", run: () => applyWide(localStorage.getItem("plume-wide") !== "1") },
 ];
 function flattenFiles(tree, acc = []) {
   for (const n of tree) { if (n.type === "file") acc.push(n); else flattenFiles(n.children || [], acc); }

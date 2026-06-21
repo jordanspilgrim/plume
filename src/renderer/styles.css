@@ -648,6 +648,10 @@ body { display: flex; flex-direction: column; }
 .fold-toggle.folded { opacity: 1; }
 .fold-toggle:hover { color: var(--text); }
 
+/* Wide mode — let prose/tables use the full window width (toggle in Settings).
+   The readable max-width is great for prose but crushes wide tables. */
+[data-wide="1"] .cm-content { max-width: none; }
+
 /* ---------- Code / config mode ---------- */
 [data-mode="code"] .cm-content,
 [data-mode="diff"] .cm-content,
