@@ -231,25 +231,67 @@ class MathWidget extends WidgetType {
 class TableWidget extends WidgetType {
   constructor(source, from, docPath) { super(); this.source = source; this.from = from; this.docPath = docPath; }
   eq(o) { return o.source === this.source && o.from === this.from && o.docPath === this.docPath; }
+  // Keep CM out of the widget's internal events so the in-cell editor can run.
+  ignoreEvent() { return true; }
   toDOM(view) {
     const wrap = document.createElement("div");
     wrap.className = "tok-table";
     wrap.appendChild(buildTable(this.source, this.from, this.docPath));
-    // Clicking a rendered table is otherwise inert (CM ignores widget events), so
-    // the cursor can't enter it to edit. Drop the cursor into the clicked cell's
-    // source position — that reveals the table source for editing.
+    // In-place cell editing: click a cell to edit it directly. The cursor never
+    // enters the table (so it stays rendered, no raw markdown); instead a small
+    // textarea opens over the clicked cell and writes that cell's span back.
     wrap.addEventListener("mousedown", (e) => {
       if (e.button !== 0 || e.metaKey || e.ctrlKey) return;
-      const cell = e.target.closest && e.target.closest("[data-pos]");
+      if (e.target.closest(".col-resize")) return;     // column-resize handle
+      if (e.target.closest(".tok-table-edit")) return; // already editing
+      const cell = e.target.closest("[data-start]");
       if (!cell) return;
-      const pos = parseInt(cell.dataset.pos, 10);
-      if (Number.isNaN(pos)) return;
       e.preventDefault();
-      view.dispatch({ selection: { anchor: Math.min(pos, view.state.doc.length) } });
-      view.focus();
+      openCellEditor(view, cell);
     });
     return wrap;
   }
+}
+
+// Open a textarea editor laid exactly over `cell`, pre-filled with the cell's
+// source text. Enter / blur commit (write the cell span back to the doc, which
+// re-renders the table); Escape cancels. The .md never shows pipes to the user.
+function openCellEditor(view, cell) {
+  const start = parseInt(cell.dataset.start, 10);
+  const end = parseInt(cell.dataset.end, 10);
+  if (Number.isNaN(start) || Number.isNaN(end)) return;
+  const rect = cell.getBoundingClientRect();
+  const cs = getComputedStyle(cell);
+  const ta = document.createElement("textarea");
+  ta.className = "tok-table-edit";
+  ta.value = cell.dataset.raw || "";
+  ta.spellcheck = false;
+  Object.assign(ta.style, {
+    position: "fixed", left: rect.left + "px", top: rect.top + "px",
+    width: rect.width + "px", height: rect.height + "px",
+    font: cs.font, padding: cs.padding, textAlign: cs.textAlign,
+  });
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  let done = false;
+  const commit = (save) => {
+    if (done) return; done = true;
+    const val = ta.value;
+    ta.remove();
+    if (!save) return;
+    // Re-pad the whole inter-pipe region to a clean "| text |" (or "| |" if empty).
+    const trimmed = val.replace(/\r?\n/g, " ").trim().replace(/\|/g, "\\|");
+    const insert = trimmed ? " " + trimmed + " " : " ";
+    const docLen = view.state.doc.length;
+    view.dispatch({ changes: { from: Math.min(start, docLen), to: Math.min(end, docLen), insert } });
+  };
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commit(true); }
+    else if (e.key === "Escape") { e.preventDefault(); commit(false); }
+    else if (e.key === "Tab") { e.preventDefault(); commit(true); }
+  });
+  ta.addEventListener("blur", () => commit(true));
 }
 
 class MermaidWidget extends WidgetType {
@@ -337,15 +379,27 @@ function buildTable(source, from, docPath) {
     const s = line.trim().replace(/^\|/, "").replace(/\|$/, "");
     return s.split(/(?<!\\)\|/).map((c) => c.replace(/\\\|/g, "|").trim());
   };
-  // Document position where the colIdx-th cell's content begins on a raw line.
-  const cellPos = (lineIdx, colIdx) => {
+  // For the colIdx-th cell on a raw line: the full inter-pipe region [start,end)
+  // (so a write re-pads to a clean "| text |"), plus the trimmed display text
+  // (unescaped) used to prefill the in-cell editor.
+  const cellSpan = (lineIdx, colIdx) => {
     const rl = rawLines[lineIdx];
     let pipes = 0, i = 0;
     for (; i < rl.length; i++) {
       if (rl[i] === "|" && rl[i - 1] !== "\\") { pipes++; if (pipes === colIdx + 1) { i++; break; } }
     }
-    while (rl[i] === " ") i++;
-    return (from || 0) + lineStart[lineIdx] + i;
+    const regionStart = i;                 // just after the opening pipe
+    let j = i;
+    for (; j < rl.length; j++) { if (rl[j] === "|" && rl[j - 1] !== "\\") break; }
+    const regionEnd = j;                   // just before the closing pipe
+    let cs = regionStart; while (cs < regionEnd && rl[cs] === " ") cs++;
+    let ce = regionEnd; while (ce > cs && rl[ce - 1] === " ") ce--;
+    const base = (from || 0) + lineStart[lineIdx];
+    return { start: base + regionStart, end: base + regionEnd, raw: rl.slice(cs, ce).replace(/\\\|/g, "|") };
+  };
+  const tagCell = (el, lineIdx, colIdx) => {
+    const sp = cellSpan(lineIdx, colIdx);
+    el.dataset.start = sp.start; el.dataset.end = sp.end; el.dataset.raw = sp.raw;
   };
   const aligns = cells(rawLines[rowIdx[1]]).map((c) => {
     const l = c.startsWith(":"), r = c.endsWith(":");
@@ -370,7 +424,7 @@ function buildTable(source, from, docPath) {
   headerCells.forEach((c, i) => {
     const th = document.createElement("th");
     th.innerHTML = inlineMd(c); if (aligns[i]) th.style.textAlign = aligns[i];
-    th.dataset.pos = cellPos(rowIdx[0], i);
+    tagCell(th, rowIdx[0], i);
     if (i < numCols - 1) th.appendChild(makeResizeHandle(table, colgroup, i, key));
     htr.appendChild(th);
   });
@@ -380,7 +434,7 @@ function buildTable(source, from, docPath) {
     cells(rawLines[rowIdx[r]]).forEach((c, i) => {
       const td = tr.insertCell();
       td.innerHTML = inlineMd(c); if (aligns[i]) td.style.textAlign = aligns[i];
-      td.dataset.pos = cellPos(rowIdx[r], i);
+      tagCell(td, rowIdx[r], i);
     });
   }
   return table;

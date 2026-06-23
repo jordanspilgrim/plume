@@ -551,6 +551,15 @@ body { display: flex; flex-direction: column; }
   padding: 6px 12px;
   text-align: left;
 }
+/* In-cell editor: a textarea laid over the clicked cell. */
+.tok-table-edit {
+  box-sizing: border-box; margin: 0; z-index: 1000;
+  border: 2px solid var(--brand); border-radius: 3px;
+  background: var(--bg); color: var(--text);
+  resize: none; overflow: hidden; line-height: 1.4;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+}
+.tok-table-edit:focus { outline: none; }
 .tok-table th { background: var(--bg-elevated); font-weight: 650; position: relative; }
 /* Drag handle on a header cell's right border to resize the column. */
 .tok-table th .col-resize {
