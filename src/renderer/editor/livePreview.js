@@ -357,10 +357,12 @@ function saveTableWidths(key, widths) {
 }
 
 // A draggable handle on a header cell's right border. Dragging resizes that
-// column; on release the full width set is persisted under `key`.
-function makeResizeHandle(table, colgroup, colIdx, key) {
+// column; on release the full width set is persisted under `key`. The last
+// column's handle sits just inside the edge so the table's overflow can't clip
+// it (otherwise the outer/right edge wouldn't be grabbable).
+function makeResizeHandle(table, colgroup, colIdx, key, isLast) {
   const h = document.createElement("span");
-  h.className = "col-resize";
+  h.className = "col-resize" + (isLast ? " col-resize-edge" : "");
   h.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
     e.preventDefault();
@@ -447,7 +449,7 @@ function buildTable(source, from, docPath) {
     const th = document.createElement("th");
     th.innerHTML = inlineMd(c); if (aligns[i]) th.style.textAlign = aligns[i];
     tagCell(th, rowIdx[0], i);
-    if (i < numCols - 1) th.appendChild(makeResizeHandle(table, colgroup, i, key));
+    th.appendChild(makeResizeHandle(table, colgroup, i, key, i === numCols - 1));
     htr.appendChild(th);
   });
   const tbody = table.createTBody();
