@@ -15,6 +15,7 @@ import { livePreview, setDocPath, setMermaidTheme, setRevealMarks, setFocusMode,
 import { modeForPath, languageForExt, codeFeatures, extOf, baseName } from "./editor/modes.js";
 import { diffDecorations, logDecorations } from "./editor/decorators.js";
 import { annotField, setAnnotRanges, locateQuote } from "./editor/annotations.js";
+import { computeSegments, applySegments, hunkCount } from "./diff.js";
 import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from "./editor/viewers.js";
 import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
@@ -728,6 +729,101 @@ function applyExternalChange(content) {
   setDoc(content, { bottom: currentMode === "log" });
   if (isRenderMode() && !showSource) renderCurrent();
   clearBanner();
+}
+
+/* ---------- Prose-diff review (review the agent's revision) ---------- */
+// When the agent revises a doc that still has open directives, don't silently
+// reload — show the change as accept/reject hunks, each linked to the directive
+// whose passage it touches. Only accepted hunks get written back to disk.
+let reviewState = null;
+const reviewEl = (() => {
+  const el = document.createElement("div");
+  el.id = "review"; el.className = "review-overlay hidden";
+  document.body.appendChild(el);
+  return el;
+})();
+
+function directivesForHunk(hunk) {
+  const delText = hunk.del.join("\n");
+  return annotations.filter((a) => !a.resolved && a.quote && delText.includes(a.quote));
+}
+
+function openDiffReview(before, after) {
+  const segs = computeSegments(before, after);
+  if (hunkCount(segs) === 0) { applyExternalChange(after); return; }
+  const accepted = new Set(segs.filter((s) => s.type === "hunk").map((s) => s.id));
+  reviewState = { segs, accepted, before, after };
+  renderReview();
+}
+
+function renderReview() {
+  if (!reviewState) { reviewEl.classList.add("hidden"); return; }
+  const { segs, accepted } = reviewState;
+  const hunks = segs.filter((s) => s.type === "hunk");
+  const addressed = hunks.filter((h) => directivesForHunk(h).length > 0).length;
+  reviewEl.classList.remove("hidden");
+  reviewEl.innerHTML = "";
+
+  const head = document.createElement("div"); head.className = "review-head";
+  const titles = document.createElement("div"); titles.className = "review-titles";
+  const t = document.createElement("div"); t.className = "review-title";
+  t.textContent = `Review revision · ${hunks.length} change${hunks.length === 1 ? "" : "s"}`;
+  const sub = document.createElement("div"); sub.className = "review-sub";
+  sub.textContent = addressed ? `${addressed} address your directives` : "no open directives touched";
+  titles.append(t, sub);
+  const acts = document.createElement("div"); acts.className = "review-acts";
+  const mk = (label, cls, fn) => { const b = document.createElement("button"); b.textContent = label; if (cls) b.className = cls; b.onclick = fn; return b; };
+  acts.append(
+    mk("Reject all", "ghost", () => { accepted.clear(); renderReview(); }),
+    mk("Accept all", "ghost", () => { hunks.forEach((h) => accepted.add(h.id)); renderReview(); }),
+    mk(`Apply (${accepted.size} accepted)`, "primary", commitReview),
+  );
+  head.append(titles, acts);
+  reviewEl.appendChild(head);
+
+  const body = document.createElement("div"); body.className = "review-body";
+  for (const h of hunks) {
+    const card = document.createElement("div");
+    const on = accepted.has(h.id);
+    card.className = "review-hunk" + (on ? " accepted" : " rejected");
+    const bar = document.createElement("div"); bar.className = "review-hunk-bar";
+    const toggle = document.createElement("button");
+    toggle.className = "review-toggle"; toggle.textContent = on ? "✓ Accept" : "✕ Reject";
+    toggle.onclick = () => { if (accepted.has(h.id)) accepted.delete(h.id); else accepted.add(h.id); renderReview(); };
+    bar.appendChild(toggle);
+    for (const d of directivesForHunk(h)) {
+      const chip = document.createElement("span");
+      const vk = verdictOf(d);
+      chip.className = "verdict-chip v-" + vk + " mini";
+      chip.innerHTML = `<span class="vg">${VERDICTS[vk].glyph}</span>${(d.note || VERDICTS[vk].label).slice(0, 48)}`;
+      bar.appendChild(chip);
+    }
+    card.appendChild(bar);
+    const pre = document.createElement("pre"); pre.className = "review-diff";
+    for (const l of h.del) { const r = document.createElement("div"); r.className = "dl del"; r.textContent = "− " + l; pre.appendChild(r); }
+    for (const l of h.add) { const r = document.createElement("div"); r.className = "dl add"; r.textContent = "+ " + l; pre.appendChild(r); }
+    card.appendChild(pre);
+    body.appendChild(card);
+  }
+  reviewEl.appendChild(body);
+}
+
+async function commitReview() {
+  if (!reviewState) return;
+  const { segs, accepted } = reviewState;
+  const merged = applySegments(segs, accepted);
+  // Mark directives the agent addressed AND you accepted as resolved.
+  for (const h of segs.filter((s) => s.type === "hunk" && accepted.has(s.id)))
+    for (const d of directivesForHunk(h)) d.resolved = true;
+  reviewState = null;
+  reviewEl.classList.add("hidden"); reviewEl.innerHTML = "";
+  setDoc(merged);
+  savedText = merged; // so our own write-back doesn't re-trigger a review
+  if (currentPath) await window.plume.save(merged);
+  setDirty(false);
+  persistAnnotations(); refreshAnnotRanges();
+  if (isRenderMode() && !showSource) renderCurrent();
+  flashMessage("Revision applied");
 }
 
 function showDiskChangedBanner(content) {
@@ -1765,7 +1861,15 @@ wsEl.addEventListener("mousedown", (e) => { if (e.target === wsEl) closeWorkspac
 
 /* ---------- Menu + IPC wiring ---------- */
 window.plume.onOpenFile(({ filePath, content, recovery, gotoLine }) => loadDocument(content, filePath, recovery, gotoLine));
-window.plume.onExternalChange(({ content }) => applyExternalChange(content));
+window.plume.onExternalChange(({ content }) => {
+  const before = view.state.doc.toString();
+  // Self-write or no-op → normal path (prevents the review re-firing on our own save).
+  if (content === savedText || content === before) { applyExternalChange(content); return; }
+  // Agent revised a doc that still has open directives, editor clean → review the diff.
+  const hasOpenDirectives = annotations.some((a) => !a.resolved);
+  if (hasOpenDirectives && currentPath && !titlebar.classList.contains("dirty")) openDiffReview(before, content);
+  else applyExternalChange(content);
+});
 window.plume.onFolderOpen(({ dir }) => {
   sidebarRoot = dir;
   sidebarEl.classList.remove("hidden");
@@ -1808,7 +1912,7 @@ updateWelcome();
 pushRecentsToMenu(); // seed the native Open Recent menu from saved recents on launch
 
 // Automation surface (used for scripting / testing the UI).
-window.__plume = { toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, htmlToMarkdown, view };
+window.__plume = { toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, htmlToMarkdown, openDiffReview, view };
 
 // Agent surface — read by the main process (executeJavaScript) for the MCP server.
 window.__plumeAgent = {
