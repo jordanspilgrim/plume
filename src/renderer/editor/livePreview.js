@@ -236,6 +236,7 @@ class TableWidget extends WidgetType {
   toDOM(view) {
     const wrap = document.createElement("div");
     wrap.className = "tok-table";
+    wrap.dataset.from = String(this.from || 0); // re-find this table after a cell edit re-renders it
     wrap.appendChild(buildTable(this.source, this.from, this.docPath));
     // In-place cell editing: click a cell to edit it directly. The cursor never
     // enters the table (so it stays rendered, no raw markdown); instead a small
@@ -286,10 +287,31 @@ function openCellEditor(view, cell) {
     const docLen = view.state.doc.length;
     view.dispatch({ changes: { from: Math.min(start, docLen), to: Math.min(end, docLen), insert } });
   };
+  // Commit, then hop the editor to the adjacent cell (dir +1 next / -1 previous).
+  // Grid coords are read BEFORE commit (the dispatch replaces the table DOM), then
+  // the re-rendered table is re-found by its data-from to open the new editor.
+  const commitAndMove = (dir) => {
+    const tableEl = cell.closest("table");
+    const wrap = cell.closest(".tok-table");
+    const tfrom = wrap ? wrap.dataset.from : null;
+    const rows = [...tableEl.tHead.rows, ...(tableEl.tBodies[0] ? tableEl.tBodies[0].rows : [])];
+    const cols = rows[0].cells.length;
+    const linear = rows.indexOf(cell.parentElement) * cols + cell.cellIndex + dir;
+    commit(true);
+    if (tfrom == null || linear < 0 || linear >= rows.length * cols) return;
+    const nr = Math.floor(linear / cols), nc = linear % cols;
+    requestAnimationFrame(() => {
+      const nt = document.querySelector('.tok-table[data-from="' + tfrom + '"] table');
+      if (!nt) return;
+      const nrows = [...nt.tHead.rows, ...(nt.tBodies[0] ? nt.tBodies[0].rows : [])];
+      const ncell = nrows[nr] && nrows[nr].cells[nc];
+      if (ncell) openCellEditor(view, ncell);
+    });
+  };
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commit(true); }
     else if (e.key === "Escape") { e.preventDefault(); commit(false); }
-    else if (e.key === "Tab") { e.preventDefault(); commit(true); }
+    else if (e.key === "Tab") { e.preventDefault(); commitAndMove(e.shiftKey ? -1 : 1); }
   });
   ta.addEventListener("blur", () => commit(true));
 }
