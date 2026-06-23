@@ -61,8 +61,8 @@ writes; Plume is where you read, steer, and ship it.
 
 - **`plume` CLI** — `plume plan.md`, `plume report.md --line 42`, `plume .` (folder), `plume --new`. Install via **File ▸ Install 'plume' Shell Command…**. Talks to a running Plume over a local socket (`~/.plume/plume.sock`); launches it if needed.
 - **Auto-reload** means the rendered view updates live as the agent writes.
-- **MCP server** (`plume-mcp`) — `claude mcp add plume -- plume-mcp`. The agent can open files, read your current selection, read the **margin notes** you leave, and write revisions (Plume live-reloads).
-- **Steer loop** — select a passage, **⌘J**, type what you want changed. The note lands in the **Notes** panel; the agent reads it via `get_annotations` and revises. You steer in prose, on the exact text.
+- **MCP server** (`plume-mcp`) — standard MCP over stdio; works with **Claude Code, Codex CLI, and Gemini CLI** (`claude mcp add plume -- plume-mcp`, `codex mcp add plume -- plume-mcp`, `gemini mcp add plume plume-mcp`). The agent can open files, read your selection, read your **typed directives**, and write revisions.
+- **Directed steer loop** — select a passage, **⌘J**, give it a verdict (✎ revise · ✓ approve · ✕ reject · ❓ question · 📌 pin). The agent reads structured directives via `get_annotations` and revises; Plume shows the revision as an **accept/reject diff** linked to each directive. PR-review, but for the prose your agents write.
 - **Deep links** — `plume://open?path=/abs/file.md&line=12`.
 - **Drop-in agent config** + an optional Claude Code hook — see [docs/agent-setup.md](docs/agent-setup.md).
 

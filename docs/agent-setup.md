@@ -66,11 +66,23 @@ plume://open?path=/abs/path/to/file.md&line=12
 ## 5. MCP — let the agent read and steer through Plume
 
 Plume ships a first-party MCP server (`plume-mcp`, installed alongside `plume`).
-Connect it once:
+It speaks standard MCP over stdio, so it works the same with **Claude Code,
+Codex CLI, and Gemini CLI** — connect it once per agent:
 
 ```bash
-claude mcp add plume -- plume-mcp        # Claude Code
-# Codex / Claude Desktop: add { "command": "plume-mcp" } to your MCP config
+# Claude Code
+claude mcp add plume -- plume-mcp
+
+# Codex CLI — either run:
+codex mcp add plume -- plume-mcp
+# …or add to ~/.codex/config.toml:
+#   [mcp_servers.plume]
+#   command = "plume-mcp"
+
+# Gemini CLI — either run:
+gemini mcp add plume plume-mcp
+# …or add to ~/.gemini/settings.json:
+#   { "mcpServers": { "plume": { "command": "plume-mcp" } } }
 ```
 
 Tools the agent gets:
@@ -81,18 +93,27 @@ Tools the agent gets:
 | `get_active_document` | The path + full text of what you're viewing (incl. unsaved edits) |
 | `get_selection` | The text you currently have selected, with its line range |
 | `list_open_files` | Every file open in Plume |
-| `get_annotations` | Your margin notes — the steer instructions you left |
-| `write_document` | Write a revision to disk (Plume live-reloads) |
+| `get_annotations` | Your **typed directives** — the steering acts you left on passages |
+| `write_document` | Write a revision to disk (Plume shows it to you as a review diff) |
 
-### The steer loop
+### The steer loop — directed, like a PR review for prose
 
 1. The agent writes a draft and runs `plume draft.md`.
-2. You read it. Select a passage, press **⌘J**, and type what you want changed —
-   e.g. *"make it teal, not blue."* The note shows in the **Notes** panel.
-3. The agent calls `get_annotations`, reads your instruction, revises with
-   `write_document`. Plume live-reloads to the new version.
+2. You read it. Select a passage, press **⌘J**, and give it a **verdict**:
+   ✎ **revise** (with an optional explicit replacement) · ✓ **approve** ·
+   ✕ **reject** · ❓ **question** · 📌 **pin** (must-keep). Each shows as a
+   color-coded highlight + a chip in the **Notes** panel.
+3. The agent calls `get_annotations` and gets structured directives — *on THIS
+   passage, do THIS* — so it revises only the revise/reject passages, answers
+   the questions, and leaves approve/pin untouched. It writes back with
+   `write_document`.
+4. Plume doesn't silently reload — it shows the agent's revision as an **inline
+   accept/reject diff**, each hunk linked to the directive that caused it. You
+   accept the good changes, reject the rest; only what you accept is written.
 
-You steer in prose, on the exact text; the agent picks it up and applies it.
+You steer in prose, on the exact text, with a verdict; the agent applies it; you
+review the result hunk by hunk. The model can't generate that human judgment for
+itself — that's the whole point.
 
 ## 6. Publish to Google Docs (one-time setup)
 
