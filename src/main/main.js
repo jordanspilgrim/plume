@@ -573,14 +573,80 @@ async function sessionMeta(file) {
   return { path: file, title, ts };
 }
 
+// ---- Codex CLI sessions: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl. The
+// session_meta first line carries cwd + id; titles come from session_index.jsonl.
+const CODEX_SESSIONS = path.join(os.homedir(), ".codex", "sessions");
+const CODEX_INDEX = path.join(os.homedir(), ".codex", "session_index.jsonl");
+const GEMINI_TMP = path.join(os.homedir(), ".gemini", "tmp");
+
+async function codexIndex() {
+  const map = new Map();
+  try {
+    for (const ln of (await fs.readFile(CODEX_INDEX, "utf8")).split("\n")) {
+      if (!ln.trim()) continue;
+      try { const o = JSON.parse(ln); if (o.id) map.set(o.id, o.thread_name); } catch { /* skip */ }
+    }
+  } catch { /* no index */ }
+  return map;
+}
+async function walkRollouts(d, depth, acc) {
+  if (depth > 6) return acc;
+  let ents; try { ents = await fs.readdir(d, { withFileTypes: true }); } catch { return acc; }
+  for (const e of ents) {
+    const full = path.join(d, e.name);
+    if (e.isDirectory()) await walkRollouts(full, depth + 1, acc);
+    else if (e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) acc.push(full);
+  }
+  return acc;
+}
+async function codexSessionsFor(dir) {
+  if (!dir) return [];
+  const withTs = [];
+  for (const f of await walkRollouts(CODEX_SESSIONS, 0, [])) { try { withTs.push({ f, ts: (await fs.stat(f)).mtimeMs }); } catch { /* skip */ } }
+  withTs.sort((a, b) => b.ts - a.ts);
+  const idx = await codexIndex();
+  const out = [];
+  for (const { f, ts } of withTs.slice(0, 250)) { // bound the per-call scan
+    let head; try { const fh = await fs.open(f, "r"); const buf = Buffer.alloc(8192); const { bytesRead } = await fh.read(buf, 0, 8192, 0); await fh.close(); head = buf.toString("utf8", 0, bytesRead); } catch { continue; }
+    const first = head.split("\n").find((l) => l.trim());
+    let o; try { o = JSON.parse(first); } catch { continue; }
+    if (o.type !== "session_meta") continue;
+    const cwd = o.payload?.cwd;
+    if (!cwd || !(cwd === dir || cwd.startsWith(dir + "/"))) continue; // match project or its worktrees
+    out.push({ path: f, title: (idx.get(o.payload?.id) || "(Codex session)").slice(0, 90), ts, agent: "codex" });
+  }
+  return out;
+}
+// ---- Gemini CLI sessions: ~/.gemini/tmp/<project-basename>/chats/session-*.json
+async function geminiSessionsFor(dir) {
+  if (!dir) return [];
+  const chats = path.join(GEMINI_TMP, path.basename(dir), "chats");
+  let files; try { files = (await fs.readdir(chats)).filter((f) => f.startsWith("session-") && f.endsWith(".json")); } catch { return []; }
+  const out = [];
+  for (const f of files) {
+    const full = path.join(chats, f);
+    let stat; try { stat = await fs.stat(full); } catch { continue; }
+    let title = "(Gemini session)";
+    try {
+      const o = JSON.parse(await fs.readFile(full, "utf8"));
+      const u = (o.messages || []).find((m) => m.type === "user");
+      const t = u ? (Array.isArray(u.content) ? u.content.map((x) => x.text || "").join(" ") : String(u.content || "")) : "";
+      if (t.trim() && !t.trim().startsWith("<")) title = t.trim().slice(0, 90);
+    } catch { /* skip */ }
+    out.push({ path: full, title, ts: stat.mtimeMs, agent: "gemini" });
+  }
+  return out;
+}
+
 ipcMain.handle("sessions:list", async (_e, { dir }) => {
   const out = [];
   for (const pd of await projectDirsFor(dir)) {
     let files; try { files = (await fs.readdir(pd)).filter((f) => f.endsWith(".jsonl")); } catch { continue; }
-    for (const f of files) out.push(await sessionMeta(path.join(pd, f)));
+    for (const f of files) out.push({ ...(await sessionMeta(path.join(pd, f))), agent: "claude" });
   }
+  out.push(...(await codexSessionsFor(dir)), ...(await geminiSessionsFor(dir)));
   out.sort((a, b) => b.ts - a.ts);
-  return out.slice(0, 80);
+  return out.slice(0, 100);
 });
 
 ipcMain.handle("sessions:search", async (_e, { query, dir }) => {

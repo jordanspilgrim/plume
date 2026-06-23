@@ -1810,10 +1810,16 @@ function renderWorkspace(q) {
   const term = q.trim().toLowerCase();
   wsRows = []; wsSel = 0; wsList.innerHTML = "";
   const addGroup = (label) => { const h = document.createElement("div"); h.className = "ws-group"; h.textContent = label; wsList.appendChild(h); };
-  const addRow = (title, sub, openPath, line) => {
+  const AGENT_LABEL = { claude: "Claude", codex: "Codex", gemini: "Gemini" };
+  const addRow = (title, sub, openPath, line, agent) => {
     const row = document.createElement("div");
     row.className = "ws-item";
-    const t = document.createElement("div"); t.className = "ws-title"; t.textContent = title;
+    const t = document.createElement("div"); t.className = "ws-title";
+    if (agent && AGENT_LABEL[agent]) {
+      const b = document.createElement("span"); b.className = "ws-badge agent-" + agent; b.textContent = AGENT_LABEL[agent];
+      t.appendChild(b);
+    }
+    t.appendChild(document.createTextNode(title));
     const s = document.createElement("div"); s.className = "ws-sub"; s.textContent = sub;
     row.append(t, s);
     const idx = wsRows.length;
@@ -1827,9 +1833,9 @@ function renderWorkspace(q) {
   if (ctx.length) { addGroup("Project context"); ctx.forEach((c) => addRow(c.name, c.path.replace(/\/[^/]*$/, ""), c.path)); }
 
   const sess = wsSessions.filter((s) => !term || s.title.toLowerCase().includes(term));
-  if (sess.length) { addGroup(term ? "Sessions (title)" : "Recent Claude Code sessions"); sess.slice(0, 40).forEach((s) => addRow(s.title, tsLabel(s.ts), s.path)); }
+  if (sess.length) { addGroup(term ? "Sessions (title)" : "Recent agent sessions"); sess.slice(0, 40).forEach((s) => addRow(s.title, tsLabel(s.ts), s.path, undefined, s.agent)); }
 
-  if (!wsRows.length && !term) wsList.innerHTML = '<div class="sb-empty">No Claude Code sessions or context files for this folder.</div>';
+  if (!wsRows.length && !term) wsList.innerHTML = '<div class="sb-empty">No agent sessions or context files for this folder.</div>';
   paintWsSel();
 
   if (term.length >= 2) {

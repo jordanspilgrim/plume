@@ -1013,7 +1013,126 @@ fn session_meta(file: &Path) -> Value {
             }
         }
     }
-    json!({ "path": file.to_string_lossy(), "title": title, "ts": ts })
+    json!({ "path": file.to_string_lossy(), "title": title, "ts": ts, "agent": "claude" })
+}
+
+fn file_mtime_ms(p: &Path) -> u64 {
+    p.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// Codex CLI sessions: ~/.codex/sessions/**/rollout-*.jsonl. The session_meta first
+// line carries cwd + id; titles come from session_index.jsonl (id -> thread_name).
+fn walk_rollouts(d: &Path, depth: u32, acc: &mut Vec<PathBuf>) {
+    if depth > 6 {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(d) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk_rollouts(&p, depth + 1, acc);
+            } else if let Some(n) = p.file_name().and_then(|x| x.to_str()) {
+                if n.starts_with("rollout-") && n.ends_with(".jsonl") {
+                    acc.push(p);
+                }
+            }
+        }
+    }
+}
+fn codex_index() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(txt) = fs::read_to_string(home_dir().join(".codex/session_index.jsonl")) {
+        for line in txt.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(o) = serde_json::from_str::<Value>(line) {
+                if let (Some(id), Some(name)) = (o["id"].as_str(), o["thread_name"].as_str()) {
+                    map.insert(id.to_string(), name.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+fn codex_sessions_for(dir: &str) -> Vec<Value> {
+    let mut files = vec![];
+    walk_rollouts(&home_dir().join(".codex/sessions"), 0, &mut files);
+    files.sort_by(|a, b| file_mtime_ms(b).cmp(&file_mtime_ms(a)));
+    files.truncate(250);
+    let idx = codex_index();
+    let mut out = vec![];
+    for f in files {
+        let mut head = [0u8; 8192];
+        let n = fs::File::open(&f).and_then(|mut fh| fh.read(&mut head)).unwrap_or(0);
+        if n == 0 {
+            continue;
+        }
+        let first = String::from_utf8_lossy(&head[..n]);
+        let line = match first.lines().find(|l| !l.trim().is_empty()) {
+            Some(l) => l,
+            None => continue,
+        };
+        let o = match serde_json::from_str::<Value>(line) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if o["type"] != "session_meta" {
+            continue;
+        }
+        let cwd = o["payload"]["cwd"].as_str().unwrap_or("");
+        if cwd != dir && !cwd.starts_with(&format!("{}/", dir)) {
+            continue;
+        }
+        let title = o["payload"]["id"]
+            .as_str()
+            .and_then(|id| idx.get(id))
+            .map(|s| s.chars().take(90).collect::<String>())
+            .unwrap_or_else(|| "(Codex session)".to_string());
+        out.push(json!({ "path": f.to_string_lossy(), "title": title, "ts": file_mtime_ms(&f), "agent": "codex" }));
+    }
+    out
+}
+
+// Gemini CLI sessions: ~/.gemini/tmp/<project-basename>/chats/session-*.json
+fn gemini_sessions_for(dir: &str) -> Vec<Value> {
+    let base = Path::new(dir).file_name().and_then(|x| x.to_str()).unwrap_or("");
+    let chats = home_dir().join(".gemini/tmp").join(base).join("chats");
+    let mut out = vec![];
+    if let Ok(entries) = fs::read_dir(&chats) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+            if !(name.starts_with("session-") && name.ends_with(".json")) {
+                continue;
+            }
+            let mut title = "(Gemini session)".to_string();
+            if let Ok(txt) = fs::read_to_string(&p) {
+                if let Ok(o) = serde_json::from_str::<Value>(&txt) {
+                    if let Some(arr) = o["messages"].as_array() {
+                        if let Some(u) = arr.iter().find(|m| m["type"] == "user") {
+                            let t = if let Some(c) = u["content"].as_array() {
+                                c.iter().filter_map(|x| x["text"].as_str()).collect::<Vec<_>>().join(" ")
+                            } else {
+                                u["content"].as_str().unwrap_or("").to_string()
+                            };
+                            let t = t.trim();
+                            if !t.is_empty() && !t.starts_with('<') {
+                                title = t.chars().take(90).collect();
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(json!({ "path": p.to_string_lossy(), "title": title, "ts": file_mtime_ms(&p), "agent": "gemini" }));
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -1028,8 +1147,12 @@ fn list_sessions(dir: Option<String>) -> Vec<Value> {
             }
         }
     }
+    if let Some(d) = &dir {
+        out.extend(codex_sessions_for(d));
+        out.extend(gemini_sessions_for(d));
+    }
     out.sort_by(|a, b| b["ts"].as_u64().cmp(&a["ts"].as_u64()));
-    out.truncate(80);
+    out.truncate(100);
     out
 }
 
