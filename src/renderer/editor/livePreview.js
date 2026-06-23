@@ -229,12 +229,12 @@ class MathWidget extends WidgetType {
 }
 
 class TableWidget extends WidgetType {
-  constructor(source, from) { super(); this.source = source; this.from = from; }
-  eq(o) { return o.source === this.source && o.from === this.from; }
+  constructor(source, from, docPath) { super(); this.source = source; this.from = from; this.docPath = docPath; }
+  eq(o) { return o.source === this.source && o.from === this.from && o.docPath === this.docPath; }
   toDOM(view) {
     const wrap = document.createElement("div");
     wrap.className = "tok-table";
-    wrap.appendChild(buildTable(this.source, this.from));
+    wrap.appendChild(buildTable(this.source, this.from, this.docPath));
     // Clicking a rendered table is otherwise inert (CM ignores widget events), so
     // the cursor can't enter it to edit. Drop the cursor into the clicked cell's
     // source position — that reveals the table source for editing.
@@ -279,9 +279,55 @@ function inlineMd(s) {
     .replace(/~~([^~]+)~~/g, "<del>$1</del>");
 }
 
+// Column widths are a Plume-local view preference (Markdown can't carry them):
+// persisted in localStorage keyed by doc path + the header row, so they survive
+// reopening on this machine but never touch the .md file.
+function tableWidthKey(docPath, headerCells) {
+  return "plume-twidth:" + (docPath || "") + "::" + headerCells.join("␟").slice(0, 200);
+}
+function loadTableWidths(key) {
+  try { const v = JSON.parse(localStorage.getItem(key) || "null"); return Array.isArray(v) ? v : null; } catch { return null; }
+}
+function saveTableWidths(key, widths) {
+  try { localStorage.setItem(key, JSON.stringify(widths.map((w) => Math.round(w) || 0))); } catch { /* quota / private mode */ }
+}
+
+// A draggable handle on a header cell's right border. Dragging resizes that
+// column; on release the full width set is persisted under `key`.
+function makeResizeHandle(table, colgroup, colIdx, key) {
+  const h = document.createElement("span");
+  h.className = "col-resize";
+  h.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation(); // don't let the table's cell-edit listener fire
+    const ths = table.tHead.rows[0].cells;
+    // Snapshot every column's current rendered width, then switch to fixed
+    // layout so explicit col widths are honored and other columns hold steady.
+    [...colgroup.children].forEach((col, j) => {
+      if (!parseFloat(col.style.width)) col.style.width = ths[j].getBoundingClientRect().width + "px";
+    });
+    table.style.tableLayout = "fixed";
+    const col = colgroup.children[colIdx];
+    const startX = e.clientX;
+    const startW = parseFloat(col.style.width) || ths[colIdx].getBoundingClientRect().width;
+    document.body.style.cursor = "col-resize";
+    const onMove = (ev) => { col.style.width = Math.max(40, startW + (ev.clientX - startX)) + "px"; };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      saveTableWidths(key, [...colgroup.children].map((c) => parseFloat(c.style.width) || 0));
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+  return h;
+}
+
 // `from` is the table's source start offset; each cell is tagged with data-pos
 // (the document position of its content) so a click can drop the cursor into it.
-function buildTable(source, from) {
+function buildTable(source, from, docPath) {
   const rawLines = source.split("\n");
   const lineStart = []; // offset of each raw line within `source`
   for (let i = 0, acc = 0; i < rawLines.length; i++) { lineStart.push(acc); acc += rawLines[i].length + 1; }
@@ -305,12 +351,27 @@ function buildTable(source, from) {
     const l = c.startsWith(":"), r = c.endsWith(":");
     return r && l ? "center" : r ? "right" : l ? "left" : "";
   });
+  const headerCells = cells(rawLines[rowIdx[0]]);
+  const numCols = headerCells.length;
+  const key = tableWidthKey(docPath, headerCells);
+  const saved = loadTableWidths(key);
+
   const table = document.createElement("table");
+  if (saved) table.style.tableLayout = "fixed";
+  const colgroup = document.createElement("colgroup");
+  for (let i = 0; i < numCols; i++) {
+    const col = document.createElement("col");
+    if (saved && saved[i]) col.style.width = saved[i] + "px";
+    colgroup.appendChild(col);
+  }
+  table.appendChild(colgroup);
+
   const htr = table.createTHead().insertRow();
-  cells(rawLines[rowIdx[0]]).forEach((c, i) => {
+  headerCells.forEach((c, i) => {
     const th = document.createElement("th");
     th.innerHTML = inlineMd(c); if (aligns[i]) th.style.textAlign = aligns[i];
     th.dataset.pos = cellPos(rowIdx[0], i);
+    if (i < numCols - 1) th.appendChild(makeResizeHandle(table, colgroup, i, key));
     htr.appendChild(th);
   });
   const tbody = table.createTBody();
@@ -448,6 +509,7 @@ function buildDecorations(state) {
   const ranges = [];
   const active = activeLineSet(state);
   const tree = syntaxTree(state);
+  const docPath = state.field(docPathField, false) || ""; // for per-doc table column widths
 
   tree.iterate({
     enter: (node) => {
@@ -474,7 +536,7 @@ function buildDecorations(state) {
       if (name === "Table") {
         if (!rangeActive(state, node.from, node.to)) {
           ranges.push(
-            Decoration.replace({ widget: new TableWidget(state.sliceDoc(node.from, node.to), node.from), block: true })
+            Decoration.replace({ widget: new TableWidget(state.sliceDoc(node.from, node.to), node.from, docPath), block: true })
               .range(node.from, node.to)
           );
         }

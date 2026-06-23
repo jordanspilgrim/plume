@@ -551,7 +551,13 @@ body { display: flex; flex-direction: column; }
   padding: 6px 12px;
   text-align: left;
 }
-.tok-table th { background: var(--bg-elevated); font-weight: 650; }
+.tok-table th { background: var(--bg-elevated); font-weight: 650; position: relative; }
+/* Drag handle on a header cell's right border to resize the column. */
+.tok-table th .col-resize {
+  position: absolute; top: 0; right: -4px; width: 8px; height: 100%;
+  cursor: col-resize; z-index: 2; user-select: none;
+}
+.tok-table th .col-resize:hover { background: color-mix(in srgb, var(--brand, #4a7) 55%, transparent); }
 .tok-table tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg-elevated) 50%, transparent); }
 .tok-table code { font-family: var(--font-mono); font-size: 0.88em; background: var(--code-bg); color: var(--code-text); padding: 0.05em 0.3em; border-radius: 4px; }
 
