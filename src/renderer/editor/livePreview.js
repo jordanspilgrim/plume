@@ -29,7 +29,7 @@ function docDir(state) {
 }
 
 function resolveSrc(state, src) {
-  if (/^(https?:|data:|file:)/i.test(src)) return src;
+  if (/^(https?:|data:|file:|asset:|blob:)/i.test(src)) return src;
   const dir = docDir(state);
   if (!dir) return null;
   const base = dir.split("/");
@@ -38,6 +38,10 @@ function resolveSrc(state, src) {
     if (part === "..") base.pop();
     else base.push(part);
   }
+  // Local files can't load via file:// from the app origin in Tauri/WKWebView;
+  // route through the host's asset URL (Tauri asset protocol / Electron file://).
+  const absPath = base.join("/");
+  if (window.plume && window.plume.toAssetUrl) return window.plume.toAssetUrl(absPath);
   return "file://" + base.map(encodeURIComponent).join("/");
 }
 
@@ -225,12 +229,25 @@ class MathWidget extends WidgetType {
 }
 
 class TableWidget extends WidgetType {
-  constructor(source) { super(); this.source = source; }
-  eq(o) { return o.source === this.source; }
-  toDOM() {
+  constructor(source, from) { super(); this.source = source; this.from = from; }
+  eq(o) { return o.source === this.source && o.from === this.from; }
+  toDOM(view) {
     const wrap = document.createElement("div");
     wrap.className = "tok-table";
-    wrap.appendChild(buildTable(this.source));
+    wrap.appendChild(buildTable(this.source, this.from));
+    // Clicking a rendered table is otherwise inert (CM ignores widget events), so
+    // the cursor can't enter it to edit. Drop the cursor into the clicked cell's
+    // source position — that reveals the table source for editing.
+    wrap.addEventListener("mousedown", (e) => {
+      if (e.button !== 0 || e.metaKey || e.ctrlKey) return;
+      const cell = e.target.closest && e.target.closest("[data-pos]");
+      if (!cell) return;
+      const pos = parseInt(cell.dataset.pos, 10);
+      if (Number.isNaN(pos)) return;
+      e.preventDefault();
+      view.dispatch({ selection: { anchor: Math.min(pos, view.state.doc.length) } });
+      view.focus();
+    });
     return wrap;
   }
 }
@@ -262,31 +279,47 @@ function inlineMd(s) {
     .replace(/~~([^~]+)~~/g, "<del>$1</del>");
 }
 
-function buildTable(source) {
-  const lines = source.split("\n").map((l) => l.trim()).filter((l) => l.includes("|"));
-  if (lines.length < 2) { const p = document.createElement("pre"); p.textContent = source; return p; }
+// `from` is the table's source start offset; each cell is tagged with data-pos
+// (the document position of its content) so a click can drop the cursor into it.
+function buildTable(source, from) {
+  const rawLines = source.split("\n");
+  const lineStart = []; // offset of each raw line within `source`
+  for (let i = 0, acc = 0; i < rawLines.length; i++) { lineStart.push(acc); acc += rawLines[i].length + 1; }
+  const rowIdx = rawLines.map((l, i) => (l.includes("|") ? i : -1)).filter((i) => i >= 0);
+  if (rowIdx.length < 2) { const p = document.createElement("pre"); p.textContent = source; return p; }
   const cells = (line) => {
-    let s = line.replace(/^\|/, "").replace(/\|$/, "");
+    const s = line.trim().replace(/^\|/, "").replace(/\|$/, "");
     return s.split(/(?<!\\)\|/).map((c) => c.replace(/\\\|/g, "|").trim());
   };
-  const aligns = cells(lines[1]).map((c) => {
+  // Document position where the colIdx-th cell's content begins on a raw line.
+  const cellPos = (lineIdx, colIdx) => {
+    const rl = rawLines[lineIdx];
+    let pipes = 0, i = 0;
+    for (; i < rl.length; i++) {
+      if (rl[i] === "|" && rl[i - 1] !== "\\") { pipes++; if (pipes === colIdx + 1) { i++; break; } }
+    }
+    while (rl[i] === " ") i++;
+    return (from || 0) + lineStart[lineIdx] + i;
+  };
+  const aligns = cells(rawLines[rowIdx[1]]).map((c) => {
     const l = c.startsWith(":"), r = c.endsWith(":");
     return r && l ? "center" : r ? "right" : l ? "left" : "";
   });
   const table = document.createElement("table");
-  const thead = table.createTHead();
-  const htr = thead.insertRow();
-  cells(lines[0]).forEach((c, i) => {
+  const htr = table.createTHead().insertRow();
+  cells(rawLines[rowIdx[0]]).forEach((c, i) => {
     const th = document.createElement("th");
     th.innerHTML = inlineMd(c); if (aligns[i]) th.style.textAlign = aligns[i];
+    th.dataset.pos = cellPos(rowIdx[0], i);
     htr.appendChild(th);
   });
   const tbody = table.createTBody();
-  for (let r = 2; r < lines.length; r++) {
+  for (let r = 2; r < rowIdx.length; r++) {
     const tr = tbody.insertRow();
-    cells(lines[r]).forEach((c, i) => {
+    cells(rawLines[rowIdx[r]]).forEach((c, i) => {
       const td = tr.insertCell();
       td.innerHTML = inlineMd(c); if (aligns[i]) td.style.textAlign = aligns[i];
+      td.dataset.pos = cellPos(rowIdx[r], i);
     });
   }
   return table;
@@ -441,7 +474,7 @@ function buildDecorations(state) {
       if (name === "Table") {
         if (!rangeActive(state, node.from, node.to)) {
           ranges.push(
-            Decoration.replace({ widget: new TableWidget(state.sliceDoc(node.from, node.to)), block: true })
+            Decoration.replace({ widget: new TableWidget(state.sliceDoc(node.from, node.to), node.from), block: true })
               .range(node.from, node.to)
           );
         }
