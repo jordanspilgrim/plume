@@ -114,7 +114,7 @@ const TOOLS = [
   },
   {
     name: "get_annotations",
-    description: "Read the user's steer-loop notes for a document — margin notes they left on quoted passages telling you what to change. Each note has the quoted text, the user's instruction, a line number, and a resolved flag. Read these, then revise the document accordingly.",
+    description: "Read the user's typed steering directives for a document — margin notes on quoted passages. Each has: quote (the passage), verdict, note (the user's text), suggestion (optional explicit replacement), line, resolved. The verdict tells you what to do with that passage: 'revise' = change it per note/suggestion; 'reject' = remove or redo it (note says why); 'question' = answer the note, don't just edit; 'approve' = leave it untouched, it's good; 'pin' = must-keep verbatim, do not alter. Apply only the revise/reject passages and answer the questions; leave approve/pin passages alone. After revising, the user reviews your changes as a per-hunk diff, so make each change traceable to its directive.",
     inputSchema: {
       type: "object",
       properties: { path: { type: "string", description: "Absolute file path. Defaults to the active document." } },

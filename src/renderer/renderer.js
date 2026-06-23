@@ -328,15 +328,29 @@ function updateWelcome() {
 }
 
 /* ---------- Steer-loop annotations (notes the agent can read via MCP) ---------- */
-let annotations = []; // { id, quote, note, line, resolved, ts }
+let annotations = []; // { id, quote, note, suggestion, verdict, line, resolved, ts }
 function annotId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
+// Typed steering verdicts — the prose analog of code-review accept/reject. Each
+// annotation carries one, turning a margin note into a structured directive the
+// agent reads via MCP. `hint` drives the input placeholder; `needsDetail` marks
+// verdicts that require text (revise/reject/question) vs. optional (approve/pin).
+const VERDICTS = {
+  revise:   { label: "Revise",   glyph: "✎", hint: "What should change?", needsDetail: true },
+  approve:  { label: "Approve",  glyph: "✓", hint: "Optional: why this is good", needsDetail: false },
+  reject:   { label: "Reject",   glyph: "✕", hint: "Why reject this?", needsDetail: true },
+  question: { label: "Question", glyph: "?", hint: "Your question for the agent", needsDetail: true },
+  pin:      { label: "Pin",      glyph: "📌", hint: "Optional: why this must stay", needsDetail: false },
+};
+const VERDICT_KEYS = ["revise", "approve", "reject", "question", "pin"];
+function verdictOf(a) { return VERDICTS[a && a.verdict] ? a.verdict : "revise"; } // legacy notes → revise
 
 function refreshAnnotRanges() {
   const ranges = [];
   for (const a of annotations) {
     const loc = locateQuote(view.state, a.quote, a.line);
     if (loc) {
-      ranges.push({ id: a.id, from: loc.from, to: loc.to, resolved: a.resolved });
+      ranges.push({ id: a.id, from: loc.from, to: loc.to, resolved: a.resolved, verdict: verdictOf(a) });
       a.line = view.state.doc.lineAt(loc.from).number; // re-anchor for display / agent
     }
     a.anchored = !!loc;
@@ -362,13 +376,17 @@ function renderNotes() {
   notesEl.appendChild(header);
   for (const a of annotations.slice().sort((x, y) => x.line - y.line)) {
     const row = document.createElement("div");
-    row.className = "note-item" + (a.resolved ? " resolved" : "") + (a.anchored ? "" : " orphan");
+    const vk = verdictOf(a);
+    row.className = "note-item v-" + vk + (a.resolved ? " resolved" : "") + (a.anchored ? "" : " orphan");
+    const chip = document.createElement("span");
+    chip.className = "verdict-chip v-" + vk + " mini";
+    chip.innerHTML = `<span class="vg">${VERDICTS[vk].glyph}</span>${VERDICTS[vk].label}`;
     const quote = document.createElement("div");
     quote.className = "note-quote";
     quote.textContent = a.anchored ? `“${a.quote.slice(0, 70)}”` : `“${a.quote.slice(0, 70)}” (text changed)`;
-    const text = document.createElement("div");
-    text.className = "note-text"; text.textContent = a.note;
-    row.append(quote, text);
+    row.append(chip, quote);
+    if (a.note) { const text = document.createElement("div"); text.className = "note-text"; text.textContent = a.note; row.append(text); }
+    if (a.suggestion) { const s = document.createElement("div"); s.className = "note-suggestion"; s.textContent = "→ " + a.suggestion; row.append(s); }
     row.onclick = () => {
       const loc = locateQuote(view.state, a.quote, a.line);
       if (loc) { view.dispatch({ selection: { anchor: loc.from }, effects: EditorView.scrollIntoView(loc.from, { y: "center" }) }); view.focus(); }
@@ -414,24 +432,45 @@ function addAnnotation() {
   const quote = view.state.sliceDoc(sel.from, sel.to).slice(0, 400);
   const coords = view.coordsAtPos(sel.from);
   showFloatAt(coords ? coords.left : 120, coords ? coords.bottom : 120, (box) => {
+    let verdict = "revise";
     const ta = document.createElement("textarea");
-    ta.className = "annot-ta"; ta.rows = 3; ta.placeholder = "Note for the agent…  (⌘↵ to save)";
+    ta.className = "annot-ta"; ta.rows = 3; ta.placeholder = VERDICTS[verdict].hint + "  (⌘↵ to save)";
+    const repl = document.createElement("input");
+    repl.className = "annot-repl"; repl.placeholder = "Replace with…  (optional)";
+    repl.style.display = verdict === "revise" ? "" : "none";
+    // Verdict picker — selecting one adapts the inputs to that directive type.
+    const picker = document.createElement("div"); picker.className = "verdict-picker";
+    const chips = {};
+    for (const k of VERDICT_KEYS) {
+      const c = document.createElement("button");
+      c.type = "button"; c.className = "verdict-chip v-" + k + (k === verdict ? " sel" : "");
+      c.innerHTML = `<span class="vg">${VERDICTS[k].glyph}</span>${VERDICTS[k].label}`;
+      c.onclick = () => {
+        verdict = k;
+        for (const kk of VERDICT_KEYS) chips[kk].classList.toggle("sel", kk === k);
+        ta.placeholder = VERDICTS[k].hint + "  (⌘↵ to save)";
+        repl.style.display = k === "revise" ? "" : "none";
+        ta.focus();
+      };
+      chips[k] = c; picker.appendChild(c);
+    }
     const bar = document.createElement("div"); bar.className = "annot-bar";
-    const save = document.createElement("button"); save.textContent = "Add note";
+    const save = document.createElement("button"); save.textContent = "Add directive";
     const cancel = document.createElement("button"); cancel.textContent = "Cancel"; cancel.className = "ghost";
     save.onclick = () => {
-      const note = ta.value.trim(); closeFloat();
-      if (!note) return;
+      const note = ta.value.trim(); const suggestion = repl.value.trim();
+      closeFloat();
+      if (VERDICTS[verdict].needsDetail && !note && !suggestion) return; // revise/reject/question need detail
       notesHidden = false;
-      annotations.push({ id: annotId(), quote, note, line: view.state.doc.lineAt(sel.from).number, resolved: false, ts: Date.now() });
-      persistAnnotations(); refreshAnnotRanges(); flashMessage("Note added — the agent can read it via MCP");
+      annotations.push({ id: annotId(), quote, note, suggestion: suggestion || null, verdict, line: view.state.doc.lineAt(sel.from).number, resolved: false, ts: Date.now() });
+      persistAnnotations(); refreshAnnotRanges(); flashMessage("Directive added — the agent reads it via MCP");
     };
     cancel.onclick = closeFloat;
     ta.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save.click(); }
       if (e.key === "Escape") { e.preventDefault(); closeFloat(); }
     });
-    bar.append(save, cancel); box.append(ta, bar); ta.focus();
+    bar.append(save, cancel); box.append(picker, ta, repl, bar); ta.focus();
   });
 }
 

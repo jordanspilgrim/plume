@@ -934,6 +934,38 @@ body { display: flex; flex-direction: column; }
   border-bottom: 2px dotted var(--text-faint);
   opacity: 0.6;
 }
+/* ---------- Typed steering verdicts ---------- */
+.verdict-picker { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+.verdict-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  font: inherit; font-size: 11px; cursor: pointer;
+  background: var(--bg); color: var(--text-muted);
+  border: 1px solid var(--rule); border-radius: 999px; padding: 3px 9px;
+}
+.verdict-chip .vg { font-size: 11px; line-height: 1; }
+.verdict-chip.mini { cursor: default; padding: 1px 7px; font-size: 10px; }
+.verdict-chip.v-revise.sel,   .verdict-chip.v-revise.mini   { border-color: #6d7ff5; color: #6d7ff5; background: color-mix(in srgb, #6d7ff5 12%, transparent); }
+.verdict-chip.v-approve.sel,  .verdict-chip.v-approve.mini  { border-color: #2faf5a; color: #2faf5a; background: color-mix(in srgb, #2faf5a 12%, transparent); }
+.verdict-chip.v-reject.sel,   .verdict-chip.v-reject.mini   { border-color: #e0564e; color: #e0564e; background: color-mix(in srgb, #e0564e 12%, transparent); }
+.verdict-chip.v-question.sel, .verdict-chip.v-question.mini { border-color: #d9912b; color: #d9912b; background: color-mix(in srgb, #d9912b 12%, transparent); }
+.verdict-chip.v-pin.sel,      .verdict-chip.v-pin.mini      { border-color: #9a6ef0; color: #9a6ef0; background: color-mix(in srgb, #9a6ef0 12%, transparent); }
+.annot-repl {
+  width: 100%; box-sizing: border-box; margin-top: 6px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--rule); border-radius: 7px;
+  padding: 6px 9px; font: inherit; font-size: 12.5px;
+}
+.annot-repl:focus { outline: 1px solid var(--brand); }
+.note-suggestion { font-size: 12.5px; line-height: 1.45; color: #2faf5a; margin-top: 4px; white-space: pre-wrap; }
+.note-item .verdict-chip.mini { margin-bottom: 5px; }
+/* verdict-colored highlights in the document */
+.tok-annot.v-revise   { background: color-mix(in srgb, #6d7ff5 16%, transparent); border-bottom: 2px solid color-mix(in srgb, #6d7ff5 60%, transparent); }
+.tok-annot.v-approve  { background: color-mix(in srgb, #2faf5a 16%, transparent); border-bottom: 2px solid color-mix(in srgb, #2faf5a 60%, transparent); }
+.tok-annot.v-reject   { background: color-mix(in srgb, #e0564e 16%, transparent); border-bottom: 2px solid color-mix(in srgb, #e0564e 60%, transparent); }
+.tok-annot.v-question { background: color-mix(in srgb, #d9912b 16%, transparent); border-bottom: 2px solid color-mix(in srgb, #d9912b 60%, transparent); }
+.tok-annot.v-pin      { background: color-mix(in srgb, #9a6ef0 16%, transparent); border-bottom: 2px solid color-mix(in srgb, #9a6ef0 60%, transparent); }
+.tok-annot.resolved   { background: transparent; border-bottom: 2px dotted var(--text-faint); opacity: 0.6; }
+
 .annot-float {
   position: fixed; z-index: 50;
   width: 320px; max-width: calc(100vw - 16px);

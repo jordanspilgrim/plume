@@ -20,7 +20,7 @@ export const annotField = StateField.define({
           .sort((a, b) => a.from - b.from)
           .map((r) =>
             Decoration.mark({
-              class: r.resolved ? "tok-annot resolved" : "tok-annot",
+              class: "tok-annot v-" + (r.verdict || "revise") + (r.resolved ? " resolved" : ""),
               attributes: { "data-annot": String(r.id) },
             }).range(r.from, r.to)
           );
