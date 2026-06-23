@@ -295,11 +295,36 @@ function buildWelcome() {
   const blink = document.createElement("div");
   blink.className = "welcome-blink";
   blink.textContent = "▮ TYPE TO START";
-  welcomeEl.append(art, tag, hints, blink);
+  const rec = document.createElement("div");
+  rec.className = "welcome-recents";
+  rec.id = "welcome-recents";
+  welcomeEl.append(art, tag, hints, blink, rec);
+}
+function renderWelcomeRecents() {
+  const host = document.getElementById("welcome-recents");
+  if (!host) return;
+  host.innerHTML = "";
+  const recents = loadRecents().slice(0, 6);
+  if (!recents.length) return;
+  const head = document.createElement("div");
+  head.className = "welcome-recents-head";
+  head.textContent = "RECENT";
+  host.appendChild(head);
+  for (const p of recents) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "welcome-recent";
+    const name = document.createElement("span"); name.className = "welcome-recent-name"; name.textContent = p.split("/").pop();
+    const path = document.createElement("span"); path.className = "welcome-recent-path"; path.textContent = p.replace(/^.*\/(?=[^/]+\/[^/]+$)/, "…/");
+    row.append(name, path);
+    row.onclick = () => window.plume.openInThisWindow(p);
+    host.appendChild(row);
+  }
 }
 function updateWelcome() {
   const empty = view.state.doc.length === 0 && !currentPath && currentMode === "markdown";
   welcomeEl.classList.toggle("hidden", !empty);
+  if (empty) renderWelcomeRecents();
 }
 
 /* ---------- Steer-loop annotations (notes the agent can read via MCP) ---------- */
@@ -605,6 +630,7 @@ function loadDocument(content, filePath, recovery, gotoLine) {
   });
   setDocPath(view, filePath);
   setTitle(filePath);
+  if (filePath) recordRecent(filePath);
   setDirty(false);
   renderOutline();
   updateStatus();
@@ -1463,6 +1489,25 @@ const paletteEl = document.getElementById("palette");
 const paletteInput = document.getElementById("palette-input");
 const paletteList = document.getElementById("palette-list");
 let paletteFiles = [], paletteItems = [], paletteSel = 0;
+/* ---------- Recent files (Open Recent) ---------- */
+const RECENTS_KEY = "plume-recents";
+const RECENTS_MAX = 15;
+function loadRecents() {
+  try { const v = JSON.parse(localStorage.getItem(RECENTS_KEY) || "[]"); return Array.isArray(v) ? v.filter((p) => typeof p === "string") : []; }
+  catch { return []; }
+}
+function recordRecent(filePath) {
+  const next = [filePath, ...loadRecents().filter((p) => p !== filePath)].slice(0, RECENTS_MAX);
+  try { localStorage.setItem(RECENTS_KEY, JSON.stringify(next)); } catch { /* private mode / quota */ }
+}
+function recentItems(term) {
+  return loadRecents()
+    .filter((p) => p !== currentPath)
+    .filter((p) => !term || fuzzy(term, p.split("/").pop()))
+    .slice(0, 8)
+    .map((p) => ({ kind: "recent", label: p.split("/").pop(), sub: p, run: () => window.plume.openInThisWindow(p) }));
+}
+
 const COMMANDS = [
   { label: "Toggle Files Sidebar", run: toggleSidebar },
   { label: "Toggle Outline", run: toggleOutline },
@@ -1507,9 +1552,11 @@ function renderPalette(q) {
   const cmdMode = q.startsWith(">");
   const term = (cmdMode ? q.slice(1) : q).trim();
   const cmds = COMMANDS.filter((c) => !term || fuzzy(term, c.label)).map((c) => ({ kind: "cmd", label: c.label, run: c.run }));
-  const files = cmdMode ? [] : paletteFiles.filter((f) => !term || fuzzy(term, f.name)).slice(0, 40)
+  const recents = cmdMode ? [] : recentItems(term);
+  const recentPaths = new Set(recents.map((r) => r.sub));
+  const files = cmdMode ? [] : paletteFiles.filter((f) => !recentPaths.has(f.path) && (!term || fuzzy(term, f.name))).slice(0, 40)
     .map((f) => ({ kind: "file", label: f.name, run: () => window.plume.openInThisWindow(f.path) }));
-  paletteItems = [...files, ...cmds];
+  paletteItems = [...recents, ...files, ...cmds];
   paletteSel = 0;
   drawPalette();
 }
@@ -1518,9 +1565,15 @@ function drawPalette() {
   paletteItems.forEach((it, i) => {
     const row = document.createElement("div");
     row.className = "pal-item" + (i === paletteSel ? " sel" : "");
-    const icon = document.createElement("span"); icon.className = "pal-icon"; icon.textContent = it.kind === "file" ? "›" : "⚡";
+    const icon = document.createElement("span"); icon.className = "pal-icon";
+    icon.textContent = it.kind === "file" ? "›" : it.kind === "recent" ? "↺" : "⚡";
     const label = document.createElement("span"); label.className = "pal-label"; label.textContent = it.label;
     row.append(icon, label);
+    if (it.sub) {
+      const sub = document.createElement("span"); sub.className = "pal-sub";
+      sub.textContent = it.sub.replace(/^.*\/(?=[^/]+\/[^/]+$)/, "…/");
+      row.appendChild(sub);
+    }
     row.onmousedown = (e) => { e.preventDefault(); runPalette(i); };
     paletteList.appendChild(row);
   });
