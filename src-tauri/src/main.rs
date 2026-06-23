@@ -31,6 +31,7 @@ struct AppState {
     next_id: AtomicU64,
     window_files: Mutex<HashMap<String, String>>,
     win_counter: AtomicU64,
+    recents: Mutex<Vec<String>>, // recent file paths for the File > Open Recent menu
 }
 
 // Home directory, cross-platform: HOME on unix, USERPROFILE on Windows.
@@ -1336,6 +1337,14 @@ fn start_socket(app: AppHandle) {
     std::thread::spawn(move || run_socket_server(app));
 }
 
+// Renderer pushes its recent-files list here; store it and rebuild the menu so
+// File > Open Recent reflects it.
+#[tauri::command]
+fn set_recent_files(app: AppHandle, state: tauri::State<AppState>, paths: Vec<String>) {
+    *state.recents.lock().unwrap() = paths;
+    let _ = build_and_set_menu(&app);
+}
+
 // ---- menu ----
 fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
     let mi = |id: &str, label: &str, accel: Option<&str>| {
@@ -1346,9 +1355,26 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
         b.build(app)
     };
 
+    // Open Recent submenu, populated from the recents the renderer pushes up.
+    let recents: Vec<String> = app.state::<AppState>().recents.lock().unwrap().clone();
+    let mut recent_b = SubmenuBuilder::new(app, "Open Recent");
+    if recents.is_empty() {
+        recent_b = recent_b.item(
+            &MenuItemBuilder::with_id("recent:none", "No Recent Files").enabled(false).build(app)?,
+        );
+    } else {
+        for p in recents.iter().take(15) {
+            let label = Path::new(p).file_name().and_then(|s| s.to_str()).unwrap_or(p.as_str());
+            recent_b = recent_b.item(&mi(&format!("openRecent:{}", p), label, None)?);
+        }
+        recent_b = recent_b.separator().item(&mi("clearRecent", "Clear Recent", None)?);
+    }
+    let recent_menu = recent_b.build()?;
+
     let file = SubmenuBuilder::new(app, "File")
         .item(&mi("new", "New", Some("CmdOrCtrl+N"))?)
         .item(&mi("open", "Open…", Some("CmdOrCtrl+O"))?)
+        .item(&recent_menu)
         .item(&mi("save", "Save", Some("CmdOrCtrl+S"))?)
         .item(&mi("saveAs", "Save As…", Some("CmdOrCtrl+Shift+S"))?)
         .separator()
@@ -1473,7 +1499,8 @@ fn main() {
             save_image,
             pick_image,
             link_preview,
-            agent_reply
+            agent_reply,
+            set_recent_files
         ])
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();

@@ -1499,6 +1499,16 @@ function loadRecents() {
 function recordRecent(filePath) {
   const next = [filePath, ...loadRecents().filter((p) => p !== filePath)].slice(0, RECENTS_MAX);
   try { localStorage.setItem(RECENTS_KEY, JSON.stringify(next)); } catch { /* private mode / quota */ }
+  pushRecentsToMenu();
+}
+// Mirror recents into the native File > Open Recent menu (Tauri; no-op on Electron).
+function pushRecentsToMenu() {
+  if (window.plume.setRecentFiles) window.plume.setRecentFiles(loadRecents());
+}
+function clearRecents() {
+  try { localStorage.removeItem(RECENTS_KEY); } catch { /* ignore */ }
+  pushRecentsToMenu();
+  updateWelcome();
 }
 function recentItems(term) {
   return loadRecents()
@@ -1726,6 +1736,8 @@ window.plume.onFolderOpen(({ dir }) => {
 window.plume.onMenu((channel, ...args) => {
   switch (channel) {
     case "menu:open": window.plume.openDialog(); break;
+    case "menu:openRecent": if (args[0]) window.plume.openInThisWindow(args[0]); break;
+    case "menu:clearRecent": clearRecents(); break;
     case "menu:save": save(Boolean(args[0]?.thenClose)); break;
     case "menu:saveAs": saveAs(); break;
     case "menu:find": openSearchPanel(view); break;
@@ -1754,6 +1766,7 @@ setTitle(null);
 buildRail();
 buildWelcome();
 updateWelcome();
+pushRecentsToMenu(); // seed the native Open Recent menu from saved recents on launch
 
 // Automation surface (used for scripting / testing the UI).
 window.__plume = { toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, htmlToMarkdown, view };

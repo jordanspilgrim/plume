@@ -41,6 +41,9 @@ window.plume = {
   onFolderOpen: (cb) => { onFolderOpen = cb; },
   onMenu: (cb) => { onMenuCb = cb; },
 
+  // Push the renderer's recents list so the native File > Open Recent menu reflects it.
+  setRecentFiles: (paths) => invoke("set_recent_files", { paths }).catch(() => {}),
+
   // files
   openDialog: () => invoke("open_dialog").catch(() => null),
   openInThisWindow: async (filePath, gotoLine) => {
