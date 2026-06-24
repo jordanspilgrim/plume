@@ -117,11 +117,15 @@ function help() {
 
   if (files.length === 0) { await send([{ cmd: "focus" }]); return; }
 
-  const reqs = files.map((f) => {
+  const reqs = files.map((f, idx) => {
     const abs = path.resolve(process.cwd(), f);
     let dir = false;
     try { dir = fs.statSync(abs).isDirectory(); } catch { /* maybe a new file */ }
-    return dir ? { cmd: "open", dir: abs } : { cmd: "open", path: abs, line, newWindow };
+    // Plume is one-doc-per-window, so several files open in several windows: the
+    // first reuses the focused window (unless --new), the rest force new windows.
+    // Otherwise each `open` replaces the previous in the same window.
+    const win = newWindow || idx > 0;
+    return dir ? { cmd: "open", dir: abs } : { cmd: "open", path: abs, line, newWindow: win };
   });
   await send(reqs);
 })();
