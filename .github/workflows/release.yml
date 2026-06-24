@@ -1,0 +1,58 @@
+# Release pipeline: on a version tag, build + Developer-ID sign + notarize the
+# macOS app, publish a GitHub Release with the DMG, and emit the auto-updater
+# feed (latest.json). Direct distribution — NOT the Mac App Store (see dist/SHIP.md).
+#
+# Required repo secrets (Settings ▸ Secrets ▸ Actions) — all created by you once:
+#   APPLE_CERTIFICATE            base64 of your "Developer ID Application" .p12
+#   APPLE_CERTIFICATE_PASSWORD   password for that .p12
+#   APPLE_SIGNING_IDENTITY       e.g. "Developer ID Application: Your Name (TEAMID)"
+#   APPLE_ID                     your Apple ID email
+#   APPLE_PASSWORD               an app-specific password for notarization
+#   APPLE_TEAM_ID                your 10-char Apple Team ID
+#   TAURI_SIGNING_PRIVATE_KEY            updater private key (`tauri signer generate`)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   its password
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: aarch64-apple-darwin,x86_64-apple-darwin }
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: "./src-tauri -> target" }
+
+      - run: npm ci
+      - run: npm run tauri:frontend   # compile the renderer BEFORE tauri build
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          # code signing + notarization
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # updater artifact signing
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Plume ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          # Universal binary so one DMG runs on Apple Silicon + Intel.
+          args: --target universal-apple-darwin
+          # tauri-action uploads the DMG + latest.json (the updater feed) to the release.
+          includeUpdaterJson: true
