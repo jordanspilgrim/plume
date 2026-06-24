@@ -63,9 +63,28 @@ async function send(reqs) {
   }
 }
 
+// 8-bit Plume wordmark, periwinkle→indigo gradient to match the brand feather.
+// Color only when stdout is a TTY, so piping/redirecting stays clean.
+const BANNER_ART = [
+  "██████╗ ██╗     ██╗   ██╗███╗   ███╗███████╗",
+  "██╔══██╗██║     ██║   ██║████╗ ████║██╔════╝",
+  "██████╔╝██║     ██║   ██║██╔████╔██║█████╗  ",
+  "██╔═══╝ ██║     ██║   ██║██║╚██╔╝██║██╔══╝  ",
+  "██║     ███████╗╚██████╔╝██║ ╚═╝ ██║███████╗",
+  "╚═╝     ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝",
+];
+const BANNER_GRAD = [147, 111, 105, 99, 63, 57];
+function banner(tagline) {
+  const tty = process.stdout.isTTY;
+  const paint = (s, c) => (tty ? `\x1b[38;5;${c}m${s}\x1b[0m` : s);
+  const dim = (s) => (tty ? `\x1b[2m${s}\x1b[0m` : s);
+  const art = BANNER_ART.map((l, i) => "  " + paint(l, BANNER_GRAD[i] || 105)).join("\n");
+  return "\n" + art + "\n\n  " + dim(tagline) + "\n";
+}
+
 function help() {
   process.stdout.write(
-    "plume — open files in the Plume editor\n\n" +
+    banner("the human pane for agentic coding") + "\n" +
     "Usage:\n" +
     "  plume <file...>          open or focus files\n" +
     "  plume <file> --line N    open and jump to line N\n" +
@@ -90,8 +109,9 @@ function help() {
   }
 
   if (wantVersion) {
-    try { const [r] = await sendOnce([{ cmd: "ping" }]); console.log("Plume " + (r.version || "")); }
-    catch { console.log("Plume (not running)"); }
+    if (process.stdout.isTTY) process.stdout.write(banner("the human pane for agentic coding") + "\n");
+    try { const [r] = await sendOnce([{ cmd: "ping" }]); console.log("  Plume " + (r.version || "")); }
+    catch { console.log("  Plume (not running)"); }
     return;
   }
 

@@ -198,6 +198,22 @@ async function handle(msg) {
   // notifications (no id) — ignore
 }
 
+// Greet on stderr only when run in a real terminal (manual / debug). When an
+// agent spawns us it pipes stderr, so this stays silent and never touches the
+// stdout JSON-RPC stream.
+if (process.stderr.isTTY) {
+  const grad = [147, 111, 105, 99, 63, 57];
+  const art = [
+    "██████╗ ██╗     ██╗   ██╗███╗   ███╗███████╗",
+    "██╔══██╗██║     ██║   ██║████╗ ████║██╔════╝",
+    "██████╔╝██║     ██║   ██║██╔████╔██║█████╗  ",
+    "██╔═══╝ ██║     ██║   ██║██║╚██╔╝██║██╔══╝  ",
+    "██║     ███████╗╚██████╔╝██║ ╚═╝ ██║███████╗",
+    "╚═╝     ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝",
+  ].map((l, i) => `  \x1b[38;5;${grad[i] || 105}m${l}\x1b[0m`).join("\n");
+  process.stderr.write(`\n${art}\n\n  \x1b[2mMCP server — waiting for an agent on stdio…\x1b[0m\n\n`);
+}
+
 let stdinBuf = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
