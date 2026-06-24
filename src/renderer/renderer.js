@@ -802,9 +802,16 @@ function renderReview() {
       bar.appendChild(chip);
     }
     card.appendChild(bar);
+    // A couple of unchanged context lines on each side so the change is placeable.
+    const si = segs.indexOf(h);
+    const prevEq = si > 0 && segs[si - 1].type === "eq" ? segs[si - 1].lines.slice(-2) : [];
+    const nextEq = si < segs.length - 1 && segs[si + 1].type === "eq" ? segs[si + 1].lines.slice(0, 2) : [];
     const pre = document.createElement("pre"); pre.className = "review-diff";
-    for (const l of h.del) { const r = document.createElement("div"); r.className = "dl del"; r.textContent = "− " + l; pre.appendChild(r); }
-    for (const l of h.add) { const r = document.createElement("div"); r.className = "dl add"; r.textContent = "+ " + l; pre.appendChild(r); }
+    const addLine = (cls, prefix, l) => { const r = document.createElement("div"); r.className = "dl " + cls; r.textContent = prefix + l; pre.appendChild(r); };
+    for (const l of prevEq) addLine("ctx", "  ", l);
+    for (const l of h.del) addLine("del", "− ", l);
+    for (const l of h.add) addLine("add", "+ ", l);
+    for (const l of nextEq) addLine("ctx", "  ", l);
     card.appendChild(pre);
     body.appendChild(card);
   }
@@ -1708,9 +1715,16 @@ function renderPalette(q) {
   paletteSel = 0;
   drawPalette();
 }
+const PAL_GROUP = { recent: "Recent", file: "Files", cmd: "Commands" };
 function drawPalette() {
   paletteList.innerHTML = "";
+  let lastKind = null;
   paletteItems.forEach((it, i) => {
+    if (it.kind !== lastKind && PAL_GROUP[it.kind]) {
+      const g = document.createElement("div"); g.className = "pal-group"; g.textContent = PAL_GROUP[it.kind];
+      paletteList.appendChild(g);
+      lastKind = it.kind;
+    }
     const row = document.createElement("div");
     row.className = "pal-item" + (i === paletteSel ? " sel" : "");
     const icon = document.createElement("span"); icon.className = "pal-icon";
@@ -1836,7 +1850,13 @@ function renderWorkspace(q) {
   if (ctx.length) { addGroup("Project context"); ctx.forEach((c) => addRow(c.name, c.path.replace(/\/[^/]*$/, ""), c.path)); }
 
   const sess = wsSessions.filter((s) => !term || s.title.toLowerCase().includes(term));
-  if (sess.length) { addGroup(term ? "Sessions (title)" : "Recent agent sessions"); sess.slice(0, 40).forEach((s) => addRow(s.title, tsLabel(s.ts), s.path, undefined, s.agent)); }
+  if (sess.length) {
+    const counts = {};
+    for (const s of sess) counts[s.agent] = (counts[s.agent] || 0) + 1;
+    const tally = ["claude", "codex", "gemini"].filter((a) => counts[a]).map((a) => `${AGENT_LABEL[a]} ${counts[a]}`).join(" · ");
+    addGroup(term ? "Sessions (title)" : tally ? `Recent agent sessions — ${tally}` : "Recent agent sessions");
+    sess.slice(0, 40).forEach((s) => addRow(s.title, tsLabel(s.ts), s.path, undefined, s.agent));
+  }
 
   if (!wsRows.length && !term) wsList.innerHTML = '<div class="sb-empty">No agent sessions or context files for this folder.</div>';
   paintWsSel();

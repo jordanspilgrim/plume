@@ -219,7 +219,7 @@ export function renderConversation(container, text) {
 
   for (const b of shown) {
     const row = document.createElement("div");
-    row.className = "conv-msg conv-" + (b.role === "assistant" ? "claude" : "you");
+    row.className = "conv-msg conv-" + (b.role === "assistant" ? agent.toLowerCase() : "you");
     const who = document.createElement("div");
     who.className = "conv-who";
     who.textContent = b.role === "assistant" ? agent : "You";

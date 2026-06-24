@@ -314,6 +314,12 @@ function openCellEditor(view, cell) {
     else if (e.key === "Tab") { e.preventDefault(); commitAndMove(e.shiftKey ? -1 : 1); }
   });
   ta.addEventListener("blur", () => commit(true));
+  // The textarea is position:fixed over the cell; scrolling the document would
+  // strand it. Commit on scroll so it never floats out of place.
+  const scroller = view.scrollDOM;
+  const onScroll = () => commit(true);
+  scroller.addEventListener("scroll", onScroll, { passive: true, once: true });
+  window.addEventListener("scroll", onScroll, { passive: true, once: true, capture: true });
 }
 
 class MermaidWidget extends WidgetType {
