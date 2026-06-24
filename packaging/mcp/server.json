@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.jordanspilgrim/plume",
+  "description": "The human pane for agentic coding. Open files in the Plume editor, read the user's selection and their typed steering directives (approve/reject/revise/question/pin), and write revisions the user reviews as an accept/reject diff.",
+  "repository": {
+    "url": "https://github.com/jordanspilgrim/plume",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/jordanspilgrim/plume",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@plume/mcp",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" },
+      "runtimeHint": "node"
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "tools": [
+        { "name": "open_in_plume", "description": "Open a file (optionally at a line) and bring it to the front." },
+        { "name": "get_active_document", "description": "Path + full text of what the user is viewing, incl. unsaved edits." },
+        { "name": "get_selection", "description": "The user's current selection with its line range." },
+        { "name": "list_open_files", "description": "Every file open in Plume." },
+        { "name": "get_annotations", "description": "The user's typed steering directives on quoted passages." },
+        { "name": "write_document", "description": "Write a revision; the user reviews it as an accept/reject diff." },
+        { "name": "get_attachments", "description": "Files the user pushed to this project's agent from Plume." }
+      ],
+      "install": "Install Plume, then run `claude mcp add plume -- plume-mcp` (or `codex mcp add` / `gemini mcp add`). Until @plume/mcp is published to npm, plume-mcp ships with the Plume app (File ▸ Install 'plume' Shell Command…).",
+      "agents": ["Claude Code", "Codex CLI", "Gemini CLI"]
+    }
+  }
+}

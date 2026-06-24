@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" font-family="Menlo, Monaco, 'DejaVu Sans Mono', 'Courier New', monospace">
+  <rect width="1200" height="630" fill="#1c1c1e"/>
+  <!-- subtle vignette -->
+  <radialGradient id="vg" cx="50%" cy="38%" r="70%">
+    <stop offset="0%" stop-color="#26263a" stop-opacity="0.6"/>
+    <stop offset="100%" stop-color="#1c1c1e" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1200" height="630" fill="url(#vg)"/>
+
+  <!-- 8-bit PLUME wordmark, periwinkle→indigo gradient (matches the brand feather).
+       font-size > line-step so the block glyphs connect vertically (no row gaps). -->
+  <g font-size="34" letter-spacing="0" text-anchor="middle" xml:space="preserve" font-weight="700">
+    <text x="600" y="214" fill="#9aa6ff">██████╗ ██╗     ██╗   ██╗███╗   ███╗███████╗</text>
+    <text x="600" y="244" fill="#8b9bff">██╔══██╗██║     ██║   ██║████╗ ████║██╔════╝</text>
+    <text x="600" y="274" fill="#7d8df7">██████╔╝██║     ██║   ██║██╔████╔██║█████╗  </text>
+    <text x="600" y="304" fill="#6d7ff5">██╔═══╝ ██║     ██║   ██║██║╚██╔╝██║██╔══╝  </text>
+    <text x="600" y="334" fill="#5d6fe8">██║     ███████╗╚██████╔╝██║ ╚═╝ ██║███████╗</text>
+    <text x="600" y="364" fill="#4f5fd0">╚═╝     ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝</text>
+  </g>
+
+  <!-- tagline -->
+  <text x="600" y="452" text-anchor="middle" font-size="22" fill="#c9c9d2"
+        font-family="-apple-system, 'Inter', 'Segoe UI', sans-serif">the human pane for agentic coding</text>
+
+  <!-- install line -->
+  <text x="600" y="520" text-anchor="middle" font-size="18" fill="#6d6d77">brew install --cask plume</text>
+</svg>
