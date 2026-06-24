@@ -94,6 +94,9 @@ export function renderJsonl(container, text) {
 /** Heuristic: does this .jsonl look like a Claude Code chat transcript? */
 export function looksLikeTranscript(text) {
   const head = text.slice(0, 20000); // cheap peek — never split the whole file
+  // Gemini CLI: a single JSON object with a messages[] of user/gemini turns.
+  const ls = head.trimStart();
+  if (ls.startsWith("{") && /"messages"\s*:\s*\[/.test(head) && /"type"\s*:\s*"(user|gemini)"/.test(head)) return true;
   let checked = 0, hits = 0;
   for (const raw of head.split("\n")) {
     const line = raw.trim();
@@ -101,6 +104,9 @@ export function looksLikeTranscript(text) {
     checked++;
     try {
       const o = JSON.parse(line);
+      // Codex CLI rollout: session_meta is a distinctive first marker.
+      if (o.type === "session_meta") return true;
+      if (o.type === "event_msg" && (o.payload?.type === "user_message" || o.payload?.type === "agent_message")) { hits++; continue; }
       const m = o.message || o;
       const role = m.role || o.type;
       if (role === "user" || role === "assistant" || o.type === "summary" || o.sessionId || o.uuid) hits++;
@@ -110,26 +116,47 @@ export function looksLikeTranscript(text) {
   return checked >= 3 && hits / checked >= 0.6;
 }
 
-const CONV_TAIL = 800000; // distill from the last ~800 KB (recency + DOM sanity)
-const CONV_MAX_MSGS = 150;
-
-/** Render a Claude Code transcript as a readable conversation (recent window). */
-export function renderConversation(container, text) {
-  container.innerHTML = "";
-  let slice = text;
-  let trimmedTail = false;
+// Normalize any of the three transcript formats to { agent, blocks, truncated },
+// where blocks are [{ role:"user"|"assistant", prose, toolCalls }] in order.
+function parseTranscript(text) {
+  const ls = text.trimStart();
+  // Gemini CLI: { messages: [{ type:"user"|"gemini", content }] } (parse whole — it's one session).
+  if (ls.startsWith("{") && /"messages"\s*:\s*\[/.test(text.slice(0, 4000))) {
+    const blocks = [];
+    try {
+      const o = JSON.parse(text);
+      for (const m of o.messages || []) {
+        const role = m.type === "user" ? "user" : "assistant";
+        const c = m.content;
+        let prose = Array.isArray(c) ? c.map((x) => x.text || "").join("") : typeof c === "string" ? c : "";
+        prose = prose.trim();
+        if (prose) blocks.push({ role, prose, toolCalls: 0 });
+      }
+    } catch { /* malformed */ }
+    return { agent: "Gemini", blocks, truncated: false };
+  }
+  // JSONL: Claude or Codex. Byte-tail huge files (Claude transcripts run to 100s of MB).
+  let slice = text, truncated = false;
   if (text.length > CONV_TAIL) {
     slice = text.slice(text.length - CONV_TAIL);
     const nl = slice.indexOf("\n");
     if (nl >= 0) slice = slice.slice(nl + 1);
-    trimmedTail = true;
+    truncated = true;
   }
-
+  let agent = "Claude";
   const blocks = [];
   for (const raw of slice.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
     let o; try { o = JSON.parse(line); } catch { continue; }
+    if (o.type === "session_meta") { agent = "Codex"; continue; }
+    // Codex rollout: clean conversational turns.
+    if (o.type === "event_msg" && o.payload) {
+      if (o.payload.type === "user_message" && o.payload.message) { agent = "Codex"; blocks.push({ role: "user", prose: String(o.payload.message).trim(), toolCalls: 0 }); }
+      else if (o.payload.type === "agent_message" && o.payload.message) { agent = "Codex"; blocks.push({ role: "assistant", prose: String(o.payload.message).trim(), toolCalls: 0 }); }
+      continue;
+    }
+    // Claude Code transcript.
     const m = o.message || o;
     const role = m.role || o.type;
     if (role !== "user" && role !== "assistant") continue;
@@ -141,14 +168,22 @@ export function renderConversation(container, text) {
         if (!b || typeof b !== "object") continue;
         if (b.type === "text" && typeof b.text === "string") prose += (prose ? "\n\n" : "") + b.text;
         else if (b.type === "tool_use") toolCalls++;
-        // tool_result blocks are harness output fed back to the model, not a turn — ignore.
       }
     }
     prose = prose.trim();
-    // Keep real turns: any prose, or an assistant that only made tool calls.
     if (!prose && !(role === "assistant" && toolCalls)) continue;
     blocks.push({ role, prose, toolCalls });
   }
+  return { agent, blocks, truncated };
+}
+
+const CONV_TAIL = 800000; // distill from the last ~800 KB (recency + DOM sanity)
+const CONV_MAX_MSGS = 150;
+
+/** Render a Claude Code transcript as a readable conversation (recent window). */
+export function renderConversation(container, text) {
+  container.innerHTML = "";
+  const { agent, blocks, truncated: trimmedTail } = parseTranscript(text);
 
   let shown = blocks;
   let truncated = trimmedTail;
@@ -164,7 +199,7 @@ export function renderConversation(container, text) {
   copy.textContent = "Copy conversation";
   copy.addEventListener("click", async () => {
     const md = shown.map((b) => {
-      const who = b.role === "assistant" ? "**Claude:**" : "**You:**";
+      const who = b.role === "assistant" ? `**${agent}:**` : "**You:**";
       const tools = b.toolCalls ? `_(${b.toolCalls} tool call${b.toolCalls === 1 ? "" : "s"})_` : "";
       return `${who}\n\n${b.prose || tools}`.trim();
     }).join("\n\n---\n\n");
@@ -187,7 +222,7 @@ export function renderConversation(container, text) {
     row.className = "conv-msg conv-" + (b.role === "assistant" ? "claude" : "you");
     const who = document.createElement("div");
     who.className = "conv-who";
-    who.textContent = b.role === "assistant" ? "Claude" : "You";
+    who.textContent = b.role === "assistant" ? agent : "You";
     row.appendChild(who);
     if (b.prose) {
       const body = document.createElement("div");

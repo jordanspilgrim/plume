@@ -652,27 +652,33 @@ ipcMain.handle("sessions:list", async (_e, { dir }) => {
 ipcMain.handle("sessions:search", async (_e, { query, dir }) => {
   if (!query || query.length < 2) return [];
   const q = query.toLowerCase();
-  const results = []; let scanned = 0;
+  // Candidate transcripts across all three agents, tagged with agent + meta.
+  const cands = [];
   for (const pd of await projectDirsFor(dir)) {
     let files; try { files = (await fs.readdir(pd)).filter((f) => f.endsWith(".jsonl")); } catch { continue; }
-    for (const f of files) {
-      if (results.length >= 40 || scanned > 500) break;
-      scanned++;
-      const full = path.join(pd, f);
-      // Cap per-file reads at 4 MB so searching across many large transcripts stays responsive.
-      let txt;
-      try {
-        const fh = await fs.open(full, "r");
-        const buf = Buffer.alloc(4 * 1024 * 1024);
-        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-        await fh.close();
-        txt = buf.toString("utf8", 0, bytesRead);
-      } catch { continue; }
-      const idx = txt.toLowerCase().indexOf(q);
-      if (idx >= 0) {
-        const snippet = txt.slice(Math.max(0, idx - 40), idx + 90).replace(/\s+/g, " ").trim();
-        results.push({ ...(await sessionMeta(full)), snippet });
-      }
+    for (const f of files) cands.push({ path: path.join(pd, f), agent: "claude" });
+  }
+  for (const s of await codexSessionsFor(dir)) cands.push({ path: s.path, agent: "codex", title: s.title, ts: s.ts });
+  for (const s of await geminiSessionsFor(dir)) cands.push({ path: s.path, agent: "gemini", title: s.title, ts: s.ts });
+
+  const results = []; let scanned = 0;
+  for (const c of cands) {
+    if (results.length >= 40 || scanned > 500) break;
+    scanned++;
+    // Cap per-file reads at 4 MB so searching across many large transcripts stays responsive.
+    let txt;
+    try {
+      const fh = await fs.open(c.path, "r");
+      const buf = Buffer.alloc(4 * 1024 * 1024);
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+      await fh.close();
+      txt = buf.toString("utf8", 0, bytesRead);
+    } catch { continue; }
+    const idx = txt.toLowerCase().indexOf(q);
+    if (idx >= 0) {
+      const snippet = txt.slice(Math.max(0, idx - 40), idx + 90).replace(/\s+/g, " ").trim();
+      const meta = c.agent === "claude" ? await sessionMeta(c.path) : { path: c.path, title: c.title, ts: c.ts, agent: "claude" };
+      results.push({ ...meta, agent: c.agent, snippet });
     }
   }
   results.sort((a, b) => b.ts - a.ts);

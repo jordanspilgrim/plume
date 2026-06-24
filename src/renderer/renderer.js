@@ -550,8 +550,11 @@ function toggleSourceView() {
   else renderCurrent();
 }
 
-function applyMode(filePath) {
-  const mode = modeForPath(filePath);
+function applyMode(filePath, content) {
+  let mode = modeForPath(filePath);
+  // Gemini sessions are .json (→ code mode); route transcript content to the
+  // conversation view like Claude/Codex .jsonl.
+  if (mode === "code" && content && looksLikeTranscript(content)) mode = "jsonl";
   currentMode = mode;
   showSource = false;
   appEl.dataset.mode = mode;
@@ -662,7 +665,7 @@ async function publishGoogle() {
 
 /* ---------- File I/O ---------- */
 function loadDocument(content, filePath, recovery, gotoLine) {
-  applyMode(filePath);
+  applyMode(filePath, content);
   savedText = content;
   view.dispatch({
     changes: { from: 0, to: view.state.doc.length, insert: content },
@@ -1846,7 +1849,7 @@ function renderWorkspace(q) {
       const fresh = hits.filter((h) => !shown.has(h.path));
       if (fresh.length) {
         addGroup("Matches in transcript");
-        fresh.forEach((h) => addRow(h.title, h.snippet, h.path));
+        fresh.forEach((h) => addRow(h.title, h.snippet, h.path, undefined, h.agent));
         paintWsSel();
       }
     }, 200);

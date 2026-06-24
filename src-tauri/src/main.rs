@@ -1162,32 +1162,44 @@ fn search_sessions(query: String, dir: Option<String>) -> Vec<Value> {
         return vec![];
     }
     let q = query.to_lowercase();
-    let mut results = vec![];
-    let mut scanned = 0;
-    'outer: for pd in project_dirs(&dir) {
+    // Candidate transcripts across all three agents, each carrying its agent + meta.
+    let mut cands: Vec<Value> = vec![];
+    for pd in project_dirs(&dir) {
         if let Ok(entries) = fs::read_dir(&pd) {
             for e in entries.flatten() {
-                if results.len() >= 40 || scanned > 500 {
-                    break 'outer;
+                if e.path().extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                    cands.push(json!({ "path": e.path().to_string_lossy(), "agent": "claude" }));
                 }
-                if e.path().extension().and_then(|x| x.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                scanned += 1;
-                if let Ok(mut f) = fs::File::open(e.path()) {
-                    let mut buf = vec![0u8; 4 * 1024 * 1024];
-                    if let Ok(n) = f.read(&mut buf) {
-                        let text = String::from_utf8_lossy(&buf[..n]);
-                        let lower = text.to_lowercase();
-                        if let Some(idx) = lower.find(&q) {
-                            let start = idx.saturating_sub(40);
-                            let snippet: String =
-                                text[start..(idx + 90).min(text.len())].split_whitespace().collect::<Vec<_>>().join(" ");
-                            let mut meta = session_meta(&e.path());
-                            meta["snippet"] = json!(snippet);
-                            results.push(meta);
-                        }
-                    }
+            }
+        }
+    }
+    if let Some(d) = &dir {
+        cands.extend(codex_sessions_for(d));
+        cands.extend(gemini_sessions_for(d));
+    }
+    let mut results = vec![];
+    let mut scanned = 0;
+    for c in cands {
+        if results.len() >= 40 || scanned > 500 {
+            break;
+        }
+        scanned += 1;
+        let path = match c["path"].as_str() {
+            Some(p) => p.to_string(),
+            None => continue,
+        };
+        if let Ok(mut f) = fs::File::open(&path) {
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            if let Ok(n) = f.read(&mut buf) {
+                let text = String::from_utf8_lossy(&buf[..n]);
+                let lower = text.to_lowercase();
+                if let Some(idx) = lower.find(&q) {
+                    let start = idx.saturating_sub(40);
+                    let snippet: String =
+                        text[start..(idx + 90).min(text.len())].split_whitespace().collect::<Vec<_>>().join(" ");
+                    let mut meta = if c["agent"] == "claude" { session_meta(Path::new(&path)) } else { c.clone() };
+                    meta["snippet"] = json!(snippet);
+                    results.push(meta);
                 }
             }
         }
