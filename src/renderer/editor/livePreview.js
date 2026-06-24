@@ -781,6 +781,7 @@ const linkClicker = EditorView.domEventHandlers({
 
 /* ---------- List hanging indent (wrapped lines align under the text) ---------- */
 const LIST_PREFIX = /^(\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)/;
+const NEST_STEP = 14; // extra px of indent per nesting level (beyond the first)
 
 // Measure the actual rendered width of a list prefix in the editor font, so the
 // hanging indent aligns exactly (bullets render as "•", ordered keep "1.", etc.).
@@ -803,17 +804,20 @@ function buildListIndent(view) {
       if (m) {
         // Confirm it's a real list item (not a "- " line inside a code block).
         const at = line.from + (line.text.length - line.text.trimStart().length);
-        let node = tree.resolveInner(at, 1), isList = false;
+        let node = tree.resolveInner(at, 1), isList = false, depth = 0;
         for (let n = node; n; n = n.parent) {
-          if (n.name === "ListItem") { isList = true; break; }
-          if (/Code|Fenced/.test(n.name)) break;
+          if (/Code|Fenced/.test(n.name)) { isList = false; depth = 0; break; }
+          if (n.name === "ListItem") { isList = true; depth++; } // count nesting, don't stop
         }
         if (isList) {
           const indent = Math.round(measurePrefixWidth(view, m[1]));
-          if (indent > 0) {
-            ranges.push(
-              Decoration.line({ attributes: { style: `padding-left:${indent}px;text-indent:-${indent}px` } }).range(line.from)
-            );
+          // Step each nesting level further right so deep structure is easy to scan.
+          // margin-left shifts the whole line box; padding/text-indent (the hanging
+          // indent for wrapped lines) stay relative to it, so alignment is preserved.
+          const nest = Math.max(0, depth - 1) * NEST_STEP;
+          if (indent > 0 || nest > 0) {
+            const style = `padding-left:${indent}px;text-indent:-${indent}px` + (nest ? `;margin-left:${nest}px` : "");
+            ranges.push(Decoration.line({ attributes: { style } }).range(line.from));
           }
         }
       }
