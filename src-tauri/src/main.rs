@@ -165,7 +165,12 @@ fn spawn_window(app: &AppHandle, file_path: &str) -> Result<(), String> {
 
 #[tauri::command]
 fn open_in_new_window(app: AppHandle, file_path: String) -> Result<(), String> {
-    spawn_window(&app, &file_path)
+    // Window creation (and its initial_file content load) must run on the main
+    // thread — commands run off it, so dispatch like the socket "open" path does.
+    // Calling spawn_window directly built the window but left it empty.
+    let appc = app.clone();
+    app.run_on_main_thread(move || { let _ = spawn_window(&appc, &file_path); })
+        .map_err(|e| e.to_string())
 }
 
 // Reuse verified Node code (html-to-docx, gdocs.js) via the bundled sidecar.
