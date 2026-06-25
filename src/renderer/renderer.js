@@ -318,7 +318,7 @@ function renderWelcomeRecents() {
     const name = document.createElement("span"); name.className = "welcome-recent-name"; name.textContent = p.split("/").pop();
     const path = document.createElement("span"); path.className = "welcome-recent-path"; path.textContent = p.replace(/^.*\/(?=[^/]+\/[^/]+$)/, "…/");
     row.append(name, path);
-    row.onclick = () => window.plume.openInThisWindow(p);
+    row.onclick = () => smartOpen(p);
     host.appendChild(row);
   }
 }
@@ -1655,12 +1655,20 @@ function clearRecents() {
   pushRecentsToMenu();
   updateWelcome();
 }
+// Open a document without clobbering the one you're reading: reuse THIS window
+// only if it's an empty/untitled scratch window (e.g. the welcome screen);
+// otherwise open in a new window. Used by recents / palette file-open / Open Recent
+// menu. (Sidebar stays in-place navigation; search/session keep their line jump.)
+function smartOpen(path) {
+  if (!currentPath && view.state.doc.length === 0) window.plume.openInThisWindow(path);
+  else window.plume.openInNewWindow(path);
+}
 function recentItems(term) {
   return loadRecents()
     .filter((p) => p !== currentPath)
     .filter((p) => !term || fuzzy(term, p.split("/").pop()))
     .slice(0, 8)
-    .map((p) => ({ kind: "recent", label: p.split("/").pop(), sub: p, run: () => window.plume.openInThisWindow(p) }));
+    .map((p) => ({ kind: "recent", label: p.split("/").pop(), sub: p, run: () => smartOpen(p) }));
 }
 
 const COMMANDS = [
@@ -1710,7 +1718,7 @@ function renderPalette(q) {
   const recents = cmdMode ? [] : recentItems(term);
   const recentPaths = new Set(recents.map((r) => r.sub));
   const files = cmdMode ? [] : paletteFiles.filter((f) => !recentPaths.has(f.path) && (!term || fuzzy(term, f.name))).slice(0, 40)
-    .map((f) => ({ kind: "file", label: f.name, run: () => window.plume.openInThisWindow(f.path) }));
+    .map((f) => ({ kind: "file", label: f.name, run: () => smartOpen(f.path) }));
   paletteItems = [...recents, ...files, ...cmds];
   paletteSel = 0;
   drawPalette();
@@ -1908,7 +1916,7 @@ window.plume.onFolderOpen(({ dir }) => {
 window.plume.onMenu((channel, ...args) => {
   switch (channel) {
     case "menu:open": window.plume.openDialog(); break;
-    case "menu:openRecent": if (args[0]) window.plume.openInThisWindow(args[0]); break;
+    case "menu:openRecent": if (args[0]) smartOpen(args[0]); break;
     case "menu:clearRecent": clearRecents(); break;
     case "menu:save": save(Boolean(args[0]?.thenClose)); break;
     case "menu:saveAs": saveAs(); break;
@@ -1941,7 +1949,7 @@ updateWelcome();
 pushRecentsToMenu(); // seed the native Open Recent menu from saved recents on launch
 
 // Automation surface (used for scripting / testing the UI).
-window.__plume = { toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, htmlToMarkdown, openDiffReview, view };
+window.__plume = { toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, htmlToMarkdown, openDiffReview, smartOpen, view };
 
 // Agent surface — read by the main process (executeJavaScript) for the MCP server.
 window.__plumeAgent = {
