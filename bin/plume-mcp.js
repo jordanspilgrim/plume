@@ -17,16 +17,52 @@ const path = require("node:path");
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 
-const SOCK = process.platform === "win32"
+// PLUME_SOCK lets a dev/test harness point at its own socket (mirrors the Electron
+// control.js + CLI override); default is the shared one Plume binds.
+const SOCK = process.env.PLUME_SOCK || (process.platform === "win32"
   ? "\\\\.\\pipe\\plume.sock"
-  : path.join(os.homedir(), ".plume", "plume.sock");
+  : path.join(os.homedir(), ".plume", "plume.sock"));
 
 // Attachments are routed per project: Plume stages under
 // ~/.plume/attachments/<dashify(cwd)>/, and this server — spawned with the
 // session's working dir — reads only its own project's bucket. dashify matches
 // Claude Code's ~/.claude/projects naming (/ and . -> -).
 const dashify = (p) => p.replace(/[/.]/g, "-");
-const ATTACH_DIR = path.join(os.homedir(), ".plume", "attachments", dashify(process.cwd()));
+// PLUME_ATTACH_DIR overrides the bucket for tests; production is project-scoped.
+const ATTACH_DIR = process.env.PLUME_ATTACH_DIR
+  || path.join(os.homedir(), ".plume", "attachments", dashify(process.cwd()));
+
+// ---- write containment (P0-1) ----
+// This server is spawned in the agent's workspace; the agent can't change our cwd,
+// so anchoring write_document to it (plus whatever the user already has open in
+// Plume) stops a prompt-injected agent from turning write_document into an arbitrary
+// write — ~/.ssh/authorized_keys, a sibling repo, a .git/hooks/pre-commit. The Rust
+// side re-checks this as a backstop; doing it here too gives the agent a clear,
+// structured refusal instead of a generic failure. See SECURITY.md.
+const WORKSPACE = process.cwd();
+
+// Resolve symlinks/.. on the existing portion of a path so the containment check
+// can't be fooled by `workspace/../../etc/x` or a symlink out of the tree.
+function canonicalize(p) {
+  const abs = path.resolve(p);
+  try { return fs.realpathSync(abs); } catch { /* target not on disk yet */ }
+  try { return path.join(fs.realpathSync(path.dirname(abs)), path.basename(abs)); }
+  catch { return abs; }
+}
+
+function withinDir(target, dir) {
+  const rel = path.relative(dir, target);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+// null = allowed; otherwise an agent-facing refusal string.
+function refuseWrite(target, workspace, openPaths = []) {
+  const t = canonicalize(target);
+  if (withinDir(t, canonicalize(workspace))) return null;
+  if (openPaths.some((p) => canonicalize(p) === t)) return null;
+  return `Refused: ${target} is outside this workspace (${workspace}) and is not open in Plume. `
+    + `Open it in Plume first, or write to a path inside the workspace.`;
+}
 
 function sockOnce(reqs) {
   return new Promise((resolve, reject) => {
@@ -127,18 +163,29 @@ const TOOLS = [
   },
   {
     name: "write_document",
-    description: "Write content to a file on disk. If the file is open in Plume, it live-reloads. Use this to apply revisions the user asked for via their annotations.",
+    description: "Write content to a file on disk. If the file is open in Plume, it live-reloads. Use this to apply revisions the user asked for via their annotations. For safety, writes are confined to this session's workspace plus files already open in Plume; a path outside that set is refused.",
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Absolute path to write." },
+        path: { type: "string", description: "Absolute path to write (must be inside the workspace or already open in Plume)." },
         content: { type: "string", description: "Full new file contents." },
       },
       required: ["path", "content"],
     },
     run: async (a) => {
-      const r = await plume({ cmd: "writeDocument", path: a.path, content: a.content });
-      return r.ok ? `Wrote ${a.path}.` : `Failed: ${r.error}`;
+      // Gather the user's open files so writes to them are allowed even outside cwd.
+      let open = [];
+      try {
+        const lf = await plume({ cmd: "listOpenFiles" });
+        if (lf.ok && Array.isArray(lf.files)) open = lf.files.map((f) => f && f.path).filter(Boolean);
+      } catch { /* best-effort; cwd containment still applies */ }
+      const refusal = refuseWrite(a.path, WORKSPACE, open);
+      if (refusal) return refusal;
+      const r = await plume({ cmd: "writeDocument", path: a.path, content: a.content, root: WORKSPACE });
+      if (r.ok) return `Wrote ${a.path}.`;
+      if (r.code === "dirty_conflict") return `Not written: ${a.path} has unsaved changes open in Plume. Ask the user to save or discard them first, then retry.`;
+      if (r.code === "outside_workspace") return `Refused by Plume: ${a.path} is outside the workspace and is not open in Plume.`;
+      return `Failed: ${r.error}`;
     },
   },
   {
@@ -155,12 +202,33 @@ const TOOLS = [
       }
       if (!files.length) return "No pending attachments — the user hasn't pushed any documents from Plume.";
       const items = [];
+      let quarantined = 0;
       for (const f of files) {
         const fp = path.join(ATTACH_DIR, f);
-        try { items.push(JSON.parse(fs.readFileSync(fp, "utf8"))); } catch { /* skip bad record */ }
-        try { fs.unlinkSync(fp); } catch { /* best-effort consume */ }
+        let parsed = null;
+        try { parsed = JSON.parse(fs.readFileSync(fp, "utf8")); } catch { parsed = null; }
+        if (parsed) {
+          items.push(parsed);
+          try { fs.unlinkSync(fp); } catch { /* best-effort consume */ }
+        } else {
+          // Don't silently destroy a malformed push (P2-7) — quarantine it for
+          // inspection instead of unlinking, so a corrupt write is recoverable.
+          try {
+            const bad = path.join(ATTACH_DIR, ".bad");
+            fs.mkdirSync(bad, { recursive: true });
+            fs.renameSync(fp, path.join(bad, f));
+            quarantined++;
+          } catch { /* if we can't move it, leave it in place rather than lose it */ }
+        }
       }
-      return JSON.stringify(items.map((it) => ({ name: it.name, pushedAt: it.pushedAt, content: it.content })));
+      const out = items.map((it) => ({ name: it.name, pushedAt: it.pushedAt, content: it.content }));
+      if (quarantined) {
+        return JSON.stringify({
+          attachments: out,
+          warning: `${quarantined} malformed attachment(s) could not be parsed and were moved to ${path.join(ATTACH_DIR, ".bad")} for inspection.`,
+        });
+      }
+      return JSON.stringify(out);
     },
   },
 ];
@@ -198,33 +266,41 @@ async function handle(msg) {
   // notifications (no id) — ignore
 }
 
-// Greet on stderr only when run in a real terminal (manual / debug). When an
-// agent spawns us it pipes stderr, so this stays silent and never touches the
-// stdout JSON-RPC stream.
-if (process.stderr.isTTY) {
-  const grad = [147, 111, 105, 99, 63, 57];
-  const art = [
-    "██████╗ ██╗     ██╗   ██╗███╗   ███╗███████╗",
-    "██╔══██╗██║     ██║   ██║████╗ ████║██╔════╝",
-    "██████╔╝██║     ██║   ██║██╔████╔██║█████╗  ",
-    "██╔═══╝ ██║     ██║   ██║██║╚██╔╝██║██╔══╝  ",
-    "██║     ███████╗╚██████╔╝██║ ╚═╝ ██║███████╗",
-    "╚═╝     ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝",
-  ].map((l, i) => `  \x1b[38;5;${grad[i] || 105}m${l}\x1b[0m`).join("\n");
-  process.stderr.write(`\n${art}\n\n  \x1b[2mMCP server — waiting for an agent on stdio…\x1b[0m\n\n`);
+// Exported for the contract tests (test/). Importing the module must NOT start the
+// stdio server or print the banner — those run only when invoked as a binary.
+module.exports = { refuseWrite, withinDir, canonicalize, PROTOCOL_VERSION, TOOLS };
+
+function startServer() {
+  // Greet on stderr only when run in a real terminal (manual / debug). When an
+  // agent spawns us it pipes stderr, so this stays silent and never touches the
+  // stdout JSON-RPC stream.
+  if (process.stderr.isTTY) {
+    const grad = [147, 111, 105, 99, 63, 57];
+    const art = [
+      "██████╗ ██╗     ██╗   ██╗███╗   ███╗███████╗",
+      "██╔══██╗██║     ██║   ██║████╗ ████║██╔════╝",
+      "██████╔╝██║     ██║   ██║██╔████╔██║█████╗  ",
+      "██╔═══╝ ██║     ██║   ██║██║╚██╔╝██║██╔══╝  ",
+      "██║     ███████╗╚██████╔╝██║ ╚═╝ ██║███████╗",
+      "╚═╝     ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝",
+    ].map((l, i) => `  \x1b[38;5;${grad[i] || 105}m${l}\x1b[0m`).join("\n");
+    process.stderr.write(`\n${art}\n\n  \x1b[2mMCP server — waiting for an agent on stdio…\x1b[0m\n\n`);
+  }
+
+  let stdinBuf = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => {
+    stdinBuf += chunk;
+    let i;
+    while ((i = stdinBuf.indexOf("\n")) >= 0) {
+      const line = stdinBuf.slice(0, i); stdinBuf = stdinBuf.slice(i + 1);
+      if (!line.trim()) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      handle(msg);
+    }
+  });
+  process.stdin.on("end", () => process.exit(0));
 }
 
-let stdinBuf = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  stdinBuf += chunk;
-  let i;
-  while ((i = stdinBuf.indexOf("\n")) >= 0) {
-    const line = stdinBuf.slice(0, i); stdinBuf = stdinBuf.slice(i + 1);
-    if (!line.trim()) continue;
-    let msg;
-    try { msg = JSON.parse(line); } catch { continue; }
-    handle(msg);
-  }
-});
-process.stdin.on("end", () => process.exit(0));
+if (require.main === module) startServer();

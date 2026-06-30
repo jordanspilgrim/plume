@@ -6,7 +6,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -32,6 +32,9 @@ struct AppState {
     window_files: Mutex<HashMap<String, String>>,
     win_counter: AtomicU64,
     recents: Mutex<Vec<String>>, // recent file paths for the File > Open Recent menu
+    // Canonical paths the renderer has flagged as having unsaved edits. writeDocument
+    // refuses to clobber one of these (P1-4). Renderer pushes via set_doc_dirty.
+    dirty_files: Mutex<HashSet<String>>,
 }
 
 // Home directory, cross-platform: HOME on unix, USERPROFILE on Windows.
@@ -1341,6 +1344,68 @@ fn agent_query(app: &AppHandle, kind: &str) -> Value {
     }
 }
 
+// ---- write containment (P0-1) ----
+// Canonicalize a path for comparison. For a not-yet-existing target, canonicalize
+// the parent dir and re-append the file name so a new file inside an allowed dir
+// still resolves (and can't be smuggled past the check via `..` or a symlink).
+fn canonical_key(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(pc) => pc.join(name),
+            Err(_) => p.to_path_buf(),
+        },
+        _ => p.to_path_buf(),
+    }
+}
+
+// The files Plume currently has open: the focused doc plus every window's file.
+fn open_files(app: &AppHandle) -> HashSet<PathBuf> {
+    let st = app.state::<AppState>();
+    let mut set = HashSet::new();
+    if let Some(c) = st.current.lock().unwrap().clone() {
+        set.insert(canonical_key(Path::new(&c)));
+    }
+    for f in st.window_files.lock().unwrap().values() {
+        set.insert(canonical_key(Path::new(f)));
+    }
+    set
+}
+
+// A write is allowed iff its canonical target is (a) a file Plume already has open,
+// or (b) inside the workspace root the MCP server declared (its real cwd). The agent
+// can't make the MCP server lie about its own cwd, and the socket is owner-only
+// (0600), so a prompt-injected agent can't escalate write_document into an arbitrary
+// write to ~/.ssh, a sibling repo, or a git hook. See SECURITY.md.
+fn write_allowed(app: &AppHandle, target: &Path, root: Option<&str>) -> bool {
+    if open_files(app).contains(target) {
+        return true;
+    }
+    if let Some(r) = root {
+        let rc = canonical_key(Path::new(r));
+        if rc.as_os_str().len() > 1 && target.starts_with(&rc) {
+            return true;
+        }
+    }
+    false
+}
+
+// The renderer reports per-document dirty state so writeDocument can refuse to
+// clobber a buffer with unsaved edits (P1-4). Keyed by canonical path.
+#[tauri::command]
+fn set_doc_dirty(state: tauri::State<AppState>, path: Option<String>, dirty: bool) {
+    let Some(p) = path else { return };
+    let key = canonical_key(Path::new(&p)).to_string_lossy().to_string();
+    let mut set = state.dirty_files.lock().unwrap();
+    if dirty {
+        set.insert(key);
+    } else {
+        set.remove(&key);
+    }
+}
+
 // ---- control socket (the `plume` CLI + MCP server talk here) ----
 fn focus_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -1380,9 +1445,21 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
         "writeDocument" => match req["content"].as_str() {
             Some(content) if req["path"].is_string() => {
                 let p = req["path"].as_str().unwrap();
-                match fs::write(p, content) {
-                    Ok(_) => json!({ "ok": true, "path": p }),
-                    Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                let target = canonical_key(Path::new(p));
+                let root = req["root"].as_str();
+                if !write_allowed(app, &target, root) {
+                    json!({ "ok": false, "code": "outside_workspace",
+                        "error": format!("refused: {} is outside the workspace and is not open in Plume", p) })
+                } else if app.state::<AppState>().dirty_files.lock().unwrap()
+                    .contains(&target.to_string_lossy().to_string())
+                {
+                    json!({ "ok": false, "code": "dirty_conflict",
+                        "error": format!("refused: {} has unsaved changes open in Plume — save or discard first", p) })
+                } else {
+                    match fs::write(p, content) {
+                        Ok(_) => json!({ "ok": true, "path": p }),
+                        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                    }
                 }
             }
             _ => json!({ "ok": false, "error": "path and content required" }),
@@ -1437,13 +1514,28 @@ fn handle_conn<S: Read + Write>(app: &AppHandle, stream: S) {
 // pipe on Windows. The name must match the Node CLI/MCP clients (bin/*.js).
 #[cfg(unix)]
 fn run_socket_server(app: AppHandle) {
-    let sock = plume_dir().join("plume.sock");
-    let _ = fs::create_dir_all(plume_dir());
-    let _ = fs::remove_file(&sock);
+    use std::os::unix::fs::PermissionsExt;
+    let dir = plume_dir();
+    let _ = fs::create_dir_all(&dir);
+    // Owner-only on the directory and (below) the socket: nothing else on a
+    // multi-user box may connect and drive writeDocument (P0-2).
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    let sock = dir.join("plume.sock");
+    // Probe-before-bind (P0-3): never steal a socket a live Plume already owns.
+    // A successful connect means a real owner is listening — leave it alone. A
+    // refused connect (or any error) means the file is stale; reclaim it. This
+    // mirrors the Electron control.js ownership logic so two shells don't fight.
+    if sock.exists() {
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(_) => return,                  // a live Plume answered — don't steal
+            Err(_) => { let _ = fs::remove_file(&sock); } // stale, safe to reclaim
+        }
+    }
     let listener = match std::os::unix::net::UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(_) => return,
     };
+    let _ = fs::set_permissions(&sock, fs::Permissions::from_mode(0o600));
     for stream in listener.incoming().flatten() {
         let app = app.clone();
         std::thread::spawn(move || handle_conn(&app, stream));
@@ -1453,7 +1545,11 @@ fn run_socket_server(app: AppHandle) {
 #[cfg(windows)]
 fn run_socket_server(app: AppHandle) {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
-    // Maps to \\.\pipe\plume.sock — the Node clients connect to the same name.
+    // Security note (P0-2 Windows analogue): a named pipe created in the default
+    // (non-global) namespace is reachable only within the creating user's session;
+    // other interactive users get their own \\.\pipe namespace, so no cross-user
+    // access is granted here. A hardened DACL would belong here if Plume ever ran
+    // as a service. Maps to \\.\pipe\plume.sock — the Node clients connect to the same name.
     let name = match "plume.sock".to_ns_name::<GenericNamespaced>() {
         Ok(n) => n,
         Err(_) => return,
@@ -1640,7 +1736,8 @@ fn main() {
             pick_image,
             link_preview,
             agent_reply,
-            set_recent_files
+            set_recent_files,
+            set_doc_dirty
         ])
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();

@@ -118,7 +118,9 @@ window.plume = {
     if (r && r.ok && r.url) invoke("open_external", { url: r.url }).catch(noop);
     return r;
   },
-  setDirty: noop,                    // N/A: window title is hidden (renderer shows the dot)
+  // Report dirty state up to the native side so write_document refuses to clobber
+  // a buffer with unsaved edits (P1-4). Keyed by the window's current file.
+  setDirty: (dirty) => { if (currentPath) invoke("set_doc_dirty", { path: currentPath, dirty }).catch(noop); },
 };
 
 // Pull the launch file once the renderer has registered its handler.

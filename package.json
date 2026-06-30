@@ -9,6 +9,7 @@
     "plume": "bin/plume.js"
   },
   "scripts": {
+    "test": "node --test test/*.test.js",
     "build:renderer": "node esbuild.config.mjs",
     "watch:renderer": "node esbuild.config.mjs --watch",
     "start": "npm run build:renderer && electron .",
