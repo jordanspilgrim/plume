@@ -25,13 +25,22 @@ const SOCK = process.platform === "win32"
   ? "\\\\.\\pipe\\plume.sock"
   : path.join(os.homedir(), ".plume", "plume.sock");
 
+// Handshake token Plume writes to ~/.plume/token (0600). Read per send so a
+// freshly-launched Plume's token is picked up. PLUME_TOKEN overrides for tests.
+function authToken() {
+  if (process.env.PLUME_TOKEN !== undefined) return process.env.PLUME_TOKEN;
+  try { return fs.readFileSync(path.join(os.homedir(), ".plume", "token"), "utf8").trim(); }
+  catch { return ""; }
+}
+
 function sendOnce(reqs) {
   return new Promise((resolve, reject) => {
     const sock = net.connect(SOCK);
     const out = [];
     let buf = "";
+    const token = authToken();
     sock.setTimeout(4000, () => { sock.destroy(); reject(new Error("timeout")); });
-    sock.on("connect", () => { for (const r of reqs) sock.write(JSON.stringify(r) + "\n"); });
+    sock.on("connect", () => { for (const r of reqs) sock.write(JSON.stringify({ ...r, token }) + "\n"); });
     sock.on("data", (d) => {
       buf += d.toString("utf8");
       let i;

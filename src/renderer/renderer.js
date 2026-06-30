@@ -798,7 +798,10 @@ function renderReview() {
       const chip = document.createElement("span");
       const vk = verdictOf(d);
       chip.className = "verdict-chip v-" + vk + " mini";
-      chip.innerHTML = `<span class="vg">${VERDICTS[vk].glyph}</span>${(d.note || VERDICTS[vk].label).slice(0, 48)}`;
+      // d.note is user-typed — build with textContent so it can't inject markup.
+      const cg = document.createElement("span"); cg.className = "vg"; cg.textContent = VERDICTS[vk].glyph;
+      chip.appendChild(cg);
+      chip.appendChild(document.createTextNode((d.note || VERDICTS[vk].label).slice(0, 48)));
       bar.appendChild(chip);
     }
     card.appendChild(bar);

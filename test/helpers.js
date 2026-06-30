@@ -16,7 +16,9 @@ const MCP_BIN = path.join(__dirname, "..", "bin", "plume-mcp.js");
 function startMcp({ env = {}, cwd } = {}) {
   const child = spawn(process.execPath, [MCP_BIN], {
     cwd,
-    env: { ...process.env, ...env },
+    // Default PLUME_TOKEN to empty so tests never read the real ~/.plume/token
+    // written by a live Plume; individual tests override it to assert handshakes.
+    env: { ...process.env, PLUME_TOKEN: "", ...env },
     stdio: ["pipe", "pipe", "ignore"],
   });
   let buf = "";

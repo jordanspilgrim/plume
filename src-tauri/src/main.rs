@@ -35,6 +35,9 @@ struct AppState {
     // Canonical paths the renderer has flagged as having unsaved edits. writeDocument
     // refuses to clobber one of these (P1-4). Renderer pushes via set_doc_dirty.
     dirty_files: Mutex<HashSet<String>>,
+    // Per-launch secret written to ~/.plume/token (0600). Socket clients must present
+    // it on every request (except ping). Defense-in-depth behind the 0600 socket.
+    socket_token: Mutex<String>,
 }
 
 // Home directory, cross-platform: HOME on unix, USERPROFILE on Windows.
@@ -1414,8 +1417,35 @@ fn focus_main(app: &AppHandle) {
     }
 }
 
+// 256-bit hex secret for the socket handshake. getrandom is already in the tree;
+// the time-based fallback only fires if the OS RNG is unavailable (effectively never).
+fn random_token() -> String {
+    let mut b = [0u8; 32];
+    if getrandom::getrandom(&mut b).is_err() {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = ((t >> (i % 16)) as u8) ^ (i as u8).wrapping_mul(31);
+        }
+    }
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
 fn dispatch(app: &AppHandle, req: &Value) -> Value {
-    match req["cmd"].as_str().unwrap_or("") {
+    let cmd = req["cmd"].as_str().unwrap_or("");
+    // Handshake-token gate (every cmd except the liveness ping). The socket is
+    // already 0600; this also blocks a same-user process that hasn't read the
+    // 0600 token file. ping stays open so probe-before-bind / `plume --version`
+    // can check liveness without the secret.
+    if cmd != "ping" {
+        let expected = app.state::<AppState>().socket_token.lock().unwrap().clone();
+        if !expected.is_empty() && req["token"].as_str().unwrap_or("") != expected {
+            return json!({ "ok": false, "error": "unauthorized" });
+        }
+    }
+    match cmd {
         "ping" => json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }),
         "focus" => {
             focus_main(app);
@@ -1520,6 +1550,13 @@ fn run_socket_server(app: AppHandle) {
     // Owner-only on the directory and (below) the socket: nothing else on a
     // multi-user box may connect and drive writeDocument (P0-2).
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    // Write the handshake token (0600) BEFORE binding, so by the time a client can
+    // connect the secret is already on disk for it to read.
+    let token = random_token();
+    *app.state::<AppState>().socket_token.lock().unwrap() = token.clone();
+    let tokfile = dir.join("token");
+    let _ = fs::write(&tokfile, &token);
+    let _ = fs::set_permissions(&tokfile, fs::Permissions::from_mode(0o600));
     let sock = dir.join("plume.sock");
     // Probe-before-bind (P0-3): never steal a socket a live Plume already owns.
     // A successful connect means a real owner is listening — leave it alone. A
@@ -1550,6 +1587,10 @@ fn run_socket_server(app: AppHandle) {
     // other interactive users get their own \\.\pipe namespace, so no cross-user
     // access is granted here. A hardened DACL would belong here if Plume ever ran
     // as a service. Maps to \\.\pipe\plume.sock — the Node clients connect to the same name.
+    let _ = fs::create_dir_all(plume_dir());
+    let token = random_token();
+    *app.state::<AppState>().socket_token.lock().unwrap() = token.clone();
+    let _ = fs::write(plume_dir().join("token"), &token);
     let name = match "plume.sock".to_ns_name::<GenericNamespaced>() {
         Ok(n) => n,
         Err(_) => return,

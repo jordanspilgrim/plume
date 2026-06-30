@@ -75,6 +75,21 @@ test("a dirty_conflict from Plume surfaces as a clear, actionable message", asyn
   } finally { mcp.stop(); await fake.stop(); }
 });
 
+test("the handshake token is presented on every socket request", async () => {
+  const seen = [];
+  const fake = await startFakeSocket((req) => {
+    seen.push(req);
+    if (req.cmd === "getActiveDocument") return { ok: true, content: "x" };
+    return { ok: true };
+  });
+  const mcp = startMcp({ env: { PLUME_SOCK: fake.sockPath, PLUME_TOKEN: "secret123" }, cwd: WS });
+  try {
+    await mcp.callTool("get_active_document", {});
+    assert.ok(seen.length >= 1);
+    assert.ok(seen.every((r) => r.token === "secret123"), "every request carries the token");
+  } finally { mcp.stop(); await fake.stop(); }
+});
+
 test("get_active_document round-trips through the socket", async () => {
   const fake = await startFakeSocket((req) => {
     if (req.cmd === "getActiveDocument") return { ok: true, path: "/p.md", mode: "md", dirty: false, content: "# Hi" };

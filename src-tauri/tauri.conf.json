@@ -30,7 +30,15 @@
       "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: asset: http://asset.localhost; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": {
+          "allow": ["**"],
+          "deny": [
+            "**/.ssh/**", "**/.aws/**", "**/.gnupg/**", "**/.kube/**",
+            "**/.docker/**", "**/.config/gh/**", "**/.config/gcloud/**",
+            "**/.env", "**/.env.*", "**/.netrc", "**/.git-credentials",
+            "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*"
+          ]
+        }
       }
     }
   },

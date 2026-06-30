@@ -64,13 +64,22 @@ function refuseWrite(target, workspace, openPaths = []) {
     + `Open it in Plume first, or write to a path inside the workspace.`;
 }
 
+// Handshake token Plume writes to ~/.plume/token (0600). Read per send so a
+// freshly-launched Plume's token is picked up. PLUME_TOKEN overrides for tests.
+function authToken() {
+  if (process.env.PLUME_TOKEN !== undefined) return process.env.PLUME_TOKEN;
+  try { return fs.readFileSync(path.join(os.homedir(), ".plume", "token"), "utf8").trim(); }
+  catch { return ""; }
+}
+
 function sockOnce(reqs) {
   return new Promise((resolve, reject) => {
     const s = net.connect(SOCK);
     const out = [];
     let buf = "";
+    const token = authToken();
     s.setTimeout(5000, () => { s.destroy(); reject(new Error("timeout")); });
-    s.on("connect", () => { for (const r of reqs) s.write(JSON.stringify(r) + "\n"); });
+    s.on("connect", () => { for (const r of reqs) s.write(JSON.stringify({ ...r, token }) + "\n"); });
     s.on("data", (d) => {
       buf += d.toString("utf8");
       let i;

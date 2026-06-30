@@ -69,6 +69,22 @@ No raw-HTML passthrough. Re-audit any new `innerHTML` sink that touches doc cont
 `get_attachments` moves a malformed push to `.bad/` instead of unlinking it, so a
 corrupt write is recoverable rather than silently lost.
 
+### Socket handshake token
+At startup Plume writes a per-launch 256-bit secret to `~/.plume/token` (mode 600)
+*before* it binds the socket. Every socket request except the liveness `ping` must
+carry that token (`socket_token` check in `dispatch`); the `plume` CLI and the MCP
+server read the file per send and present it. This gates the protocol even against a
+same-user process that hasn't read the 0600 token file — belt-and-suspenders behind
+the 0600 socket. `PLUME_TOKEN` overrides the file for tests/dev.
+
+### Asset-protocol scope
+`assetProtocol.scope` is an allow/deny set: `allow: ["**"]` (the editor opens images
+from arbitrary local paths) with a `deny` list for credential material —
+`**/.ssh/**`, `**/.aws/**`, `**/.gnupg/**`, `*.pem`, `*.key`, `id_rsa*`, `.env*`,
+`.git-credentials`, etc. The CSP already keeps `asset:` out of `connect-src`, so the
+webview can't `fetch()` a local file into JS regardless; the deny list is additional
+depth against rendering secret files through `<img>`.
+
 ## MCP protocol — version-bump checklist (P2-8)
 
 The MCP server (`bin/plume-mcp.js`) is intentionally zero-dependency and pins the
@@ -93,15 +109,18 @@ If maintaining the hand-rolled server becomes burdensome, adopt
   containment + `dirty_conflict` end-to-end.
 - `test/mcp-attachments.test.js` — quarantine behavior.
 
-## Known residual risks (tracked, not yet closed)
+## Known residual risks (tracked)
 
-- **`assetProtocol.scope` is `["**"]`** — the webview can load any local file via the
-  asset protocol. Fine for an arbitrary-path image viewer; tighten if that changes.
-- **Annotation chips interpolate user-typed note text into `innerHTML`** in a few
-  places (self-authored, so self-XSS only; the CSP blunts it). Worth moving to
-  `textContent`.
 - **Rust backstop trusts the MCP-supplied `root`.** Sound against the injected-agent
   threat (the server can't be made to lie about its own `cwd`) and gated by the 0600
-  socket; a separate hostile local process is explicitly out of scope.
-- **Optional handshake token** (Plume writes `~/.plume/token` mode 600; MCP presents
-  it per call) is not implemented — it would gate the socket even if perms slipped.
+  socket + handshake token; a separate hostile process running as the user is
+  explicitly out of scope (it could act as the user directly).
+- **The asset-protocol deny list is a blocklist**, not an allowlist — it covers the
+  well-known credential locations but a novel secret path outside it would still be
+  loadable as an `<img>`. The CSP (`asset:` not in `connect-src`) is the real backstop:
+  contents can't be read into JS regardless of what renders.
+
+### Closed
+- `assetProtocol.scope` tightened to allow/deny (was `["**"]`).
+- Annotation chips now build with `textContent` (was `innerHTML`).
+- Socket handshake token implemented (was the optional item).
