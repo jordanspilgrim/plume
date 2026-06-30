@@ -30,19 +30,28 @@ function docDir(state) {
 
 function resolveSrc(state, src) {
   if (/^(https?:|data:|file:|asset:|blob:)/i.test(src)) return src;
-  const dir = docDir(state);
-  if (!dir) return null;
-  const base = dir.split("/");
-  for (const part of decodeURIComponent(src).split("/")) {
-    if (part === "" || part === ".") continue;
-    if (part === "..") base.pop();
-    else base.push(part);
+  const decoded = decodeURIComponent(src);
+  let absPath;
+  if (decoded.startsWith("/")) {
+    // Already absolute — use it as-is. Resolving it against the doc dir turned
+    // /tmp/x.png into <docDir>/tmp/x.png (the leading "" was skipped), which is
+    // what left absolute-path images broken.
+    absPath = decoded;
+  } else {
+    const dir = docDir(state);
+    if (!dir) return null;
+    const base = dir.split("/");
+    for (const part of decoded.split("/")) {
+      if (part === "" || part === ".") continue;
+      if (part === "..") base.pop();
+      else base.push(part);
+    }
+    absPath = base.join("/");
   }
   // Local files can't load via file:// from the app origin in Tauri/WKWebView;
   // route through the host's asset URL (Tauri asset protocol / Electron file://).
-  const absPath = base.join("/");
   if (window.plume && window.plume.toAssetUrl) return window.plume.toAssetUrl(absPath);
-  return "file://" + base.map(encodeURIComponent).join("/");
+  return "file://" + absPath.split("/").map(encodeURIComponent).join("/");
 }
 
 /* ---------- Mermaid ---------- */

@@ -488,7 +488,11 @@ body { display: flex; flex-direction: column; }
   font-size: 17px;
 }
 .cm-line { padding: 0; }
-.cm-cursor { border-left-color: var(--accent); border-left-width: 2px; }
+/* CodeMirror's drawSelection base theme hardcodes a solid-black .cm-cursor and only
+   lightens it when the EditorView theme is built with {dark:true} (we theme via CSS
+   vars instead), so on a dark background the caret is invisible. Force our accent —
+   same !important override the selection-background rule below already uses. */
+.cm-cursor, .cm-dropCursor { border-left-color: var(--accent) !important; border-left-width: 2px; }
 .cm-selectionBackground,
 .cm-content ::selection { background: var(--selection) !important; }
 .cm-activeLine { background: transparent; }
