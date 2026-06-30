@@ -82,6 +82,8 @@ function buildMenu({ createWindow, installCli }) {
         { label: "Strikethrough", accelerator: "CmdOrCtrl+Shift+X", click: () => send("menu:format", "strike") },
         { label: "Link", accelerator: "CmdOrCtrl+K", click: () => send("menu:format", "link") },
         { type: "separator" },
+        { label: "Add Note for Agent", accelerator: "CmdOrCtrl+J", click: () => send("menu:addNote") },
+        { type: "separator" },
         { label: "Heading 1", accelerator: "CmdOrCtrl+1", click: () => send("menu:heading", 1) },
         { label: "Heading 2", accelerator: "CmdOrCtrl+2", click: () => send("menu:heading", 2) },
         { label: "Heading 3", accelerator: "CmdOrCtrl+3", click: () => send("menu:heading", 3) },

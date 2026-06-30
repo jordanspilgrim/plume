@@ -1247,6 +1247,8 @@ function blockMenuItems() {
     { label: "Code block", fn: insertCodeBlock },
   ];
 }
+// Comment bubble (Phosphor ChatTeardropDots) for the "leave a steering note" action.
+const NOTE_ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M132,24A100.11,100.11,0,0,0,32,124v84a16,16,0,0,0,16,16h84a100,100,0,0,0,0-200ZM84,140a12,12,0,1,1,12-12A12,12,0,0,1,84,140Zm48,0a12,12,0,1,1,12-12A12,12,0,0,1,132,140Zm48,0a12,12,0,1,1,12-12A12,12,0,0,1,180,140Z"/></svg>';
 function buildSelBar() {
   selbar.innerHTML = "";
   // Lead with the block-type ("turn into") menu, then a divider, then inline formats.
@@ -1271,6 +1273,18 @@ function buildSelBar() {
     btn.addEventListener("click", b.fn);
     selbar.appendChild(btn);
   }
+  // Steering note — the entry point into the agent directive loop (also ⌘J).
+  const div2 = document.createElement("div");
+  div2.className = "sel-div";
+  selbar.appendChild(div2);
+  const noteBtn = document.createElement("button");
+  noteBtn.className = "sel-btn";
+  noteBtn.title = "Add note for the agent  (⌘J)";
+  noteBtn.setAttribute("aria-label", "Add note for the agent");
+  noteBtn.innerHTML = NOTE_ICON;
+  noteBtn.addEventListener("mousedown", (e) => e.preventDefault());
+  noteBtn.addEventListener("click", () => addAnnotation());
+  selbar.appendChild(noteBtn);
 }
 function updateSelBar() {
   const sel = view.state.selection.main;
@@ -1926,6 +1940,7 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:find": openSearchPanel(view); break;
     case "menu:replace": openSearchPanel(view); break;
     case "menu:format": applyFormat(args[0]); break;
+    case "menu:addNote": addAnnotation(); break;
     case "menu:heading": setHeading(args[0]); break;
     case "menu:toggleOutline": toggleOutline(); break;
     case "menu:toggleSidebar": toggleSidebar(); break;

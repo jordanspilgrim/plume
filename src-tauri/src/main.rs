@@ -1684,6 +1684,8 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
         .item(&mi("format:code", "Inline Code", Some("CmdOrCtrl+E"))?)
         .item(&mi("format:link", "Link", Some("CmdOrCtrl+K"))?)
         .separator()
+        .item(&mi("addNote", "Add Note for Agent", Some("CmdOrCtrl+J"))?)
+        .separator()
         .item(&mi("heading:1", "Heading 1", Some("CmdOrCtrl+1"))?)
         .item(&mi("heading:2", "Heading 2", Some("CmdOrCtrl+2"))?)
         .item(&mi("heading:3", "Heading 3", Some("CmdOrCtrl+3"))?)
