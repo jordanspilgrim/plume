@@ -15,8 +15,11 @@
   <true/>
   <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
   <true/>
-  <!-- Allow spawning the Node sidecar / plume-mcp as a child process. -->
-  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
-  <true/>
+  <!--
+    com.apple.security.cs.allow-dyld-environment-variables is intentionally NOT set.
+    Spawning the Node sidecar does not require loosening this process's dyld env, and
+    that entitlement would let a local attacker inject code via DYLD_INSERT_LIBRARIES.
+    WKWebView needs only allow-jit.
+  -->
 </dict>
 </plist>

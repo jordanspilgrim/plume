@@ -34,9 +34,12 @@
           "allow": ["**"],
           "deny": [
             "**/.ssh/**", "**/.aws/**", "**/.gnupg/**", "**/.kube/**",
-            "**/.docker/**", "**/.config/gh/**", "**/.config/gcloud/**",
+            "**/.docker/**", "**/.config/**", "**/.password-store/**",
             "**/.env", "**/.env.*", "**/.netrc", "**/.git-credentials",
-            "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*"
+            "**/.npmrc", "**/.pypirc", "**/secrets/**",
+            "**/Library/Keychains/**", "**/*.keychain*",
+            "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx", "**/*.ovpn",
+            "**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*", "**/id_dsa*"
           ]
         }
       }

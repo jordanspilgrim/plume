@@ -1,6 +1,9 @@
 import MarkdownIt from "markdown-it";
 
-const md = new MarkdownIt({ html: true, linkify: true, breaks: false, typographer: false });
+// html:false — a document is untrusted; raw <script>/<img onerror> in the source must
+// not pass through verbatim into exported HTML or the rich-text clipboard payload
+// (which then executes when opened in a browser / pasted into a permissive target).
+const md = new MarkdownIt({ html: false, linkify: true, breaks: false, typographer: false });
 
 export function mdToHtml(src) {
   return md.render(src || "");

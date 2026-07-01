@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -457,7 +458,12 @@ async fn export_pdf(app: AppHandle, html: String, default_name: Option<String>) 
 
 #[tauri::command]
 fn open_external(url: String) {
-    let _ = open::that(url);
+    // Only hand safe web/mail schemes to the OS opener. open::that would otherwise
+    // launch file://, custom app schemes (vscode://, smb://, …), etc.
+    let lower = url.trim_start().to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:") {
+        let _ = open::that(url);
+    }
 }
 
 #[tauri::command]
@@ -570,7 +576,13 @@ async fn pick_folder(app: AppHandle) -> Option<String> {
 // ~/.claude/projects/ dirs — so the agent running in that cwd finds its own.
 #[tauri::command]
 fn push_attachment(app: AppHandle, project_key: String, name: String, content: String) -> Result<String, String> {
-    let key = if project_key.trim().is_empty() { "_global".to_string() } else { project_key };
+    // Sanitize the project key to a single flat path segment — never let it contain
+    // path separators or ".." that would escape the attachments directory.
+    let cleaned: String = project_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let key = if cleaned.trim_matches('-').is_empty() { "_global".to_string() } else { cleaned };
     let dir = plume_dir().join("attachments").join(&key);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ts = std::time::SystemTime::now()
@@ -741,8 +753,83 @@ const PREVIEW_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Plume/1.0";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const PREVIEW_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) Plume/1.0";
 
+// SSRF guard: reject any address that isn't publicly routable so a document/agent
+// can't make the app fetch cloud metadata (169.254.169.254), localhost admin ports,
+// or intranet hosts.
+fn ip_is_public(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local() // 169.254.0.0/16, incl. the metadata IP
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)) // 100.64.0.0/10 CGNAT
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4() {
+                return ip_is_public(&IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg0 & 0xfe00) == 0xfc00  // fc00::/7 unique-local
+                || (seg0 & 0xffc0) == 0xfe80) // fe80::/10 link-local
+        }
+    }
+}
+
+// Parse host:port from an http(s) URL without pulling a URL crate.
+fn host_port(url: &str) -> Option<(String, u16)> {
+    let https = url.starts_with("https://");
+    let after = url.splitn(2, "://").nth(1)?;
+    let authority = after.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next()?; // strip any userinfo
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_string(), p.parse().ok()?)
+        }
+        _ => (authority.to_string(), if https { 443 } else { 80 }),
+    };
+    Some((host.trim_matches(|c| c == '[' || c == ']').to_string(), port))
+}
+
+// True only if the URL is http(s) AND every address the host resolves to is public.
+fn url_is_safe(url: &str) -> bool {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    let (host, port) = match host_port(url) {
+        Some(hp) => hp,
+        None => return false,
+    };
+    match (host.as_str(), port).to_socket_addrs() {
+        Ok(addrs) => {
+            let mut any = false;
+            for a in addrs {
+                any = true;
+                if !ip_is_public(&a.ip()) {
+                    return false; // any private/loopback record fails the whole URL
+                }
+            }
+            any
+        }
+        Err(_) => false,
+    }
+}
+
 fn fetch_preview(url: &str) -> Value {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(6)).build();
+    if !url_is_safe(url) {
+        return Value::Null;
+    }
+    // redirects(0): never follow a redirect — a public URL that 30x-redirects to an
+    // internal host is the classic SSRF-via-redirect bypass. No follow, no bypass.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(6))
+        .redirects(0)
+        .build();
     let resp = match agent
         .get(url)
         .set("User-Agent", PREVIEW_UA)
@@ -806,6 +893,13 @@ fn resolve_link(href: String, base: Option<String>) -> Option<String> {
         target.with_extension("markdown"),
     ] {
         if cand.is_file() {
+            // Don't resolve a relative link that escapes the user's home into a system
+            // location (../../../../etc/passwd). Legitimate project links stay under home.
+            let resolved = canonical_key(&cand);
+            let home = home_dir();
+            if home.as_os_str().len() > 1 && !resolved.starts_with(&home) {
+                return None;
+            }
             return Some(cand.to_string_lossy().to_string());
         }
     }
@@ -909,8 +1003,12 @@ fn search_files(dir: String, query: String) -> Vec<Value> {
 fn sidecar(path: &str) -> (PathBuf, PathBuf) {
     let p = Path::new(path);
     let dir = p.parent().unwrap_or(Path::new(".")).join(".plume");
-    let name = format!("{}.notes.json", p.file_name().unwrap().to_string_lossy());
-    let file = dir.join(name);
+    // Never unwrap: a path with no filename (e.g. "/") must not panic-abort the process.
+    let stem = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "untitled".to_string());
+    let file = dir.join(format!("{}.notes.json", stem));
     (dir, file)
 }
 
@@ -1189,6 +1287,9 @@ fn search_sessions(query: String, dir: Option<String>) -> Vec<Value> {
     }
     let mut results = vec![];
     let mut scanned = 0;
+    // One 4 MiB scratch buffer reused across candidates — not a fresh alloc per file
+    // (which churned ~2 GB of transient allocation on a full 500-candidate scan).
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
     for c in cands {
         if results.len() >= 40 || scanned > 500 {
             break;
@@ -1199,7 +1300,6 @@ fn search_sessions(query: String, dir: Option<String>) -> Vec<Value> {
             None => continue,
         };
         if let Ok(mut f) = fs::File::open(&path) {
-            let mut buf = vec![0u8; 4 * 1024 * 1024];
             if let Ok(n) = f.read(&mut buf) {
                 let text = String::from_utf8_lossy(&buf[..n]);
                 let lower = text.to_lowercase();
@@ -1376,22 +1476,64 @@ fn open_files(app: &AppHandle) -> HashSet<PathBuf> {
     set
 }
 
-// A write is allowed iff its canonical target is (a) a file Plume already has open,
-// or (b) inside the workspace root the MCP server declared (its real cwd). The agent
-// can't make the MCP server lie about its own cwd, and the socket is owner-only
-// (0600), so a prompt-injected agent can't escalate write_document into an arbitrary
-// write to ~/.ssh, a sibling repo, or a git hook. See SECURITY.md.
-fn write_allowed(app: &AppHandle, target: &Path, root: Option<&str>) -> bool {
-    if open_files(app).contains(target) {
+// Pure containment decision (unit-tested): a target is in scope iff it is one of the
+// open files, or lives inside the directory (or a subdir) of an open file. This is
+// territory the USER established by opening something — it does NOT trust any value
+// supplied by the caller. The previous design trusted a client `root` field, which a
+// raw-socket attacker could forge (root:"/Users/you") to authorize writing anywhere
+// under it — the containment bypass fixed here.
+fn path_within_open_scope(opens: &HashSet<PathBuf>, target: &Path) -> bool {
+    if opens.contains(target) {
         return true;
     }
-    if let Some(r) = root {
-        let rc = canonical_key(Path::new(r));
-        if rc.as_os_str().len() > 1 && target.starts_with(&rc) {
-            return true;
+    for f in opens {
+        if let Some(dir) = f.parent() {
+            // len > 1 rejects "/" as a scope root.
+            if dir.as_os_str().len() > 1 && target.starts_with(dir) {
+                return true;
+            }
         }
     }
     false
+}
+
+fn write_allowed(app: &AppHandle, target: &Path) -> bool {
+    path_within_open_scope(&open_files(app), target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope(paths: &[&str]) -> HashSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn open_file_and_its_directory_are_in_scope() {
+        let s = scope(&["/proj/doc.md"]);
+        assert!(path_within_open_scope(&s, Path::new("/proj/doc.md")));
+        assert!(path_within_open_scope(&s, Path::new("/proj/other.md")));
+        assert!(path_within_open_scope(&s, Path::new("/proj/sub/x.md")));
+    }
+
+    #[test]
+    fn paths_outside_open_dirs_are_refused() {
+        let s = scope(&["/proj/doc.md"]);
+        assert!(!path_within_open_scope(&s, Path::new("/Users/you/.ssh/authorized_keys")));
+        assert!(!path_within_open_scope(&s, Path::new("/etc/passwd")));
+        // component-wise prefix — a sibling directory sharing a name prefix is NOT in scope
+        assert!(!path_within_open_scope(&s, Path::new("/proj-evil/x.md")));
+        assert!(!path_within_open_scope(&s, Path::new("/proj2/x.md")));
+    }
+
+    #[test]
+    fn empty_scope_and_root_parent_authorize_nothing() {
+        assert!(!path_within_open_scope(&HashSet::new(), Path::new("/anything")));
+        // an open file directly at "/" has parent "/", which must not grant blanket access
+        let s = scope(&["/x"]);
+        assert!(!path_within_open_scope(&s, Path::new("/etc/passwd")));
+    }
 }
 
 // The renderer reports per-document dirty state so writeDocument can refuse to
@@ -1467,7 +1609,9 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
     // can check liveness without the secret.
     if cmd != "ping" {
         let expected = app.state::<AppState>().socket_token.lock().unwrap().clone();
-        if !expected.is_empty() && req["token"].as_str().unwrap_or("") != expected {
+        // Fail CLOSED: an empty/unset token denies every command rather than opening
+        // the gate. The token is written before bind, so this never blocks a live app.
+        if expected.is_empty() || req["token"].as_str() != Some(expected.as_str()) {
             return json!({ "ok": false, "error": "unauthorized" });
         }
     }
@@ -1499,19 +1643,20 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
             Some(content) if req["path"].is_string() => {
                 let p = req["path"].as_str().unwrap();
                 let target = canonical_key(Path::new(p));
-                let root = req["root"].as_str();
-                if !write_allowed(app, &target, root) {
+                if !write_allowed(app, &target) {
                     json!({ "ok": false, "code": "outside_workspace",
-                        "error": format!("refused: {} is outside the workspace and is not open in Plume", p) })
+                        "error": "refused: target is outside the open workspace (open the file or its folder in Plume first)" })
                 } else if app.state::<AppState>().dirty_files.lock().unwrap()
                     .contains(&target.to_string_lossy().to_string())
                 {
                     json!({ "ok": false, "code": "dirty_conflict",
-                        "error": format!("refused: {} has unsaved changes open in Plume — save or discard first", p) })
+                        "error": "refused: the target has unsaved changes open in Plume — save or discard first" })
                 } else {
-                    match fs::write(p, content) {
+                    // Write the canonicalized target we validated, never the raw path —
+                    // otherwise a symlink swap between check and write diverges (TOCTOU).
+                    match fs::write(&target, content) {
                         Ok(_) => json!({ "ok": true, "path": p }),
-                        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                        Err(_) => json!({ "ok": false, "error": "write failed" }),
                     }
                 }
             }
@@ -1522,7 +1667,15 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
                 app.state::<AppState>().current.lock().unwrap().clone()
             });
             match p {
-                Some(p) => json!({ "ok": true, "path": p, "annotations": load_annotations(Some(p.clone())) }),
+                Some(p) => {
+                    // Read scope = write scope: don't let a socket caller pull a
+                    // <path>.notes.json from outside the open workspace.
+                    if !write_allowed(app, &canonical_key(Path::new(&p))) {
+                        json!({ "ok": false, "error": "refused: path is outside the open workspace" })
+                    } else {
+                        json!({ "ok": true, "path": p, "annotations": load_annotations(Some(p.clone())) })
+                    }
+                }
                 None => json!({ "ok": false, "error": "no path" }),
             }
         }
@@ -1542,14 +1695,22 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
 
 // Per-connection handler: newline-delimited JSON request → response on the same
 // full-duplex stream (no try_clone — works for any Read+Write transport).
+// 32 MiB is far above any legitimate control message (incl. a large document write)
+// and bounds a no-newline flood that would otherwise buffer unboundedly (DoS).
+const MAX_SOCKET_LINE: u64 = 32 * 1024 * 1024;
+
 fn handle_conn<S: Read + Write>(app: &AppHandle, stream: S) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        let n = match reader.by_ref().take(MAX_SOCKET_LINE + 1).read_line(&mut line) {
+            Ok(0) => break,
+            Ok(n) => n as u64,
+            Err(_) => break,
+        };
+        if n > MAX_SOCKET_LINE {
+            break; // oversized line (no newline within the cap) — drop the connection
         }
         let t = line.trim();
         if t.is_empty() {

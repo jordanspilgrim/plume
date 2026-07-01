@@ -396,7 +396,9 @@ ipcMain.handle("file:rename", async (event, { newName }) => {
 });
 
 ipcMain.handle("attachment:push", async (_event, { projectKey, name, content }) => {
-  const key = projectKey && projectKey.trim() ? projectKey : "_global";
+  // Flatten the key to one safe segment — never let "/" or ".." escape the dir.
+  const cleaned = String(projectKey || "").replace(/[^A-Za-z0-9_-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  const key = cleaned || "_global";
   const dir = path.join(os.homedir(), ".plume", "attachments", key);
   await fs.mkdir(dir, { recursive: true });
   const ts = Date.now();
@@ -807,13 +809,48 @@ function decodeEntities(s) {
     });
 }
 
+const dnsp = require("node:dns").promises;
+const netmod = require("node:net");
+// SSRF guard (mirrors the Rust ip_is_public): reject non-publicly-routable addresses.
+function ipIsPublic(ip) {
+  if (netmod.isIPv4(ip)) {
+    const o = ip.split(".").map(Number);
+    if (o[0] === 0 || o[0] === 10 || o[0] === 127) return false;
+    if (o[0] === 169 && o[1] === 254) return false; // link-local incl. metadata
+    if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return false;
+    if (o[0] === 192 && o[1] === 168) return false;
+    if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return false; // CGNAT
+    if (o[0] >= 224) return false; // multicast/reserved
+    return true;
+  }
+  if (netmod.isIPv6(ip)) {
+    const l = ip.toLowerCase();
+    if (l === "::1" || l === "::") return false;
+    if (l.startsWith("fe80") || l.startsWith("fc") || l.startsWith("fd")) return false;
+    const m = l.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (m) return ipIsPublic(m[1]);
+    return true;
+  }
+  return false;
+}
+async function urlIsSafe(url) {
+  let host;
+  try { const u = new URL(url); if (!/^https?:$/.test(u.protocol)) return false; host = u.hostname; }
+  catch { return false; }
+  try {
+    const addrs = await dnsp.lookup(host, { all: true });
+    return addrs.length > 0 && addrs.every((a) => ipIsPublic(a.address));
+  } catch { return false; }
+}
+
 const previewCache = new Map();
 ipcMain.handle("link:preview", async (_e, { url }) => {
   if (!/^https?:\/\//i.test(url)) return null;
   if (previewCache.has(url)) return previewCache.get(url);
+  if (!(await urlIsSafe(url))) return null;
   try {
     const res = await fetch(url, {
-      redirect: "follow",
+      redirect: "error", // never follow a redirect (public -> internal SSRF bypass)
       headers: { "user-agent": "Mozilla/5.0 (Macintosh) Plume/1.0", accept: "text/html,*/*" },
       signal: AbortSignal.timeout(6000),
     });
@@ -922,8 +959,33 @@ app.whenReady().then(() => {
   appReady = true;
   buildMenu({ createWindow, installCli });
 
-  // The control socket: the `plume` CLI and the MCP server talk to us here.
-  controlServer = startControlServer({
+  // Server-established write scope (mirrors the Rust path_within_open_scope): the open
+  // files plus the directory of any open file. Never trusts a client-supplied root.
+  const openScopeDirs = () => {
+    const files = [];
+    for (const st of windowState.values()) if (st && st.filePath) files.push(st.filePath);
+    return files;
+  };
+  const canon = (p) => {
+    try { return fsSync.realpathSync(path.resolve(p)); }
+    catch { try { return path.join(fsSync.realpathSync(path.dirname(path.resolve(p))), path.basename(p)); } catch { return path.resolve(p); } }
+  };
+  const withinOpenScope = (target) => {
+    const t = canon(target);
+    for (const f of openScopeDirs()) {
+      const fr = canon(f);
+      if (t === fr) return true;
+      const dir = path.dirname(fr);
+      if (dir.length > 1 && (t === dir || t.startsWith(dir + path.sep))) return true;
+    }
+    return false;
+  };
+
+  // The control socket only runs in development (unpackaged). A shipped/packaged
+  // Electron build never exposes it — the Tauri app is the product surface, and this
+  // shell is a dev/test rig. PLUME_ENABLE_CONTROL forces it on if ever needed.
+  const controlEnabled = !app.isPackaged || process.env.PLUME_ENABLE_CONTROL;
+  controlServer = controlEnabled ? startControlServer({
     ping: () => ({ ok: true, version: app.getVersion() }),
     focus: () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); focusFront(); return { ok: true }; },
     open: async (req) => {
@@ -958,10 +1020,11 @@ app.whenReady().then(() => {
     },
     writeDocument: async (req) => {
       if (!req.path || typeof req.content !== "string") return { ok: false, error: "path and content required" };
-      try { await fs.writeFile(req.path, req.content, "utf8"); return { ok: true, path: req.path }; }
-      catch (err) { return { ok: false, error: String(err.message || err) }; }
+      if (!withinOpenScope(req.path)) return { ok: false, code: "outside_workspace", error: "refused: target is outside the open workspace" };
+      try { await fs.writeFile(canon(req.path), req.content, "utf8"); return { ok: true, path: req.path }; }
+      catch { return { ok: false, error: "write failed" }; }
     },
-  });
+  }) : null;
 
   // CLI arg (e.g. `electron . note.md`)
   const argPath = process.argv

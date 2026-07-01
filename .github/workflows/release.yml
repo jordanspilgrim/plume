@@ -24,18 +24,20 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Third-party actions pinned to full commit SHAs (a mutable @tag could be
+      # repointed to exfiltrate the Apple signing cert + updater key below).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 20, cache: npm }
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with: { targets: aarch64-apple-darwin,x86_64-apple-darwin }
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: "./src-tauri -> target" }
 
       - run: npm ci
       - run: npm run tauri:frontend   # compile the renderer BEFORE tauri build
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           # code signing + notarization
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -54,5 +56,7 @@ jobs:
           prerelease: false
           # Universal binary so one DMG runs on Apple Silicon + Intel.
           args: --target universal-apple-darwin
-          # tauri-action uploads the DMG + latest.json (the updater feed) to the release.
-          includeUpdaterJson: true
+          # NOTE: the auto-updater is NOT wired yet (no tauri-plugin-updater / pubkey in
+          # tauri.conf.json), so we do NOT emit latest.json — shipping an update feed the
+          # app can't verify would be worse than none. Re-enable includeUpdaterJson only
+          # once the updater plugin + pubkey are configured. See packaging/SHIP.md.

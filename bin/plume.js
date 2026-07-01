@@ -43,10 +43,11 @@ function sendOnce(reqs) {
     sock.on("connect", () => { for (const r of reqs) sock.write(JSON.stringify({ ...r, token }) + "\n"); });
     sock.on("data", (d) => {
       buf += d.toString("utf8");
+      if (buf.length > 32 * 1024 * 1024) { sock.destroy(); reject(new Error("response too large")); return; }
       let i;
       while ((i = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
-        if (line.trim()) out.push(JSON.parse(line));
+        if (line.trim()) { try { out.push(JSON.parse(line)); } catch { /* ignore malformed line */ } }
         if (out.length >= reqs.length) { sock.end(); resolve(out); return; }
       }
     });

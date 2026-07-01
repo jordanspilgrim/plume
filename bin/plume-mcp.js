@@ -72,6 +72,9 @@ function authToken() {
   catch { return ""; }
 }
 
+// Bound any single newline-delimited message so a peer can't force unbounded buffering.
+const MAX_MSG = 32 * 1024 * 1024;
+
 function sockOnce(reqs) {
   return new Promise((resolve, reject) => {
     const s = net.connect(SOCK);
@@ -82,10 +85,11 @@ function sockOnce(reqs) {
     s.on("connect", () => { for (const r of reqs) s.write(JSON.stringify({ ...r, token }) + "\n"); });
     s.on("data", (d) => {
       buf += d.toString("utf8");
+      if (buf.length > MAX_MSG) { s.destroy(); reject(new Error("response too large")); return; }
       let i;
       while ((i = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
-        if (line.trim()) out.push(JSON.parse(line));
+        if (line.trim()) { try { out.push(JSON.parse(line)); } catch { /* ignore malformed line */ } }
         if (out.length >= reqs.length) { s.end(); resolve(out); return; }
       }
     });
@@ -190,7 +194,9 @@ const TOOLS = [
       } catch { /* best-effort; cwd containment still applies */ }
       const refusal = refuseWrite(a.path, WORKSPACE, open);
       if (refusal) return refusal;
-      const r = await plume({ cmd: "writeDocument", path: a.path, content: a.content, root: WORKSPACE });
+      // Note: Plume's Rust authority re-checks containment against its OWN open-file
+      // scope and does NOT trust any client-supplied root — so we don't send one.
+      const r = await plume({ cmd: "writeDocument", path: a.path, content: a.content });
       if (r.ok) return `Wrote ${a.path}.`;
       if (r.code === "dirty_conflict") return `Not written: ${a.path} has unsaved changes open in Plume. Ask the user to save or discard them first, then retry.`;
       if (r.code === "outside_workspace") return `Refused by Plume: ${a.path} is outside the workspace and is not open in Plume.`;
@@ -300,6 +306,7 @@ function startServer() {
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (chunk) => {
     stdinBuf += chunk;
+    if (stdinBuf.length > MAX_MSG) { stdinBuf = ""; return; } // drop an oversized/no-newline flood
     let i;
     while ((i = stdinBuf.indexOf("\n")) >= 0) {
       const line = stdinBuf.slice(0, i); stdinBuf = stdinBuf.slice(i + 1);

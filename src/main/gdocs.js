@@ -165,7 +165,10 @@ function runOAuthFlow(creds, openUrl) {
         const port = server.address().port;
         const tok = await exchangeCode(creds, code, `http://127.0.0.1:${port}`);
         await fs.mkdir(path.dirname(TOKEN_FILE), { recursive: true });
-        await fs.writeFile(TOKEN_FILE, JSON.stringify(tok));
+        await fs.chmod(path.dirname(TOKEN_FILE), 0o700).catch(() => {});
+        // Owner-only: this is a long-lived Google refresh token.
+        await fs.writeFile(TOKEN_FILE, JSON.stringify(tok), { mode: 0o600 });
+        await fs.chmod(TOKEN_FILE, 0o600).catch(() => {});
         resolve(tok.refresh_token);
       } catch (e) { reject(e); }
     });

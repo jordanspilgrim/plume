@@ -37,6 +37,7 @@ function startControlServer(handlers) {
     let buf = "";
     sock.on("data", (chunk) => {
       buf += chunk;
+      if (buf.length > 32 * 1024 * 1024) { sock.destroy(); return; } // bound a no-newline flood
       let idx;
       while ((idx = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, idx);

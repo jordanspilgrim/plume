@@ -1376,7 +1376,12 @@ function openMenu(anchor, items) {
     if (it.sep) { const s = document.createElement("div"); s.className = "tb-menu-sep"; menu.appendChild(s); continue; }
     const row = document.createElement("button");
     row.className = "tb-menu-item" + (it.checked ? " checked" : "");
-    row.innerHTML = `<span class="tbm-check">${it.checked ? "✓" : ""}</span><span>${it.label}</span>`;
+    // textContent, not innerHTML: it.label can carry untrusted text (e.g. a session
+    // title derived from a transcript), and event-handler attributes like onerror=
+    // are NOT blocked by the CSP. Build the row as text nodes.
+    const check = document.createElement("span"); check.className = "tbm-check"; check.textContent = it.checked ? "✓" : "";
+    const label = document.createElement("span"); label.textContent = it.label;
+    row.append(check, label);
     row.addEventListener("mousedown", (e) => e.preventDefault());
     row.addEventListener("click", () => { closeToolbarMenu(); it.fn(); view.focus(); });
     menu.appendChild(row);

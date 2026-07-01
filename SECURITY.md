@@ -20,21 +20,28 @@ scoping what the agent path itself can do.
 
 ## Controls
 
-### Write containment (P0-1) — `write_document`
-A write is allowed only if its **canonical** target is either:
-- a file Plume currently has open, or
-- inside the **workspace root** the MCP server was spawned in (its real `cwd`).
+### Write & read containment (P0-1) — server-authoritative
+A write (`writeDocument`) or annotation read (`getAnnotations`) is allowed only if its
+**canonical** target is either a file Plume currently has open, or inside the
+**directory of an open file**. This scope is established entirely by the user opening
+something — it does **not** trust any value supplied by the caller.
 
-Enforced in two places:
-- **MCP server** (`bin/plume-mcp.js`, `refuseWrite`) — the primary boundary. The
-  agent cannot change the server's `cwd`, so anchoring to it is sound against the
-  injected-agent threat. Refusals are returned to the agent as a clear message.
-- **Rust backstop** (`src-tauri/src/main.rs`, `write_allowed`) — re-checks against
-  Plume's authoritative open-file set plus the `root` the request declares. Paths are
-  canonicalized (symlinks/`..` resolved) so the check can't be bypassed.
+An earlier design trusted a client-supplied `root` field. That was wrong: the adversary
+speaks the raw socket and could forge `root:"/Users/you"` to authorize writing anywhere
+under it (an adversarial review caught this). `write_allowed` / `path_within_open_scope`
+(`src-tauri/src/main.rs`) now derive the scope from `open_files()` only, and the write
+targets the **canonicalized** path that was validated (never the raw request path — that
+closes the check-vs-write TOCTOU). The pure decision is unit-tested (`cargo test`).
 
-Result: a manipulated agent cannot use `write_document` to overwrite `~/.ssh/...`,
-a sibling repository, or `.git/hooks/*`.
+- **Rust authority** is the boundary — independent of any client.
+- **MCP server** (`bin/plume-mcp.js`, `refuseWrite`) additionally refuses out-of-cwd
+  writes up front so the agent gets a clear message; it is a convenience layer, not the
+  boundary, and sends no `root`.
+
+Result: neither a prompt-injected agent nor a raw-socket client can use the protocol to
+overwrite `~/.ssh/...`, a sibling repo, or `.git/hooks/*`, or to read a `.notes.json`
+outside the open workspace. (Reading a file the user themselves opens is inherent editor
+behavior and is user-visible — `open` brings the file to the front.)
 
 ### Socket permissions (P0-2)
 `~/.plume` is `chmod 700` and `~/.plume/plume.sock` is `chmod 600` after bind, so no
@@ -109,18 +116,43 @@ If maintaining the hand-rolled server becomes burdensome, adopt
   containment + `dirty_conflict` end-to-end.
 - `test/mcp-attachments.test.js` — quarantine behavior.
 
+## Additional controls (from the adversarial review)
+
+- **SSRF guard** — `link_preview` (Rust + Electron) resolves the host and refuses any
+  non-public address (loopback, RFC-1918, `169.254/16` incl. cloud metadata, ULA,
+  link-local, CGNAT), and does **not** follow redirects (a public→internal redirect is
+  the classic bypass).
+- **DoS bounds** — the socket readers cap a single message at 32 MiB (no unbounded
+  no-newline flood), `sidecar()` no longer `unwrap()`s on a path with no filename, and
+  `search_sessions` reuses one scratch buffer instead of allocating 4 MiB per candidate.
+- **Token fails closed** — an empty/unset socket token now denies every command.
+- **`open_external`** only launches `http(s)`/`mailto` (never `file:`/custom schemes).
+- **`resolve_link`** refuses relative links that escape the user's home into `/etc` etc.
+- **`push_attachment`** project keys are flattened to one safe path segment.
+- **Export/clipboard** markdown uses `html:false` — raw `<script>` in a doc can't ride
+  into exported HTML.
+- **Google refresh token** is written `0600` under a `0700` dir.
+- **Electron control socket** runs only in dev (unpackaged); a shipped build never
+  exposes it, and its `writeDocument` is containment-checked.
+- **CI actions** are pinned to full commit SHAs; the `allow-dyld-environment-variables`
+  entitlement is removed; the unwired auto-updater feed is no longer emitted.
+
 ## Known residual risks (tracked)
 
-- **Rust backstop trusts the MCP-supplied `root`.** Sound against the injected-agent
-  threat (the server can't be made to lie about its own `cwd`) and gated by the 0600
-  socket + handshake token; a separate hostile process running as the user is
-  explicitly out of scope (it could act as the user directly).
-- **The asset-protocol deny list is a blocklist**, not an allowlist — it covers the
-  well-known credential locations but a novel secret path outside it would still be
-  loadable as an `<img>`. The CSP (`asset:` not in `connect-src`) is the real backstop:
-  contents can't be read into JS regardless of what renders.
+- **Local images render as `<img>`** (a requested feature), so a document can probe
+  file *existence/size* (not contents) for non-secret paths. The asset-protocol deny
+  list blocks credential locations and the CSP keeps `asset:` out of `connect-src`
+  (bytes can't reach JS). Full closure would require dropping absolute-path images.
+- **Remote images auto-load** (standard editor behavior) — a tracking-beacon vector.
+  A "block remote images" setting is a reasonable future opt-in.
+- **A separate hostile process running as the user** is out of scope — it can act as
+  the user directly; the 0600 socket + token raise the bar for *other* users only.
+- **Owner actions before publishing:** fill the real Homebrew `sha256` (not the
+  placeholder) and reserve the `@plume/mcp` npm name to prevent squatting.
 
-### Closed
-- `assetProtocol.scope` tightened to allow/deny (was `["**"]`).
-- Annotation chips now build with `textContent` (was `innerHTML`).
-- Socket handshake token implemented (was the optional item).
+### Closed (this review)
+- Client-supplied `root` no longer trusted; write targets the canonical path (TOCTOU).
+- Read containment on `getAnnotations`; SSRF guard; DoS bounds; token fail-closed;
+  `open_external` scheme allowlist; export `html:false`; menu XSS → `textContent`;
+  gdocs token `0600`; Electron socket dev-gated + contained; CI SHAs; dyld entitlement
+  dropped; updater feed removed. Earlier: asset deny-list, annotation chip, handshake token.

@@ -26,7 +26,7 @@ test("open_in_plume relays an `open` command and reports success", async () => {
   } finally { mcp.stop(); await fake.stop(); }
 });
 
-test("write_document inside the workspace reaches Plume WITH a root field", async () => {
+test("write_document inside the workspace reaches Plume without a trusted client root", async () => {
   const written = [];
   const fake = await startFakeSocket((req) => {
     if (req.cmd === "listOpenFiles") return { ok: true, files: [] };
@@ -39,8 +39,8 @@ test("write_document inside the workspace reaches Plume WITH a root field", asyn
     const out = await mcp.callTool("write_document", { path: target, content: "hi" });
     assert.match(out, /Wrote/);
     assert.equal(written.length, 1);
-    // The Rust backstop relies on this field — its absence would weaken containment.
-    assert.equal(written[0].root, WS, "writeDocument carries the workspace root");
+    // Rust re-checks containment against its own open-file scope; no client root is sent.
+    assert.equal(written[0].root, undefined, "no client-supplied root is trusted");
     assert.equal(written[0].content, "hi");
   } finally { mcp.stop(); await fake.stop(); }
 });
