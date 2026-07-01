@@ -61,8 +61,14 @@ edits; the agent is told to ask the user to save or discard first.
 
 ### Content Security Policy (P1-5)
 `src-tauri/tauri.conf.json` sets an explicit CSP (the Tauri build strips the HTML
-`<meta>` CSP and defers to the config). `object-src 'none'`, `base-uri 'self'`,
-`frame-ancestors 'none'`, no remote script. Defense-in-depth behind the sanitizer.
+`<meta>` CSP and defers to the config). `script-src 'self'` with **no `'unsafe-eval'`**
+(verified: the bundle uses zero `eval`/`new Function`, and mermaid/katex/CodeMirror
+render fine without it), `object-src 'none'`, `base-uri 'self'`, `frame-ancestors 'none'`,
+no remote script. `connect-src` allows only `'self' ipc: blob: data:` — **no `https:`**,
+so even if an XSS ever slipped past the sanitizer it has no `fetch()` exfil channel (the
+only browser fetch is `blob:`/`data:` image inlining). Defense-in-depth behind the
+sanitizer. Note: `img-src https:` remains (for remote images, a feature) and is an
+inherent GET-length-limited exfil channel — see residual risks.
 
 ### Renderer sanitization (audited)
 Document and agent-transcript content is treated as untrusted. All HTML-producing
@@ -76,13 +82,16 @@ No raw-HTML passthrough. Re-audit any new `innerHTML` sink that touches doc cont
 `get_attachments` moves a malformed push to `.bad/` instead of unlinking it, so a
 corrupt write is recoverable rather than silently lost.
 
-### Socket handshake token
+### Socket handshake token — the outer gate, not the boundary
 At startup Plume writes a per-launch 256-bit secret to `~/.plume/token` (mode 600)
 *before* it binds the socket. Every socket request except the liveness `ping` must
-carry that token (`socket_token` check in `dispatch`); the `plume` CLI and the MCP
-server read the file per send and present it. This gates the protocol even against a
-same-user process that hasn't read the 0600 token file — belt-and-suspenders behind
-the 0600 socket. `PLUME_TOKEN` overrides the file for tests/dev.
+carry it (checked in `dispatch`, **fails closed**); the `plume` CLI and MCP server read
+the file per send. This stops other Unix users and casual same-user processes that
+haven't read the token. It does **not** stop a *hostile* same-user process — any code
+running as the user can read the 0600 file. That's expected and fine: the token is the
+outer gate, and **containment (above) is the load-bearing control**. Even a caller
+holding a valid token can only write/read within what the user has opened in Plume —
+the token doesn't widen that scope. `PLUME_TOKEN` overrides the file for tests/dev.
 
 ### Asset-protocol scope
 `assetProtocol.scope` is an allow/deny set: `allow: ["**"]` (the editor opens images
