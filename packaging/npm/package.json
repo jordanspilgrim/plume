@@ -1,0 +1,18 @@
+{
+  "name": "plume-mcp",
+  "version": "0.1.0",
+  "description": "MCP server + CLI for Plume — the human pane for agentic coding. Open files in the Plume editor, read the user's typed steering directives, and write revisions they review as an accept/reject diff.",
+  "bin": {
+    "plume-mcp": "bin/plume-mcp.js",
+    "plume": "bin/plume.js"
+  },
+  "files": ["bin", "README.md"],
+  "scripts": {
+    "prepack": "node prepack.js"
+  },
+  "keywords": ["mcp", "model-context-protocol", "plume", "markdown", "editor", "agent", "claude-code"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "github:jordanspilgrim/plume" },
+  "homepage": "https://github.com/jordanspilgrim/plume",
+  "engines": { "node": ">=18" }
+}

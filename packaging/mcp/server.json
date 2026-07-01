@@ -11,7 +11,7 @@
   "packages": [
     {
       "registryType": "npm",
-      "identifier": "@plume/mcp",
+      "identifier": "plume-mcp",
       "version": "0.1.0",
       "transport": { "type": "stdio" },
       "runtimeHint": "node"
@@ -28,7 +28,7 @@
         { "name": "write_document", "description": "Write a revision; the user reviews it as an accept/reject diff." },
         { "name": "get_attachments", "description": "Files the user pushed to this project's agent from Plume." }
       ],
-      "install": "Install Plume, then run `claude mcp add plume -- plume-mcp` (or `codex mcp add` / `gemini mcp add`). Until @plume/mcp is published to npm, plume-mcp ships with the Plume app (File ▸ Install 'plume' Shell Command…).",
+      "install": "Install the Plume app, then `npm install -g plume-mcp` and `claude mcp add plume -- plume-mcp` (or `codex mcp add` / `gemini mcp add`). plume-mcp also ships inside the Plume app (File ▸ Install 'plume' Shell Command…).",
       "agents": ["Claude Code", "Codex CLI", "Gemini CLI"]
     }
   }

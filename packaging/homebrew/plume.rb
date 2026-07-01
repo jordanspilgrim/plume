@@ -16,9 +16,10 @@ cask "plume" do
   desc "Human pane for agentic coding — a markdown editor wired into the agent loop"
   homepage "https://github.com/jordanspilgrim/plume"
 
-  # Auto-update is handled in-app (tauri-plugin-updater); tell Homebrew so it
-  # doesn't fight the app's own updater.
-  auto_updates true
+  # The in-app auto-updater is NOT wired yet (no tauri-plugin-updater / pubkey), so
+  # Homebrew manages upgrades via `brew upgrade --cask plume`. Flip to `auto_updates
+  # true` only once the updater is actually configured (see release.yml / SECURITY.md).
+  auto_updates false
   depends_on macos: ">= :big-sur"
 
   app "Plume.app"
