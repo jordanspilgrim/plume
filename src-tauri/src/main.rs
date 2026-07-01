@@ -158,6 +158,7 @@ fn spawn_window(app: &AppHandle, file_path: &str) -> Result<(), String> {
     st.window_files.lock().unwrap().insert(label.clone(), file_path.to_string());
     let builder = tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("index.html".into()))
         .title("Plume")
+        .focused(true) // a newly opened doc window comes to the front, not behind
         .inner_size(920.0, 720.0)
         .min_inner_size(480.0, 320.0);
     // The overlay title bar + hidden title are macOS-only builder methods.
@@ -469,10 +470,8 @@ async fn open_dialog(app: AppHandle) -> Option<String> {
         .blocking_pick_file()?;
     let path = picked.into_path().ok()?;
     let p = path.to_string_lossy().to_string();
-    if let Ok(content) = fs::read_to_string(&p) {
-        let recovery = recovery_for(&p);
-        set_current(&app, &p, &content);
-        let _ = app.emit("file-opened", json!({ "filePath": p, "content": content, "recovery": recovery }));
+    if Path::new(&p).is_file() {
+        deliver_open(&app, &p, None);
     }
     Some(p)
 }
@@ -1409,6 +1408,33 @@ fn set_doc_dirty(state: tauri::State<AppState>, path: Option<String>, dirty: boo
     }
 }
 
+// The window that should receive an open request: the focused one, else main.
+fn focused_or_main(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    app.webview_windows()
+        .into_values()
+        .find(|w| w.is_focused().unwrap_or(false))
+        .or_else(|| app.get_webview_window("main"))
+}
+
+// Route an open to ONE window's smartOpen (reuse it if it's an empty/untitled
+// buffer, else spawn a new window on top), then bring it forward. Replaces the old
+// global `emit("file-opened")` broadcast, which loaded the doc into every window and
+// then focused "main" regardless of where it went — the cause of both the
+// opens-behind and the intermittent replace-the-foreground-window bugs.
+fn deliver_open(app: &AppHandle, path: &str, line: Option<i64>) {
+    let payload = json!({ "path": path, "line": line });
+    if let Some(win) = focused_or_main(app) {
+        let label = win.label().to_string();
+        let _ = app.emit_to(&label, "open-file", payload); // this window only
+        let _ = win.show();
+        let _ = win.set_focus();
+    } else {
+        let appc = app.clone();
+        let p = path.to_string();
+        let _ = app.run_on_main_thread(move || { let _ = spawn_window(&appc, &p); });
+    }
+}
+
 // ---- control socket (the `plume` CLI + MCP server talk here) ----
 fn focus_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -1461,14 +1487,11 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
                 }
             }
             if let Some(p) = req["path"].as_str() {
-                if let Ok(content) = fs::read_to_string(p) {
-                    set_current(app, p, &content);
-                    let line = req["line"].clone();
-                    let _ = app.emit("file-opened", json!({ "filePath": p, "content": content, "gotoLine": line }));
-                    focus_main(app);
-                    return json!({ "ok": true });
+                if !Path::new(p).is_file() {
+                    return json!({ "ok": false, "error": "cannot read file" });
                 }
-                return json!({ "ok": false, "error": "cannot read file" });
+                deliver_open(app, p, req["line"].as_i64());
+                return json!({ "ok": true });
             }
             json!({ "ok": false, "error": "no path" })
         }
@@ -1726,12 +1749,7 @@ fn open_external_file(app: &AppHandle, p: &str) {
     if !Path::new(p).is_file() {
         return;
     }
-    if let Ok(content) = fs::read_to_string(p) {
-        let recovery = recovery_for(p);
-        set_current(app, p, &content);
-        let _ = app.emit("file-opened", json!({ "filePath": p, "content": content, "recovery": recovery }));
-        focus_main(app);
-    }
+    deliver_open(app, p, None);
 }
 
 fn main() {

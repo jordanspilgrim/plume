@@ -1676,8 +1676,8 @@ function clearRecents() {
 // only if it's an empty/untitled scratch window (e.g. the welcome screen);
 // otherwise open in a new window. Used by recents / palette file-open / Open Recent
 // menu. (Sidebar stays in-place navigation; search/session keep their line jump.)
-function smartOpen(path) {
-  if (!currentPath && view.state.doc.length === 0) window.plume.openInThisWindow(path);
+function smartOpen(path, line) {
+  if (!currentPath && view.state.doc.length === 0) window.plume.openInThisWindow(path, line);
   else window.plume.openInNewWindow(path);
 }
 function recentItems(term) {

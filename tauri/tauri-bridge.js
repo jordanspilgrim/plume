@@ -18,6 +18,13 @@ listen("file-opened", (e) => {
 });
 listen("file-changed", (e) => { if (onExternalChange) onExternalChange(e.payload); });
 listen("folder-opened", (e) => { if (onFolderOpen) onFolderOpen(e.payload); });
+// Native side (CLI / double-click / File>Open) asks THIS window to open a path.
+// Route through smartOpen so an empty window is reused and anything else opens a new
+// window on top — instead of the old global broadcast that hit every window.
+listen("open-file", (e) => {
+  const { path, line } = e.payload || {};
+  if (path && window.__plume && window.__plume.smartOpen) window.__plume.smartOpen(path, line);
+});
 listen("menu", (e) => { if (onMenuCb) onMenuCb(e.payload.channel, e.payload.arg); });
 
 // Agent round-trip: the control socket asks the renderer for live state.
