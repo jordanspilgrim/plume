@@ -18,6 +18,9 @@ import { annotField, setAnnotRanges, locateQuote } from "./editor/annotations.js
 import { computeSegments, applySegments, hunkCount } from "./diff.js";
 import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from "./editor/viewers.js";
 import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
+import {
+  createTab, findTab, addTab, closeTab, cycleTabId, tabDisplayName, isCapturedDirty, isBlankTab,
+} from "./tabs-model.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
 import "@fontsource-variable/inter/index.css";
@@ -39,6 +42,7 @@ import "@fontsource/jetbrains-mono/700.css";
 let savedText = "";
 let currentPath = null;
 let pendingName = null; // a name set via the title bar before an untitled doc is materialized
+let windowEverHadPath = false; // this window has shown a path-backed doc (see snapshot guard)
 const appEl = document.getElementById("app");
 const titlebar = document.getElementById("titlebar");
 const titlebarName = document.getElementById("titlebar-name");
@@ -146,9 +150,17 @@ function scheduleSideEffects() {
     updateStatus();
   }, 120);
 
-  // Crash-recovery snapshot (path-backed docs only; main ignores untitled).
+  // Crash-recovery snapshot (path-backed docs; untitled buffers snapshot to a
+  // per-window slot on the native side — see untitledRecovery()).
   if (snapshotTimer) clearTimeout(snapshotTimer);
-  snapshotTimer = setTimeout(() => window.plume.snapshot(view.state.doc.toString()), 700);
+  snapshotTimer = setTimeout(() => {
+    // Guard: an untitled TAB in a window that previously showed a file — the
+    // native side's per-window doc binding still points at that file, so a
+    // snapshot would be misfiled into ITS recovery slot. Skip until the native
+    // side grows a detachDoc() to clear the binding (requested from be-dev).
+    if (!currentPath && windowEverHadPath && !window.plume.detachDoc) return;
+    window.plume.snapshot(view.state.doc.toString());
+  }, 700);
 
   // Autosave the open file after a short idle.
   if (autosaveTimer) clearTimeout(autosaveTimer);
@@ -196,6 +208,7 @@ async function autosave() {
 function setDirty(dirty) {
   titlebar.classList.toggle("dirty", dirty);
   window.plume.setDirty(dirty);
+  if (tabs.length > 1) renderTabbar(); // keep the active tab's dirty dot honest
 }
 
 // Flush a save when the window loses focus, so nothing is lost on app switch.
@@ -206,6 +219,7 @@ function setTitle(pathOrNull) {
   currentPath = pathOrNull;
   const name = pathOrNull ? pathOrNull.split("/").pop() : (pendingName || "Untitled");
   document.title = name;
+  if (tabs.length > 1) renderTabbar(); // active tab label follows the title
   if (titlebarName.classList.contains("editing")) return; // don't clobber an in-progress rename
   titlebarName.textContent = name;
 }
@@ -551,7 +565,9 @@ function toggleSourceView() {
 }
 
 function applyMode(filePath, content) {
-  let mode = modeForPath(filePath);
+  // No path = an untitled scratch buffer, which is always markdown
+  // (modeForPath("") would say "code").
+  let mode = filePath ? modeForPath(filePath) : "markdown";
   // Gemini sessions are .json (→ code mode); route transcript content to the
   // conversation view like Claude/Codex .jsonl.
   if (mode === "code" && content && looksLikeTranscript(content)) mode = "jsonl";
@@ -586,9 +602,10 @@ function applyMode(filePath, content) {
       codeConf.reconfigure(codeFeatures),
     ]});
   }
-  // Markdown-only chrome: hide the Share menu + selection bubble + slash menu in code/data modes.
+  // Markdown-only chrome: hide the Share menu + toolbar + selection bubble + slash menu in code/data modes.
   const tools = document.getElementById("titlebar-tools");
   if (tools) tools.style.display = mode === "markdown" ? "" : "none";
+  updateToolbarVisibility();
   const sb = document.getElementById("selbar");
   closeSlash();
   if (mode !== "markdown") {
@@ -652,19 +669,78 @@ async function copyAsHtml() {
     flashMessage("Copied HTML source");
   } catch (e) { flashMessage("Copy failed: " + e.message); }
 }
+/* ---------- Export runtime enablement (pkg-dev contract, PR #2) ----------
+   docx export + Google publish run through a Node sidecar. For external users
+   without Node, pkg-dev bundles a one-time managed download; the renderer owns
+   the prompt + progress UI. Every bridge call is optional-chained, so until
+   pkg-dev's branch lands this is byte-identical to the old behavior. PDF/HTML
+   export is native and must never enter this path. */
+let nodeInstallBannerUp = false;
+window.plume.onNodeInstallProgress?.((p) => {
+  if (p.phase === "done") {
+    if (nodeInstallBannerUp) { nodeInstallBannerUp = false; clearBanner(); }
+    return;
+  }
+  nodeInstallBannerUp = true;
+  const mb = (n) => Math.max(1, Math.round(n / 1048576));
+  bannerEl.className = "";
+  bannerEl.textContent =
+    p.phase === "download"
+      ? (p.total ? `Downloading export helper… ${mb(p.received)} MB of ${mb(p.total)} MB` : "Downloading export helper…")
+      : p.phase === "verify" ? "Verifying export helper…"
+      : "Setting up export helper…";
+});
+// True when docx/publish can proceed. Prompts for (and runs) the one-time
+// download when the helper is missing; call BEFORE any save dialog.
+async function ensureExportRuntime() {
+  if (!window.plume.nodeStatus) return true; // contract not landed → old behavior
+  const st = await window.plume.nodeStatus().catch(() => null);
+  if (!st || st.available) return true;
+  const choice = await askConfirm({
+    message: "Enable export?",
+    detail: "Exporting to Word and publishing to Google Docs uses a small helper that needs a one-time ~40 MB download.",
+    buttons: [
+      { label: "Download & Enable", kind: "primary", value: "enable" },
+      { label: "Cancel", kind: "ghost", value: "cancel" },
+    ],
+  });
+  if (choice !== "enable") return false;
+  const r = await window.plume.installNode().catch((e) => ({ ok: false, error: String(e) }));
+  nodeInstallBannerUp = false;
+  clearBanner();
+  if (r?.ok) return true;
+  flashMessage(
+    r?.code === "IN_PROGRESS"
+      ? "The export helper is already downloading — try again in a moment."
+      : "Couldn't enable export: " + (r?.error || "download failed") + " — check your connection and try again."
+  );
+  return false;
+}
+
 async function exportAs(format) {
+  if (format === "docx" && !(await ensureExportRuntime())) return;
   const html = fullHtmlDocument(mdToHtml(view.state.doc.toString()), docBaseName());
   const result = await window.plume.exportDoc(format, html, docBaseName());
   if (result) flashMessage("Exported " + result.split("/").pop());
 }
-async function publishGoogle() {
+async function publishGoogle(retried = false) {
   if (currentMode !== "markdown") { flashMessage("Publish to Google Docs works on Markdown documents."); return; }
+  if (!(await ensureExportRuntime())) return;
   flashMessage("Publishing to Google Docs…");
-  await window.plume.publishGoogle(view.state.doc.toString(), docBaseName());
+  const r = await window.plume.publishGoogle(view.state.doc.toString(), docBaseName());
+  // Belt-and-braces: raced past the status check and the sidecar was missing —
+  // run the enable flow once, then retry the publish.
+  if (!retried && r && r.ok === false && r.code === "NODE_MISSING") {
+    if (await ensureExportRuntime()) return publishGoogle(true);
+  }
 }
 
 /* ---------- File I/O ---------- */
 function loadDocument(content, filePath, recovery, gotoLine) {
+  // Tab switch in flight? A captured (possibly dirty) buffer for this exact
+  // path is restored on top of the disk content loaded below.
+  const restore = pendingTabRestore && pendingTabRestore.path === filePath ? pendingTabRestore : null;
+  if (restore) pendingTabRestore = null;
   applyMode(filePath, content);
   savedText = content;
   view.dispatch({
@@ -673,7 +749,7 @@ function loadDocument(content, filePath, recovery, gotoLine) {
   });
   setDocPath(view, filePath);
   setTitle(filePath);
-  if (filePath) recordRecent(filePath);
+  if (filePath) { windowEverHadPath = true; recordRecent(filePath); }
   setDirty(false);
   renderOutline();
   updateStatus();
@@ -686,6 +762,23 @@ function loadDocument(content, filePath, recovery, gotoLine) {
     const ln = view.state.doc.line(Math.max(1, Math.min(gotoLine, view.state.doc.lines)));
     view.dispatch({ selection: { anchor: ln.from }, effects: EditorView.scrollIntoView(ln.from, { y: "center" }) });
   }
+  if (restore) {
+    // Unsaved edits from when this tab was backgrounded win over disk content;
+    // savedText stays the disk content, so the dirty flag recomputes correctly.
+    if (restore.text != null && restore.text !== content) {
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: restore.text } });
+    }
+    const len = view.state.doc.length;
+    const anchor = Math.min(restore.sel?.anchor ?? 0, len);
+    const head = Math.min(restore.sel?.head ?? anchor, len);
+    view.dispatch({ selection: { anchor, head } });
+    view.scrollDOM.scrollTop = restore.scrollTop || 0;
+  }
+  // Keep the active tab's record pointing at what this window now shows
+  // (in-place navigation from the sidebar retargets the current tab).
+  const at = findTab(tabs, activeTabId);
+  if (at) { at.path = filePath || null; at.pendingName = null; at.text = null; at.savedText = null; }
+  renderTabbar();
   refreshSidebar();
   view.focus();
 }
@@ -1041,6 +1134,13 @@ function toggleLinePrefix(test, makePrefix) {
   view.focus();
 }
 
+// Named line-prefix toggles — shared by the toolbar, native Format menu
+// (menu:list / menu:block), slash menu, and the selection bubble's block menu.
+function toggleBulletList() { toggleLinePrefix(/^\s*[-*+] /, () => "- "); }
+function toggleOrderedList() { toggleLinePrefix(/^\s*\d+\. /, (i) => `${i + 1}. `); }
+function toggleTaskList() { toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] "); }
+function toggleQuote() { toggleLinePrefix(/^> ?/, () => "> "); }
+
 function freshLinePrefix(from) {
   if (from === 0) return "";
   const line = view.state.doc.lineAt(from);
@@ -1146,6 +1246,51 @@ const INLINE_FORMATS = [
   { t: "Link  ⌘K", svg: "link", fn: () => applyFormat("link") },
 ];
 
+/* ---------- Persistent formatting toolbar (#3 — visible chrome) ---------- */
+// A non-Markdown user must be able to format without knowing any syntax. The
+// contextual selection bubble still exists; this row is the always-visible
+// entry point. Markdown mode only; toggleable (View menu / Settings / palette),
+// on by default.
+const toolbarEl = document.getElementById("toolbar");
+function toolbarEnabled() { return localStorage.getItem("plume-toolbar") !== "0"; }
+function applyToolbarSetting(on) {
+  localStorage.setItem("plume-toolbar", on ? "1" : "0");
+  updateToolbarVisibility();
+}
+function updateToolbarVisibility() {
+  toolbarEl.classList.toggle("hidden", !(currentMode === "markdown" && toolbarEnabled()));
+}
+function buildToolbar() {
+  toolbarEl.innerHTML = "";
+  const btn = (title, html, fn, { menu = false, stroke = false } = {}) => {
+    const b = document.createElement("button");
+    b.className = "tb-btn tb-item" + (menu ? " has-menu" : "") + (stroke ? " tb-stroke" : "");
+    b.title = title;
+    b.setAttribute("aria-label", title.replace(/\s+[⌘⇧⌃].*$/u, ""));
+    b.innerHTML = html + (menu ? CHEV_TT : "");
+    b.addEventListener("mousedown", (e) => e.preventDefault()); // keep editor selection/focus
+    b.addEventListener("click", () => fn(b));
+    toolbarEl.appendChild(b);
+    return b;
+  };
+  const sep = () => { const s = document.createElement("div"); s.className = "sel-div"; toolbarEl.appendChild(s); };
+
+  btn("Turn into…  (heading, list, quote, code)", BLOCK_ICON, (b) => openMenu(b, blockMenuItems()), { menu: true });
+  sep();
+  for (const f of INLINE_FORMATS) btn(f.t, ICONS[f.svg], f.fn);
+  sep();
+  btn("Bullet list  ⌘⇧8", SLASH_ICONS.bullet, toggleBulletList, { stroke: true });
+  btn("Numbered list  ⌘⇧7", SLASH_ICONS.numbered, toggleOrderedList, { stroke: true });
+  btn("To-do list", SLASH_ICONS.todo, toggleTaskList, { stroke: true });
+  sep();
+  btn("Quote", SLASH_ICONS.quote, toggleQuote, { stroke: true });
+  btn("Code block", SLASH_ICONS.code, insertCodeBlock, { stroke: true });
+  btn("Table", SLASH_ICONS.table, insertTable, { stroke: true });
+  btn("Divider (horizontal rule)", SLASH_ICONS.hr, insertHR, { stroke: true });
+  btn("Insert image…", SLASH_ICONS.image, insertImageViaPicker, { stroke: true });
+  updateToolbarVisibility();
+}
+
 /* ---------- Fonts ---------- */
 const FONTS = [
   { id: "inter", label: "Inter", stack: '"Inter Variable", "Inter", -apple-system, sans-serif' },
@@ -1239,10 +1384,10 @@ function blockMenuItems() {
     { label: "Subheading", fn: () => setHeading(3), checked: hLvl === 3 },
     { label: "Body text", fn: () => setHeading(0), checked: hLvl === 0 && !isList },
     { sep: true },
-    { label: "Bullet list", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- "), checked: /^\s*[-*+] /.test(line) && !/^\s*[-*+] \[[ xX]\] /.test(line) },
-    { label: "Numbered list", fn: () => toggleLinePrefix(/^\s*\d+\. /, (i) => `${i + 1}. `), checked: /^\s*\d+\. /.test(line) },
-    { label: "To-do list", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] "), checked: /^\s*[-*+] \[[ xX]\] /.test(line) },
-    { label: "Quote", fn: () => toggleLinePrefix(/^> ?/, () => "> "), checked: /^\s*> /.test(line) },
+    { label: "Bullet list", fn: toggleBulletList, checked: /^\s*[-*+] /.test(line) && !/^\s*[-*+] \[[ xX]\] /.test(line) },
+    { label: "Numbered list", fn: toggleOrderedList, checked: /^\s*\d+\. /.test(line) },
+    { label: "To-do list", fn: toggleTaskList, checked: /^\s*[-*+] \[[ xX]\] /.test(line) },
+    { label: "Quote", fn: toggleQuote, checked: /^\s*> /.test(line) },
     { sep: true },
     { label: "Code block", fn: insertCodeBlock },
   ];
@@ -1358,6 +1503,7 @@ function settingsMenuItems() {
     { label: "Appearance: Light", fn: () => applyTheme("light"), checked: theme === "light" },
     { label: "Appearance: Dark", fn: () => applyTheme("dark"), checked: theme === "dark" },
     { sep: true },
+    { label: "Formatting toolbar", fn: () => applyToolbarSetting(!toolbarEnabled()), checked: toolbarEnabled() },
     { label: "Wide mode (full width — for tables)", fn: () => applyWide(!wide), checked: wide },
     { label: "Autosave (new docs auto-save to a folder)", fn: () => applyAutosave(!autosaveOn), checked: autosaveOn },
     { label: saveDir ? `New docs folder · ${saveDir.split("/").pop()}…` : "New docs folder · Documents/Plume…", fn: () => pickAutosaveFolder() },
@@ -1408,13 +1554,20 @@ const SLASH_ICONS = {
   session: '<svg viewBox="0 0 18 18"><path d="M3.5 6A1.5 1.5 0 0 1 5 4.5h8A1.5 1.5 0 0 1 14.5 6v4.5A1.5 1.5 0 0 1 13 12H7l-2.5 2.4V12H5A1.5 1.5 0 0 1 3.5 10.5z"/></svg>',
   pdf: '<svg viewBox="0 0 18 18"><path d="M9 2.5v8"/><path d="M6 7.5 9 10.5l3-3"/><path d="M4 11v3A1.5 1.5 0 0 0 5.5 15.5h7A1.5 1.5 0 0 0 14 14v-3"/></svg>',
   gdocs: '<svg viewBox="0 0 18 18"><path d="M4.5 2.5h4.6L12.5 5.9V15a.6.6 0 0 1-.6.6H4.5a.6.6 0 0 1-.6-.6V3.1A.6.6 0 0 1 4.5 2.5z"/><path d="M9 2.7v3.4h3.4"/></svg>',
+  numbered: '<svg viewBox="0 0 18 18"><path d="M7.5 5h7M7.5 9h7M7.5 13h7"/><path d="M2.7 3.8 3.9 3v3.4M2.8 8.1c.9-1 2.2-.4 1.9.6-.2.6-1 .9-2 1.8h2.2M2.7 11.9h1.4a.9.9 0 0 1 0 1.8h-.6a.9.9 0 0 1 .6 1.7H2.6" stroke-width="1.1"/></svg>',
+  quote: '<svg viewBox="0 0 18 18"><path d="M3.5 3.5v11"/><path d="M7 6h7.5M7 9h7.5M7 12h5"/></svg>',
+  hr: '<svg viewBox="0 0 18 18"><path d="M2.5 9h13"/><path d="M4.5 4.5h9M4.5 13.5h9" stroke-opacity="0.35"/></svg>',
+  image: '<svg viewBox="0 0 18 18"><rect x="2.5" y="3.5" width="13" height="11" rx="2"/><circle cx="6.4" cy="7.2" r="1.2"/><path d="M4 13.2 8 9.5l2.6 2.4 2-1.8 1.9 1.9"/></svg>',
 };
 const SLASH = [
   { g: "Basic blocks", icon: "heading", b: "Heading", s: "Section title", kbd: "##", fn: () => setHeading(2) },
-  { g: "Basic blocks", icon: "bullet", b: "Bullet list", s: "A simple list", kbd: "-", fn: () => toggleLinePrefix(/^\s*[-*+] /, () => "- ") },
-  { g: "Basic blocks", icon: "todo", b: "To-do list", s: "Track tasks with checkboxes", fn: () => toggleLinePrefix(/^\s*[-*+] \[[ xX]\] /, () => "- [ ] ") },
+  { g: "Basic blocks", icon: "bullet", b: "Bullet list", s: "A simple list", kbd: "-", fn: () => toggleBulletList() },
+  { g: "Basic blocks", icon: "todo", b: "To-do list", s: "Track tasks with checkboxes", fn: () => toggleTaskList() },
   { g: "Basic blocks", icon: "code", b: "Code block", s: "Fenced snippet", fn: () => insertCodeBlock() },
   { g: "Basic blocks", icon: "table", b: "Table", s: "Rows and columns", fn: () => insertTable() },
+  { g: "Basic blocks", icon: "hr", b: "Divider", s: "Horizontal rule", kbd: "---", fn: () => insertHR() },
+  { g: "Basic blocks", icon: "image", b: "Image", s: "Insert a picture from disk", fn: () => insertImageViaPicker() },
+  { g: "Basic blocks", icon: "image", b: "Image alt text", s: "Edit the alt text (accessibility)", fn: () => editImageAlt() },
   { g: "Companion", icon: "session", b: "Insert from session…", s: "Pull text from a Claude Code transcript", fn: () => openSessionInsert() },
   { g: "Companion", icon: "pdf", b: "Export to PDF", s: "Render this document to a file", fn: () => exportAs("pdf") },
   { g: "Companion", icon: "gdocs", b: "Publish to Google Docs", s: "Share with non-devs", fn: () => publishGoogle() },
@@ -1544,6 +1697,7 @@ function applyFocus(on) {
 applyFont(localStorage.getItem("plume-font") || "inter");
 buildBrand();
 buildTitlebarTools();
+buildToolbar();
 buildSelBar();
 view.scrollDOM.addEventListener("scroll", () => {
   if (!selbar.classList.contains("hidden")) updateSelBar();
@@ -1678,12 +1832,12 @@ function clearRecents() {
   updateWelcome();
 }
 // Open a document without clobbering the one you're reading: reuse THIS window
-// only if it's an empty/untitled scratch window (e.g. the welcome screen);
-// otherwise open in a new window. Used by recents / palette file-open / Open Recent
-// menu. (Sidebar stays in-place navigation; search/session keep their line jump.)
+// if it's an empty/untitled scratch surface (e.g. the welcome screen);
+// otherwise open a new TAB (#10 in-window switching). Used by recents / palette
+// file-open / Open Recent menu / CLI + double-click opens routed to this window.
+// (Sidebar stays in-place navigation; search/session keep their line jump.)
 function smartOpen(path, line) {
-  if (!currentPath && view.state.doc.length === 0) window.plume.openInThisWindow(path, line);
-  else window.plume.openInNewWindow(path);
+  openInNewTab(path, line);
 }
 function recentItems(term) {
   return loadRecents()
@@ -1694,8 +1848,14 @@ function recentItems(term) {
 }
 
 const COMMANDS = [
+  { label: "New Tab", run: () => newTab() },
+  { label: "Open in New Window", run: () => { if (currentPath) window.plume.openInNewWindow(currentPath); } },
+  { label: "Toggle Formatting Toolbar", run: () => applyToolbarSetting(!toolbarEnabled()) },
   { label: "Toggle Files Sidebar", run: toggleSidebar },
   { label: "Toggle Outline", run: toggleOutline },
+  { label: "Insert Divider (Horizontal Rule)", run: () => insertHR() },
+  { label: "Insert Image…", run: () => insertImageViaPicker() },
+  { label: "Edit Image Alt Text", run: () => editImageAlt() },
   { label: "Search in Folder", run: () => openSearch() },
   { label: "Claude Code Sessions & Context", run: () => openWorkspace() },
   { label: "Copy as Rich Text", run: copyAsRichText },
@@ -1918,9 +2078,274 @@ wsInput.addEventListener("keydown", (e) => {
 });
 wsEl.addEventListener("mousedown", (e) => { if (e.target === wsEl) closeWorkspace(); });
 
+/* ---------- Confirm dialog (save prompts) ---------- */
+const confirmEl = (() => {
+  const el = document.createElement("div");
+  el.id = "confirm";
+  el.className = "overlay hidden";
+  document.body.appendChild(el);
+  return el;
+})();
+let confirmResolve = null;
+function closeConfirm(value) {
+  confirmEl.classList.add("hidden");
+  confirmEl.innerHTML = "";
+  const r = confirmResolve;
+  confirmResolve = null;
+  if (r) r(value);
+}
+// askConfirm({ message, detail, buttons: [{label, kind, value}] }) → Promise<value|null>.
+// Escape / backdrop click resolve null (treat as Cancel).
+function askConfirm({ message, detail, buttons }) {
+  return new Promise((resolve) => {
+    if (confirmResolve) closeConfirm(null); // replace any prior prompt
+    confirmResolve = resolve;
+    confirmEl.innerHTML = "";
+    const box = document.createElement("div");
+    box.className = "confirm-box";
+    const msg = document.createElement("div");
+    msg.className = "confirm-msg";
+    msg.textContent = message;
+    box.appendChild(msg);
+    if (detail) {
+      const d = document.createElement("div");
+      d.className = "confirm-detail";
+      d.textContent = detail;
+      box.appendChild(d);
+    }
+    const bar = document.createElement("div");
+    bar.className = "confirm-bar";
+    let primary = null;
+    for (const b of buttons) {
+      const btn = document.createElement("button");
+      btn.className = "confirm-btn " + (b.kind || "ghost");
+      btn.textContent = b.label;
+      btn.onclick = () => closeConfirm(b.value);
+      if (b.kind === "primary") primary = btn;
+      bar.appendChild(btn);
+    }
+    box.appendChild(bar);
+    confirmEl.appendChild(box);
+    confirmEl.classList.remove("hidden");
+    (primary || bar.firstChild)?.focus();
+  });
+}
+confirmEl.addEventListener("mousedown", (e) => { if (e.target === confirmEl) closeConfirm(null); });
+document.addEventListener("keydown", (e) => {
+  if (!confirmResolve) return;
+  if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeConfirm(null); }
+}, true);
+
+/* ---------- Document tabs (#10 — in-window switching) ---------- */
+// The renderer owns the tab list; the native side still sees one document per
+// window. Every switch to a path-backed tab goes through openInThisWindow →
+// read_path, which rebinds the native watcher + per-window doc map, so saves
+// and file-changed events always route to the file this window is showing.
+const tabbarEl = document.getElementById("tabbar");
+let tabs = [createTab()];
+let activeTabId = tabs[0].id;
+let pendingTabRestore = null; // consumed by loadDocument when a switch is in flight
+
+function activeTab() { return findTab(tabs, activeTabId); }
+
+// Freeze the live editor state into the active tab's record (before switching away).
+function captureActiveTab() {
+  const t = activeTab();
+  if (!t) return;
+  t.path = currentPath;
+  t.pendingName = pendingName;
+  t.text = view.state.doc.toString();
+  t.savedText = savedText;
+  t.sel = { anchor: view.state.selection.main.anchor, head: view.state.selection.main.head };
+  t.scrollTop = view.scrollDOM.scrollTop;
+}
+
+function renderTabbar() {
+  tabbarEl.classList.toggle("hidden", tabs.length < 2);
+  tabbarEl.innerHTML = "";
+  if (tabs.length < 2) return;
+  for (const t of tabs) {
+    const active = t.id === activeTabId;
+    const el = document.createElement("div");
+    el.className = "tab" + (active ? " on" : "");
+    el.setAttribute("role", "tab");
+    el.setAttribute("aria-selected", active ? "true" : "false");
+    const dirty = active ? titlebar.classList.contains("dirty") : isCapturedDirty(t);
+    const name = document.createElement("span");
+    name.className = "tab-name" + (dirty ? " dirty" : "");
+    name.textContent = active
+      ? (currentPath ? currentPath.split("/").pop() : (pendingName || "Untitled"))
+      : tabDisplayName(t);
+    name.title = t.path || name.textContent;
+    const close = document.createElement("button");
+    close.className = "tab-close";
+    close.title = "Close tab";
+    close.setAttribute("aria-label", "Close tab");
+    close.textContent = "×";
+    close.addEventListener("mousedown", (e) => e.stopPropagation());
+    close.addEventListener("click", (e) => { e.stopPropagation(); closeTabRequest(t.id); });
+    el.append(name, close);
+    el.addEventListener("mousedown", (e) => { if (e.button === 1) { e.preventDefault(); closeTabRequest(t.id); } });
+    el.addEventListener("click", () => activateTab(t.id));
+    tabbarEl.appendChild(el);
+  }
+  const add = document.createElement("button");
+  add.className = "tab-add";
+  add.title = "New tab  ⌘T";
+  add.setAttribute("aria-label", "New tab");
+  add.textContent = "+";
+  add.addEventListener("click", () => newTab());
+  tabbarEl.appendChild(add);
+}
+
+// Show an untitled tab's buffer. Mirrors loadDocument for the no-path case.
+function presentUntitledTab(t) {
+  // Ask the native side to clear this window's doc binding so saves/snapshots
+  // can't route to the previously shown file. No-op until detachDoc lands
+  // (requested from be-dev); the snapshot guard covers the gap.
+  window.plume.detachDoc?.();
+  const text = t.text ?? "";
+  applyMode(null, text);
+  pendingName = t.pendingName || null;
+  savedText = t.savedText ?? "";
+  const anchor = Math.min(t.sel?.anchor ?? 0, text.length);
+  view.dispatch({
+    changes: { from: 0, to: view.state.doc.length, insert: text },
+    selection: { anchor, head: Math.min(t.sel?.head ?? anchor, text.length) },
+  });
+  setDocPath(view, null);
+  setTitle(null);
+  setDirty(text !== savedText);
+  loadAnnotationsFor(null);
+  renderOutline();
+  updateStatus();
+  updateWelcome();
+  clearBanner();
+  view.scrollDOM.scrollTop = t.scrollTop || 0;
+  view.focus();
+}
+
+// Load tab `t` into the editor (native rebind for path-backed tabs).
+async function presentTab(t) {
+  if (t.path) {
+    pendingTabRestore = t;
+    await window.plume.openInThisWindow(t.path);
+    if (pendingTabRestore === t) {
+      // Disk read failed (file moved/deleted) — show the captured buffer so
+      // nothing is lost; savedText marks it dirty against what disk last had.
+      pendingTabRestore = null;
+      const text = t.text ?? "";
+      loadDocument(text, t.path);
+      if (t.savedText != null && t.savedText !== text) { savedText = t.savedText; setDirty(true); }
+      flashMessage(`Couldn't re-read ${tabDisplayName(t)} from disk — showing the buffered copy.`);
+    }
+  } else {
+    presentUntitledTab(t);
+  }
+  renderTabbar();
+}
+
+async function activateTab(id) {
+  if (id === activeTabId) return;
+  const t = findTab(tabs, id);
+  if (!t) return;
+  await autosave(); // flush the outgoing tab so background tabs are clean
+  captureActiveTab();
+  activeTabId = id;
+  await presentTab(t);
+}
+
+async function newTab() {
+  await autosave();
+  captureActiveTab();
+  const t = createTab();
+  tabs = addTab(tabs, t);
+  activeTabId = t.id;
+  presentUntitledTab(t);
+  renderTabbar();
+}
+
+async function openInNewTab(path, line) {
+  // Reuse a blank scratch surface (e.g. the welcome screen) instead of stacking a tab.
+  if (!currentPath && view.state.doc.length === 0) { window.plume.openInThisWindow(path, line); return; }
+  await autosave();
+  captureActiveTab();
+  const prevActive = activeTabId;
+  const t = createTab({ path });
+  tabs = addTab(tabs, t);
+  activeTabId = t.id;
+  await window.plume.openInThisWindow(path, line);
+  if (currentPath !== path) {
+    // Read failed — drop the new tab and stay put.
+    tabs = closeTab(tabs, t.id).tabs;
+    activeTabId = prevActive;
+    flashMessage("Couldn't open " + path.split("/").pop());
+  }
+  renderTabbar();
+}
+
+async function closeTabRequest(id) {
+  const t = findTab(tabs, id);
+  if (!t) return;
+  // Last tab → close the window; the native side owns that flow (and holds it
+  // for a dirty untitled buffer, which re-enters via close-requested below).
+  if (tabs.length === 1) { window.close(); return; }
+  if (id !== activeTabId) {
+    // Background tabs are flushed on switch-away, so dirty ones only exist when
+    // autosave is off — surface them before discarding.
+    if (isCapturedDirty(t)) { await activateTab(id); return closeActiveTab(); }
+    tabs = closeTab(tabs, id).tabs;
+    renderTabbar();
+    return;
+  }
+  return closeActiveTab();
+}
+
+async function closeActiveTab() {
+  if (titlebar.classList.contains("dirty")) {
+    const name = currentPath ? currentPath.split("/").pop() : (pendingName || "Untitled");
+    const choice = await askConfirm({
+      message: `Save changes to “${name}”?`,
+      detail: "Your changes will be lost if you close this tab without saving.",
+      buttons: [
+        { label: "Save", kind: "primary", value: "save" },
+        { label: "Don't Save", kind: "danger", value: "discard" },
+        { label: "Cancel", kind: "ghost", value: "cancel" },
+      ],
+    });
+    if (choice !== "save" && choice !== "discard") return;
+    if (choice === "save") {
+      if (currentPath) await save();
+      else if (!(await saveAs())) return; // dialog cancelled — keep the tab
+      if (titlebar.classList.contains("dirty")) return; // save failed — don't drop edits
+    }
+  }
+  const r = closeTab(tabs, activeTabId);
+  tabs = r.tabs;
+  activeTabId = r.nextActiveId;
+  const next = activeTab();
+  if (next) await presentTab(next);
+  renderTabbar();
+}
+
+// Ctrl-Tab / Ctrl-Shift-Tab cycle tabs; ⌘T opens a new one. Capture phase so
+// CodeMirror's Tab handling never sees Ctrl-Tab.
+window.addEventListener("keydown", (e) => {
+  if (e.ctrlKey && !e.metaKey && e.key === "Tab") {
+    e.preventDefault();
+    activateTab(cycleTabId(tabs, activeTabId, e.shiftKey ? -1 : 1));
+  } else if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && (e.key === "t" || e.key === "T")) {
+    e.preventDefault();
+    newTab();
+  }
+}, true);
+
 /* ---------- Menu + IPC wiring ---------- */
 window.plume.onOpenFile(({ filePath, content, recovery, gotoLine }) => loadDocument(content, filePath, recovery, gotoLine));
-window.plume.onExternalChange(({ content }) => {
+window.plume.onExternalChange(({ path, content }) => {
+  // Per-window contract (be-dev #1): the payload names the file that changed on
+  // disk. Ignore events for a file this window/tab isn't currently showing.
+  if (path && path !== currentPath) return;
   const before = view.state.doc.toString();
   // Self-write or no-op → normal path (prevents the review re-firing on our own save).
   if (content === savedText || content === before) { applyExternalChange(content); return; }
@@ -1934,6 +2359,58 @@ window.plume.onFolderOpen(({ dir }) => {
   sidebarEl.classList.remove("hidden");
   refreshSidebar();
 });
+
+// #4 (renderer side): the native side held this window's close because its
+// untitled buffer has unsaved edits. Prompt, then save or confirm the close.
+window.plume.onCloseRequested?.(async () => {
+  const name = currentPath ? currentPath.split("/").pop() : (pendingName || "Untitled");
+  const choice = await askConfirm({
+    message: `Save changes to “${name}”?`,
+    detail: "Your changes will be lost if you don't save them.",
+    buttons: [
+      { label: "Save", kind: "primary", value: "save" },
+      { label: "Don't Save", kind: "danger", value: "discard" },
+      { label: "Cancel", kind: "ghost", value: "cancel" },
+    ],
+  });
+  if (choice === "save") {
+    if (currentPath) await save();
+    else await saveAs(); // Save As dialog; cancelling it keeps the window open
+    if (!titlebar.classList.contains("dirty")) window.plume.confirmClose?.();
+  } else if (choice === "discard") {
+    window.plume.confirmClose?.();
+  }
+});
+
+// Offer the newest untitled crash snapshot from a previous run when this window
+// opens blank (be-dev #4 contract: untitledRecovery / discardUntitledRecovery).
+async function maybeOfferUntitledRecovery() {
+  if (!window.plume.untitledRecovery) return;
+  if (currentPath || view.state.doc.length > 0) return;
+  const r = await window.plume.untitledRecovery();
+  if (!r || !r.content || !r.content.trim()) return;
+  if (currentPath || view.state.doc.length > 0) return; // something opened while we fetched
+  bannerEl.className = "";
+  bannerEl.innerHTML = "";
+  const msg = document.createElement("span");
+  msg.textContent = "Plume recovered an unsaved draft from your last session.";
+  const restore = document.createElement("button");
+  restore.textContent = "Restore";
+  restore.onclick = () => {
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: r.content } });
+    setDirty(true);
+    window.plume.discardUntitledRecovery?.(r.key);
+    clearBanner();
+    view.focus();
+  };
+  const discard = document.createElement("button");
+  discard.textContent = "Discard";
+  discard.className = "ghost";
+  discard.onclick = () => { window.plume.discardUntitledRecovery?.(r.key); clearBanner(); view.focus(); };
+  bannerEl.append(msg, restore, discard);
+}
+// Give initial_file (async bridge pull) a beat to land before offering.
+setTimeout(maybeOfferUntitledRecovery, 600);
 
 window.plume.onMenu((channel, ...args) => {
   switch (channel) {
@@ -1952,7 +2429,15 @@ window.plume.onMenu((channel, ...args) => {
     case "menu:palette": openPalette(); break;
     case "menu:searchFolder": openSearch(); break;
     case "menu:workspace": openWorkspace(); break;
-    case "menu:toggleToolbar": break; // toolbar slab retired; controls live in the title bar
+    case "menu:toggleToolbar": applyToolbarSetting(!toolbarEnabled()); break;
+    // New Format-menu channels (be-dev #12 contract).
+    case "menu:list":
+      if (args[0] === "bullet") toggleBulletList();
+      else if (args[0] === "ordered") toggleOrderedList();
+      else toggleTaskList();
+      break;
+    case "menu:block": (args[0] === "code" ? insertCodeBlock : toggleQuote)(); break;
+    case "menu:insert": (args[0] === "hr" ? insertHR : insertTable)(); break;
     case "menu:toggleReveal": applyReveal(localStorage.getItem("plume-reveal") !== "1"); break;
     case "menu:toggleFocus": applyFocus(localStorage.getItem("plume-focus") !== "1"); break;
     case "menu:formatDoc": formatDocument(); break;
@@ -1972,7 +2457,13 @@ updateWelcome();
 pushRecentsToMenu(); // seed the native Open Recent menu from saved recents on launch
 
 // Automation surface (used for scripting / testing the UI).
-window.__plume = { toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs, copyAsRichText, applyFocus, updateWelcome, addAnnotation, htmlToMarkdown, openDiffReview, smartOpen, view };
+window.__plume = {
+  toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs,
+  copyAsRichText, applyFocus, updateWelcome, addAnnotation, htmlToMarkdown,
+  openDiffReview, smartOpen, view,
+  newTab, activateTab, closeTabRequest, openInNewTab,
+  tabsState: () => ({ tabs: tabs.map((t) => ({ ...t })), activeTabId }),
+};
 
 // Agent surface — read by the main process (executeJavaScript) for the MCP server.
 window.__plumeAgent = {

@@ -1,0 +1,67 @@
+// Pure document-tab bookkeeping for in-window tab switching (#10).
+// No DOM, no CodeMirror — the renderer owns presentation; this owns the list.
+//
+// A tab record:
+//   { id, path, pendingName, text, savedText, sel, scrollTop }
+// The ACTIVE tab's live state lives in the editor; its record is refreshed by
+// the renderer on switch-away ("capture"). `text`/`savedText` are null for the
+// active tab (live) and hold the captured buffer for background tabs.
+
+let seq = 0;
+export function createTab(partial = {}) {
+  return {
+    id: "t" + Date.now().toString(36) + "-" + (seq++).toString(36),
+    path: null,
+    pendingName: null,
+    text: null,
+    savedText: null,
+    sel: null,
+    scrollTop: 0,
+    ...partial,
+  };
+}
+
+export function findTab(tabs, id) {
+  return tabs.find((t) => t.id === id) || null;
+}
+
+export function addTab(tabs, tab, afterId = null) {
+  const i = afterId ? tabs.findIndex((t) => t.id === afterId) : -1;
+  if (i < 0) return [...tabs, tab];
+  return [...tabs.slice(0, i + 1), tab, ...tabs.slice(i + 1)];
+}
+
+// Remove `id`; pick the neighbor that keeps the user's place (the tab to the
+// right, else the new last tab) as the next active tab.
+export function closeTab(tabs, id) {
+  const i = tabs.findIndex((t) => t.id === id);
+  if (i < 0) return { tabs, nextActiveId: null };
+  const rest = tabs.filter((t) => t.id !== id);
+  const next = rest.length ? rest[Math.min(i, rest.length - 1)] : null;
+  return { tabs: rest, nextActiveId: next ? next.id : null };
+}
+
+// Cycle order: dir +1 = next (Ctrl-Tab), -1 = previous (Ctrl-Shift-Tab).
+export function cycleTabId(tabs, activeId, dir) {
+  if (tabs.length < 2) return activeId;
+  const i = tabs.findIndex((t) => t.id === activeId);
+  if (i < 0) return tabs[0].id;
+  return tabs[(i + dir + tabs.length) % tabs.length].id;
+}
+
+export function tabDisplayName(tab) {
+  if (tab.path) return tab.path.split("/").pop();
+  return tab.pendingName || "Untitled";
+}
+
+// Dirty check for CAPTURED (background) tabs only — the active tab's dirty
+// state is the editor's, which the renderer reads from its own title bar flag.
+export function isCapturedDirty(tab) {
+  return tab.text != null && tab.savedText != null && tab.text !== tab.savedText;
+}
+
+// A tab is a reusable blank scratch surface (safe to load a file into without
+// clobbering anything) when it has no path and no captured content.
+export function isBlankTab(tab) {
+  return !tab.path && !(tab.text && tab.text.length);
+}
