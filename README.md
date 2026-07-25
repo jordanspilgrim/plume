@@ -4,7 +4,7 @@ A fast, single-surface Markdown editor for macOS — **renders like a document, 
 
 The Markdown syntax marks (`**`, `#`, `` ` ``, `[]()`) reveal only on the line your cursor is on. Everywhere else, the document reads finished — bold is bold, headings are sized, links show their text, checkboxes are checkboxes. What's on disk is exactly what you typed: plain UTF-8 Markdown, no proprietary wrapper, no lock-in.
 
-Built on Electron + CodeMirror 6.
+Built on Tauri v2 (native WKWebView + Rust) and CodeMirror 6.
 
 ## Features (v1)
 
@@ -70,29 +70,26 @@ writes; Plume is where you read, steer, and ship it.
 
 ```bash
 npm install
-npm start          # build renderer + launch
-npm run watch:renderer   # rebuild renderer on change (run electron . separately)
+npm run dev              # build renderer + launch (Tauri dev)
+npm run watch:renderer   # rebuild the renderer on change
 ```
 
 ## Build the app
 
 ```bash
-npm run dist       # → release/mac-arm64/Plume.app
+npm run tauri:build   # → src-tauri/target/release/bundle/macos/Plume.app
 ```
 
 Then drag `Plume.app` to `/Applications`, and set it as the default for `.md`:
 right-click any `.md` → Get Info → Open with → Plume → Change All.
 
-## Tauri shell (in progress)
+## Runtime
 
-A Tauri v2 reshell is scaffolded in `src-tauri/` to replace Electron (~449 MB)
-with a native WKWebView + Rust binary (**4.7 MB**). The renderer runs unchanged
-via a `window.plume` bridge (`tauri/tauri-bridge.js`); the core file loop
-(open/save/list/open-external) is ported and **verified rendering in WKWebView**.
-Remaining native surface (dialogs, file watcher, control socket, menu, export/PDF,
-sessions, Google publish) is enumerated in [src-tauri/MIGRATION.md](src-tauri/MIGRATION.md).
-Build: `npm run tauri:build`. The shipping app is still the Electron build until
-the port is complete.
+Plume ships as a Tauri v2 app: a native WKWebView plus a Rust binary, about
+**4.7 MB** against Electron's ~449 MB. The renderer runs unchanged via a
+`window.plume` bridge (`tauri/tauri-bridge.js`), backed by the Rust commands in
+`src-tauri/`. Plume began on Electron; the port to Tauri is complete and Electron
+has been removed.
 
 ## Roadmap
 
