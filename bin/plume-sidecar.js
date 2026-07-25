@@ -17,11 +17,21 @@ const { publishToGoogleDocs } = require("../src/main/gdocs.js");
 
 function done(obj) { process.stdout.write(JSON.stringify(obj)); process.exit(0); }
 
-function readStdin() {
+// Watchdog: a sidecar invocation must never outlive its caller as an orphan —
+// even if the parent forgets to reap it or the OAuth consent tab is abandoned.
+// gdocs allows for the 5-minute consent window (gdocs.js OAUTH_TIMEOUT_MS) plus
+// network headroom; everything else is mechanical and bounded tightly.
+const WATCHDOG_MS = { docx: 2 * 60_000, gdocs: 7 * 60_000 };
+let watchdog = setTimeout(timeoutExit, WATCHDOG_MS.gdocs);
+function timeoutExit() { done({ ok: false, error: "sidecar timed out", code: "SIDECAR_TIMEOUT" }); }
+
+function readStdin(timeoutMs = 30_000) {
   return new Promise((resolve) => {
     let d = ""; process.stdin.setEncoding("utf8");
+    // If the caller never writes/closes stdin, give up with what we have.
+    const t = setTimeout(() => resolve(d), timeoutMs);
     process.stdin.on("data", (c) => (d += c));
-    process.stdin.on("end", () => resolve(d));
+    process.stdin.on("end", () => { clearTimeout(t); resolve(d); });
   });
 }
 
@@ -30,6 +40,11 @@ function readStdin() {
   const raw = process.argv[2] || (await readStdin());
   let req;
   try { req = JSON.parse(raw || "{}"); } catch { done({ ok: false, error: "bad request" }); }
+
+  if (WATCHDOG_MS[req.cmd] && WATCHDOG_MS[req.cmd] !== WATCHDOG_MS.gdocs) {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(timeoutExit, WATCHDOG_MS[req.cmd]);
+  }
 
   if (req.cmd === "docx") {
     try {
