@@ -22,20 +22,36 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuild
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
+// The document a single window has open, plus the watcher that live-reloads it.
+// One per window label — the old global (current/last_content/watcher) meant a
+// second window silently retargeted saves, snapshots, and image drops onto the
+// FIRST window's file (the multi-window data-loss bug, #1/#3).
+struct DocState {
+    path: String,
+    last_content: String,
+    // Held for RAII only: dropping it unwatches the file. Never read.
+    _watcher: Option<RecommendedWatcher>,
+}
+
 #[derive(Default)]
 struct AppState {
-    current: Mutex<Option<String>>,
     initial: Mutex<Option<String>>,
-    last_content: Mutex<Option<String>>,
-    watcher: Mutex<Option<RecommendedWatcher>>,
+    // Per-window document state, keyed by window label.
+    docs: Mutex<HashMap<String, DocState>>,
     pending: Mutex<HashMap<u64, Sender<Value>>>,
     next_id: AtomicU64,
+    // Windows spawned with a target file that haven't consumed it via initial_file
+    // yet ("" = blank untitled sentinel). Consumed entries move into `docs`, so a
+    // window's file is in scope from spawn to close with no gap (#5).
     window_files: Mutex<HashMap<String, String>>,
     win_counter: AtomicU64,
     recents: Mutex<Vec<String>>, // recent file paths for the File > Open Recent menu
     // Canonical paths the renderer has flagged as having unsaved edits. writeDocument
     // refuses to clobber one of these (P1-4). Renderer pushes via set_doc_dirty.
     dirty_files: Mutex<HashSet<String>>,
+    // Labels of windows holding a never-saved (untitled) buffer with unsaved edits.
+    // Close of such a window is intercepted so the renderer can prompt (#4).
+    untitled_dirty: Mutex<HashSet<String>>,
     // Per-launch secret written to ~/.plume/token (0600). Socket clients must present
     // it on every request (except ping). Defense-in-depth behind the 0600 socket.
     socket_token: Mutex<String>,
@@ -54,45 +70,58 @@ fn plume_dir() -> PathBuf {
 }
 
 // ---- file watcher (live auto-reload) ----
-fn set_current(app: &AppHandle, path: &str, content: &str) {
+// Bind `path` as `label`'s document: record it in docs and watch it. The watcher
+// emits `file-changed` with { path, content } to THAT window only — never a
+// global broadcast, so window B's reload can't clobber window A's buffer.
+fn set_current(app: &AppHandle, label: &str, path: &str, content: &str) {
     let state = app.state::<AppState>();
-    *state.current.lock().unwrap() = Some(path.to_string());
-    *state.last_content.lock().unwrap() = Some(content.to_string());
-    start_watcher(app, path);
+    let watcher = start_watcher(app, label, path);
+    let old = state.docs.lock().unwrap().insert(
+        label.to_string(),
+        DocState { path: path.to_string(), last_content: content.to_string(), _watcher: watcher },
+    );
+    // The window now holds a real file — it is no longer a dirty untitled buffer.
+    state.untitled_dirty.lock().unwrap().remove(label);
+    // Drop the replaced watcher OUTSIDE the docs lock: its callback takes the same
+    // lock, and some backends join the callback thread on drop (deadlock otherwise).
+    drop(old);
 }
 
-fn start_watcher(app: &AppHandle, path: &str) {
-    let state = app.state::<AppState>();
-    *state.watcher.lock().unwrap() = None; // drop the old watcher
-    let dir = match Path::new(path).parent() {
-        Some(d) => d.to_path_buf(),
-        None => return,
-    };
+fn start_watcher(app: &AppHandle, label: &str, path: &str) -> Option<RecommendedWatcher> {
+    let dir = Path::new(path).parent()?.to_path_buf();
     let file = path.to_string();
+    let lbl = label.to_string();
     let app2 = app.clone();
     // Re-read the tracked file on any event in its directory and emit only when
     // the content actually changed. Avoids fragile path matching (e.g. /tmp vs
     // /private/tmp) and naturally ignores our own writes via the content compare.
-    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if res.is_err() {
             return;
         }
         if let Ok(content) = fs::read_to_string(&file) {
             let st = app2.state::<AppState>();
-            let mut last = st.last_content.lock().unwrap();
-            if last.as_deref() != Some(content.as_str()) {
-                *last = Some(content.clone());
-                let _ = app2.emit("file-changed", json!({ "content": content }));
+            let mut changed = false;
+            {
+                let mut docs = st.docs.lock().unwrap();
+                if let Some(doc) = docs.get_mut(&lbl) {
+                    // Stale-watcher guard: this window may have moved to another file.
+                    if doc.path == file && doc.last_content != content {
+                        doc.last_content = content.clone();
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let _ = app2.emit_to(&lbl, "file-changed", json!({ "path": file, "content": content }));
             }
         }
-    }) {
-        Ok(w) => w,
-        Err(_) => return,
-    };
+    })
+    .ok()?;
     // Watch the canonical dir so FSEvents reliably delivers.
     let watch_dir = fs::canonicalize(&dir).unwrap_or(dir);
-    let _ = watcher.watch(&watch_dir, RecursiveMode::NonRecursive);
-    *state.watcher.lock().unwrap() = Some(watcher);
+    watcher.watch(&watch_dir, RecursiveMode::NonRecursive).ok()?;
+    Some(watcher)
 }
 
 // ---- core file commands ----
@@ -103,27 +132,31 @@ struct ReadResult {
 }
 
 #[tauri::command]
-fn read_path(app: AppHandle, path: String) -> Result<ReadResult, String> {
+fn read_path(app: AppHandle, window: tauri::WebviewWindow, path: String) -> Result<ReadResult, String> {
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let recovery = recovery_for(&path);
-    set_current(&app, &path, &content);
+    set_current(&app, window.label(), &path, &content);
     Ok(ReadResult { content, recovery })
 }
 
 #[tauri::command]
-fn write_file(app: AppHandle, path: Option<String>, content: String) -> Result<String, String> {
+fn write_file(app: AppHandle, window: tauri::WebviewWindow, path: Option<String>, content: String) -> Result<String, String> {
+    // Default target = THIS window's document. Falling back to a global "current"
+    // here is what let an untitled window save over another window's file (#1).
     let target = match path {
         Some(p) => p,
         None => app
             .state::<AppState>()
-            .current
+            .docs
             .lock()
             .unwrap()
-            .clone()
+            .get(window.label())
+            .map(|d| d.path.clone())
+            .filter(|p| !p.is_empty())
             .ok_or_else(|| "no current file".to_string())?,
     };
     fs::write(&target, &content).map_err(|e| e.to_string())?;
-    set_current(&app, &target, &content);
+    set_current(&app, window.label(), &target, &content);
     Ok(target)
 }
 
@@ -149,7 +182,8 @@ fn initial_file(app: AppHandle, window: tauri::WebviewWindow) -> Option<InitialF
     }?;
     let content = fs::read_to_string(&p).ok()?;
     let recovery = recovery_for(&p);
-    set_current(&app, &p, &content);
+    // Consuming the pending entry moves the file into docs — write scope keeps it.
+    set_current(&app, window.label(), &p, &content);
     Some(InitialFile { path: p, content, recovery })
 }
 
@@ -187,6 +221,12 @@ fn sidecar_script(app: &AppHandle) -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
+// Hard deadline on any sidecar run (#8): a hung Node process (stuck OAuth flow,
+// dead network fetch) previously blocked wait_with_output forever, wedging the
+// export path for the rest of the session. Generous enough for a first-time
+// Google OAuth round-trip; the sidecar itself carries tighter per-step deadlines.
+const SIDECAR_TIMEOUT_SECS: u64 = 180;
+
 fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
     use std::process::{Command, Stdio};
     let script = match sidecar_script(app) {
@@ -203,13 +243,39 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
         Ok(c) => c,
         Err(_) => return json!({ "ok": false, "error": "Node.js not found on PATH — it's required for DOCX and Google Docs export. Install Node 18+ and restart Plume." }),
     };
+    // Feed stdin and drain stdout on their own threads so a child that never
+    // reads (or floods) a pipe can't deadlock us against the timeout loop below.
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(req.to_string().as_bytes());
+        let payload = req.to_string();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes());
+            // stdin drops here, closing the pipe so the sidecar sees EOF.
+        });
     }
-    match child.wait_with_output() {
-        Ok(o) => serde_json::from_slice(&o.stdout).unwrap_or(json!({ "ok": false, "error": "no result" })),
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    let reader = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(SIDECAR_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap; also unblocks the reader thread
+                    return json!({ "ok": false, "error": "export timed out — the helper process was stopped" });
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return json!({ "ok": false, "error": e.to_string() }),
+        }
     }
+    let stdout = reader.and_then(|t| t.join().ok()).unwrap_or_default();
+    serde_json::from_slice(&stdout).unwrap_or(json!({ "ok": false, "error": "no result" }))
 }
 
 #[tauri::command]
@@ -240,6 +306,12 @@ async fn publish_google(app: AppHandle, markdown: String, default_name: Option<S
 }
 
 // ---- PDF export: render HTML in a hidden WKWebView, then WKWebView.createPDF ----
+// The hidden export window starts on about:blank (never the editor app) and its
+// pdf* label is not in capabilities/default.json — exported HTML gets no IPC.
+fn pdf_blank_url() -> tauri::WebviewUrl {
+    tauri::WebviewUrl::External("about:blank".parse().expect("about:blank is a valid URL"))
+}
+
 #[cfg(target_os = "macos")]
 fn pdf_load_html(pw: &tauri::webview::PlatformWebview, html: &str) {
     use objc2_foundation::NSString;
@@ -282,7 +354,11 @@ fn generate_pdf(app: &AppHandle, html: String) -> Result<Vec<u8>, String> {
     let app_main = app.clone();
     let label_main = label.clone();
     app.run_on_main_thread(move || {
-        let win = match tauri::WebviewWindowBuilder::new(&app_main, &label_main, tauri::WebviewUrl::App("index.html".into()))
+        // about:blank, not index.html: the export HTML is arbitrary document
+        // content, so the hidden window must never boot the editor app — and its
+        // pdf* label is deliberately absent from capabilities/default.json, so it
+        // has no IPC surface at all.
+        let win = match tauri::WebviewWindowBuilder::new(&app_main, &label_main, pdf_blank_url())
             .visible(false)
             .inner_size(816.0, 1056.0)
             .build()
@@ -331,7 +407,8 @@ fn generate_pdf(app: &AppHandle, html: String) -> Result<Vec<u8>, String> {
     let app_main = app.clone();
     let label_main = label.clone();
     app.run_on_main_thread(move || {
-        let win = match tauri::WebviewWindowBuilder::new(&app_main, &label_main, tauri::WebviewUrl::App("index.html".into()))
+        // about:blank + no capability entry for pdf* — same rationale as macOS.
+        let win = match tauri::WebviewWindowBuilder::new(&app_main, &label_main, pdf_blank_url())
             .visible(false)
             .inner_size(816.0, 1056.0)
             .build()
@@ -466,8 +543,9 @@ fn open_external(url: String) {
     }
 }
 
-#[tauri::command]
-async fn open_dialog(app: AppHandle) -> Option<String> {
+// Shared by the open_dialog command and the zero-window File > Open path (on
+// macOS the app now outlives its last window, so the menu must work windowless).
+fn open_via_dialog(app: &AppHandle) -> Option<String> {
     let picked = app
         .dialog()
         .file()
@@ -477,13 +555,18 @@ async fn open_dialog(app: AppHandle) -> Option<String> {
     let path = picked.into_path().ok()?;
     let p = path.to_string_lossy().to_string();
     if Path::new(&p).is_file() {
-        deliver_open(&app, &p, None);
+        deliver_open(app, &p, None);
     }
     Some(p)
 }
 
 #[tauri::command]
-async fn save_dialog(app: AppHandle, content: String) -> Option<String> {
+async fn open_dialog(app: AppHandle) -> Option<String> {
+    open_via_dialog(&app)
+}
+
+#[tauri::command]
+async fn save_dialog(app: AppHandle, window: tauri::WebviewWindow, content: String) -> Option<String> {
     let picked = app
         .dialog()
         .file()
@@ -493,7 +576,8 @@ async fn save_dialog(app: AppHandle, content: String) -> Option<String> {
     let path = picked.into_path().ok()?;
     let p = path.to_string_lossy().to_string();
     fs::write(&p, &content).ok()?;
-    set_current(&app, &p, &content);
+    clear_untitled_recovery(window.label());
+    set_current(&app, window.label(), &p, &content);
     Some(p)
 }
 
@@ -531,7 +615,7 @@ fn default_docs_dir() -> String {
 // ~/Documents/Plume), ensure it exists, pick a collision-free name, write, and
 // make it the current doc so autosave takes over.
 #[tauri::command]
-fn materialize_doc(app: AppHandle, dir: Option<String>, name: String, content: String) -> Option<String> {
+fn materialize_doc(app: AppHandle, window: tauri::WebviewWindow, dir: Option<String>, name: String, content: String) -> Option<String> {
     let base = match dir.filter(|d| !d.trim().is_empty()) {
         Some(d) => PathBuf::from(d),
         None => default_plume_dir(),
@@ -540,14 +624,16 @@ fn materialize_doc(app: AppHandle, dir: Option<String>, name: String, content: S
     let path = unique_path(&base, &sanitize_stem(&name), "md");
     fs::write(&path, &content).ok()?;
     let p = path.to_string_lossy().to_string();
-    set_current(&app, &p, &content);
+    // The buffer is now a real file — its untitled crash snapshot is obsolete.
+    clear_untitled_recovery(window.label());
+    set_current(&app, window.label(), &p, &content);
     Some(p)
 }
 
 // Rename the current file in place (same folder, new stem), collision-safe and
 // never overwriting an existing file. Returns the new absolute path.
 #[tauri::command]
-fn rename_file(app: AppHandle, old_path: String, new_name: String) -> Option<String> {
+fn rename_file(app: AppHandle, window: tauri::WebviewWindow, old_path: String, new_name: String) -> Option<String> {
     let old = PathBuf::from(&old_path);
     let dir = old.parent()?.to_path_buf();
     let ext = old.extension().and_then(|e| e.to_str()).unwrap_or("md").to_string();
@@ -559,7 +645,7 @@ fn rename_file(app: AppHandle, old_path: String, new_name: String) -> Option<Str
     }
     let p = new_path.to_string_lossy().to_string();
     let content = fs::read_to_string(&p).unwrap_or_default();
-    set_current(&app, &p, &content);
+    set_current(&app, window.label(), &p, &content);
     Some(p)
 }
 
@@ -657,8 +743,21 @@ fn recovery_for(path: &str) -> Option<String> {
 }
 
 // ---- images ----
-fn assets_rel(app: &AppHandle, ext: &str) -> Option<(PathBuf, String)> {
-    let cur = app.state::<AppState>().current.lock().unwrap().clone()?;
+// The document path THIS window has open (empty/None = untitled). Keying off the
+// caller's window — not a global — is what stops a paste in window B from filing
+// the image under window A's assets/ folder (#3 misroute).
+fn window_doc_path(app: &AppHandle, label: &str) -> Option<String> {
+    app.state::<AppState>()
+        .docs
+        .lock()
+        .unwrap()
+        .get(label)
+        .map(|d| d.path.clone())
+        .filter(|p| !p.is_empty())
+}
+
+fn assets_rel(app: &AppHandle, label: &str, ext: &str) -> Option<(PathBuf, String)> {
+    let cur = window_doc_path(app, label)?;
     let dir = Path::new(&cur).parent()?.join("assets");
     fs::create_dir_all(&dir).ok()?;
     let ts = std::time::SystemTime::now()
@@ -671,15 +770,15 @@ fn assets_rel(app: &AppHandle, ext: &str) -> Option<(PathBuf, String)> {
 }
 
 #[tauri::command]
-fn save_image(app: AppHandle, bytes: Vec<u8>, ext: String) -> Option<String> {
-    let (path, rel) = assets_rel(&app, &ext)?;
+fn save_image(app: AppHandle, window: tauri::WebviewWindow, bytes: Vec<u8>, ext: String) -> Option<String> {
+    let (path, rel) = assets_rel(&app, window.label(), &ext)?;
     fs::write(path, bytes).ok()?;
     Some(rel)
 }
 
 #[tauri::command]
-async fn pick_image(app: AppHandle) -> Value {
-    if app.state::<AppState>().current.lock().unwrap().is_none() {
+async fn pick_image(app: AppHandle, window: tauri::WebviewWindow) -> Value {
+    if window_doc_path(&app, window.label()).is_none() {
         return json!({ "error": "unsaved" });
     }
     let picked = app
@@ -692,7 +791,7 @@ async fn pick_image(app: AppHandle) -> Value {
         None => return Value::Null,
     };
     let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
-    match assets_rel(&app, ext) {
+    match assets_rel(&app, window.label(), ext) {
         Some((dest, rel)) if fs::copy(&src, &dest).is_ok() => json!({ "rel": rel }),
         _ => Value::Null,
     }
@@ -1043,25 +1142,128 @@ fn save_annotations(path: Option<String>, annotations: Value) -> bool {
 }
 
 // ---- crash-recovery snapshot ----
+// Untitled (never-saved) buffers snapshot to recovery/untitled-<label>.json (#4).
+// Labels restart each launch, so surfacing recovery scans the whole set and offers
+// the newest — see untitled_recovery.
+fn untitled_recovery_dir() -> PathBuf {
+    plume_dir().join("recovery")
+}
+
+fn untitled_recovery_file(label: &str) -> PathBuf {
+    let clean: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    untitled_recovery_dir().join(format!("untitled-{}.json", clean))
+}
+
+fn clear_untitled_recovery(label: &str) {
+    let _ = fs::remove_file(untitled_recovery_file(label));
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// Pinned in setup(). Snapshots written before this instant are crash leftovers
+// from a PREVIOUS run; anything newer belongs to a live untitled window in THIS
+// session and must never be offered to another window as "recovery".
+static LAUNCHED_AT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn launched_at_ms() -> u64 {
+    *LAUNCHED_AT_MS.get_or_init(now_ms)
+}
+
 #[tauri::command]
-fn snapshot(app: AppHandle, content: String) {
-    let cur = app.state::<AppState>().current.lock().unwrap().clone();
-    if let Some(path) = cur {
+fn snapshot(app: AppHandle, window: tauri::WebviewWindow, content: String) {
+    let label = window.label();
+    if let Some(path) = window_doc_path(&app, label) {
         let file = recovery_path(&path);
         if let Some(dir) = file.parent() {
             let _ = fs::create_dir_all(dir);
         }
         let _ = fs::write(file, json!({ "filePath": path, "content": content }).to_string());
+    } else if content.trim().is_empty() {
+        // Nothing worth recovering — don't leave a stale untitled snapshot behind.
+        clear_untitled_recovery(label);
+    } else {
+        let file = untitled_recovery_file(label);
+        if let Some(dir) = file.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(file, json!({ "content": content }).to_string());
     }
 }
 
 // Discard the crash-recovery snapshot for the open file (banner "Discard").
 #[tauri::command]
-fn discard_recovery(app: AppHandle) {
-    let cur = app.state::<AppState>().current.lock().unwrap().clone();
-    if let Some(path) = cur {
-        let _ = fs::remove_file(recovery_path(&path));
+fn discard_recovery(app: AppHandle, window: tauri::WebviewWindow) {
+    match window_doc_path(&app, window.label()) {
+        Some(path) => { let _ = fs::remove_file(recovery_path(&path)); }
+        None => clear_untitled_recovery(window.label()),
     }
+}
+
+// Newest untitled crash snapshot, if any — the renderer calls this when a blank
+// window opens and offers a restore banner. Non-destructive; the renderer clears
+// it via discard_untitled_recovery(key) after restoring or dismissing.
+#[tauri::command]
+fn untitled_recovery() -> Option<Value> {
+    let dir = untitled_recovery_dir();
+    let mut best: Option<(u64, String, String)> = None; // (mtime, key, content)
+    for e in fs::read_dir(&dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !(name.starts_with("untitled-") && name.ends_with(".json")) {
+            continue;
+        }
+        let p = e.path();
+        let Some(content) = fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v["content"].as_str().map(|c| c.to_string()))
+        else {
+            continue;
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        let ts = file_mtime_ms(&p);
+        // Only pre-launch snapshots are recovery; newer ones belong to a live
+        // untitled window in this session (offering those would cross-talk).
+        if ts >= launched_at_ms() {
+            continue;
+        }
+        if best.as_ref().map(|(t, _, _)| ts > *t).unwrap_or(true) {
+            best = Some((ts, name, content));
+        }
+    }
+    best.map(|(_, key, content)| json!({ "key": key, "content": content }))
+}
+
+// Remove one untitled snapshot by the key untitled_recovery returned. The key is
+// re-derived through the same sanitizer + fixed prefix/suffix so a caller can
+// never turn it into a path traversal.
+#[tauri::command]
+fn discard_untitled_recovery(key: String) {
+    let stem = key
+        .strip_prefix("untitled-")
+        .and_then(|s| s.strip_suffix(".json"))
+        .unwrap_or(&key);
+    clear_untitled_recovery(stem);
+}
+
+// Renderer-confirmed close of an untitled window (after its unsaved-changes
+// prompt): the user chose to discard, so drop the dirty flag AND the crash
+// snapshot (an explicit discard must not resurrect next launch), then destroy.
+// destroy() skips CloseRequested, so this can't re-enter the prompt loop.
+#[tauri::command]
+fn close_window_now(app: AppHandle, window: tauri::WebviewWindow) {
+    app.state::<AppState>().untitled_dirty.lock().unwrap().remove(window.label());
+    clear_untitled_recovery(window.label());
+    let _ = window.destroy();
 }
 
 // ---- Claude Code sessions + context ----
@@ -1442,7 +1644,12 @@ fn agent_query(app: &AppHandle, kind: &str) -> Value {
             }
             json!({ "ok": true, "value": v })
         }
-        Err(_) => json!({ "ok": false, "error": "renderer timeout" }),
+        Err(_) => {
+            // Reap the abandoned sender — otherwise every renderer timeout leaks
+            // a pending-map entry (and its channel) for the life of the process.
+            state.pending.lock().unwrap().remove(&id);
+            json!({ "ok": false, "error": "renderer timeout" })
+        }
     }
 }
 
@@ -1463,15 +1670,22 @@ fn canonical_key(p: &Path) -> PathBuf {
     }
 }
 
-// The files Plume currently has open: the focused doc plus every window's file.
+// The files Plume currently has open: the union of every window's document (#5)
+// plus any spawned-but-not-yet-loaded window targets. Previously this leaned on a
+// global `current` while initial_file deleted the per-window entry, so all but
+// the most recently touched window silently fell OUT of the agent write scope.
 fn open_files(app: &AppHandle) -> HashSet<PathBuf> {
     let st = app.state::<AppState>();
     let mut set = HashSet::new();
-    if let Some(c) = st.current.lock().unwrap().clone() {
-        set.insert(canonical_key(Path::new(&c)));
+    for d in st.docs.lock().unwrap().values() {
+        if !d.path.is_empty() {
+            set.insert(canonical_key(Path::new(&d.path)));
+        }
     }
     for f in st.window_files.lock().unwrap().values() {
-        set.insert(canonical_key(Path::new(f)));
+        if !f.is_empty() {
+            set.insert(canonical_key(Path::new(f)));
+        }
     }
     set
 }
@@ -1534,19 +1748,43 @@ mod tests {
         let s = scope(&["/x"]);
         assert!(!path_within_open_scope(&s, Path::new("/etc/passwd")));
     }
+
+    #[test]
+    fn untitled_recovery_key_cannot_escape_recovery_dir() {
+        // A hostile key (e.g. via discard_untitled_recovery) must sanitize into a
+        // flat file name inside the recovery dir — never a traversal.
+        for evil in ["../../evil", "..", "a/b/c", "..\\..\\x"] {
+            let f = untitled_recovery_file(evil);
+            assert!(f.starts_with(untitled_recovery_dir()), "escaped: {evil}");
+            assert!(!f.to_string_lossy().contains(".."), "kept dots: {evil}");
+        }
+    }
 }
 
 // The renderer reports per-document dirty state so writeDocument can refuse to
-// clobber a buffer with unsaved edits (P1-4). Keyed by canonical path.
+// clobber a buffer with unsaved edits (P1-4). Keyed by canonical path. A null
+// path means THIS window's untitled buffer — tracked by label so close can
+// intercept and prompt before the content is lost (#4).
 #[tauri::command]
-fn set_doc_dirty(state: tauri::State<AppState>, path: Option<String>, dirty: bool) {
-    let Some(p) = path else { return };
-    let key = canonical_key(Path::new(&p)).to_string_lossy().to_string();
-    let mut set = state.dirty_files.lock().unwrap();
-    if dirty {
-        set.insert(key);
-    } else {
-        set.remove(&key);
+fn set_doc_dirty(window: tauri::WebviewWindow, state: tauri::State<AppState>, path: Option<String>, dirty: bool) {
+    match path {
+        Some(p) => {
+            let key = canonical_key(Path::new(&p)).to_string_lossy().to_string();
+            let mut set = state.dirty_files.lock().unwrap();
+            if dirty {
+                set.insert(key);
+            } else {
+                set.remove(&key);
+            }
+        }
+        None => {
+            let mut set = state.untitled_dirty.lock().unwrap();
+            if dirty {
+                set.insert(window.label().to_string());
+            } else {
+                set.remove(window.label());
+            }
+        }
     }
 }
 
@@ -1556,6 +1794,19 @@ fn focused_or_main(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         .into_values()
         .find(|w| w.is_focused().unwrap_or(false))
         .or_else(|| app.get_webview_window("main"))
+}
+
+fn focused_label(app: &AppHandle) -> Option<String> {
+    app.webview_windows()
+        .into_values()
+        .find(|w| w.is_focused().unwrap_or(false))
+        .map(|w| w.label().to_string())
+}
+
+// The document open in the focused window (None if unfocused/untitled).
+fn focused_doc(app: &AppHandle) -> Option<String> {
+    let label = focused_label(app)?;
+    window_doc_path(app, &label)
 }
 
 // Route an open to ONE window's smartOpen (reuse it if it's an empty/untitled
@@ -1663,9 +1914,7 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
             _ => json!({ "ok": false, "error": "path and content required" }),
         },
         "getAnnotations" => {
-            let p = req["path"].as_str().map(|s| s.to_string()).or_else(|| {
-                app.state::<AppState>().current.lock().unwrap().clone()
-            });
+            let p = req["path"].as_str().map(|s| s.to_string()).or_else(|| focused_doc(app));
             match p {
                 Some(p) => {
                     // Read scope = write scope: don't let a socket caller pull a
@@ -1680,8 +1929,26 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
             }
         }
         "listOpenFiles" => {
-            let cur = app.state::<AppState>().current.lock().unwrap().clone();
-            json!({ "ok": true, "files": [{ "path": cur, "dirty": false, "focused": true }] })
+            // Every window's document, with real dirty + focused flags — the old
+            // single-global answer hid all but one window from agents.
+            let focused = focused_label(app);
+            let st = app.state::<AppState>();
+            let files: Vec<Value> = {
+                let docs = st.docs.lock().unwrap();
+                let dirty = st.dirty_files.lock().unwrap();
+                docs.iter()
+                    .filter(|(_, d)| !d.path.is_empty())
+                    .map(|(label, d)| {
+                        let key = canonical_key(Path::new(&d.path)).to_string_lossy().to_string();
+                        json!({
+                            "path": d.path,
+                            "dirty": dirty.contains(&key),
+                            "focused": focused.as_deref() == Some(label.as_str()),
+                        })
+                    })
+                    .collect()
+            };
+            json!({ "ok": true, "files": files })
         }
         "windows" => {
             let labels: Vec<String> = app.webview_windows().into_keys().collect();
@@ -1832,7 +2099,8 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
     }
     let recent_menu = recent_b.build()?;
 
-    let file = SubmenuBuilder::new(app, "File")
+    #[allow(unused_mut)]
+    let mut file_b = SubmenuBuilder::new(app, "File")
         .item(&mi("new", "New", Some("CmdOrCtrl+N"))?)
         .item(&mi("open", "Open…", Some("CmdOrCtrl+O"))?)
         .item(&recent_menu)
@@ -1844,8 +2112,13 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
         .item(&mi("export:docx", "Export Word…", None)?)
         .item(&mi("publishGoogle", "Publish to Google Docs…", None)?)
         .separator()
-        .item(&PredefinedMenuItem::close_window(app, Some("Close"))?)
-        .build()?;
+        .item(&PredefinedMenuItem::close_window(app, Some("Close"))?);
+    // No macOS app menu on Windows/Linux — Quit belongs under File there.
+    #[cfg(not(target_os = "macos"))]
+    {
+        file_b = file_b.separator().quit();
+    }
+    let file = file_b.build()?;
 
     let edit = SubmenuBuilder::new(app, "Edit")
         .undo()
@@ -1862,18 +2135,30 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
         .item(&mi("find", "Find…", Some("CmdOrCtrl+F"))?)
         .build()?;
 
+    // Format-menu parity with the in-app block controls (#12): strike, lists,
+    // quote, code block, table, rule — every action discoverable from the menu bar.
     let format = SubmenuBuilder::new(app, "Format")
         .item(&mi("format:bold", "Bold", Some("CmdOrCtrl+B"))?)
         .item(&mi("format:italic", "Italic", Some("CmdOrCtrl+I"))?)
+        .item(&mi("format:strike", "Strikethrough", Some("CmdOrCtrl+Shift+X"))?)
         .item(&mi("format:code", "Inline Code", Some("CmdOrCtrl+E"))?)
         .item(&mi("format:link", "Link", Some("CmdOrCtrl+K"))?)
-        .separator()
-        .item(&mi("addNote", "Add Note for Agent", Some("CmdOrCtrl+J"))?)
         .separator()
         .item(&mi("heading:1", "Heading 1", Some("CmdOrCtrl+1"))?)
         .item(&mi("heading:2", "Heading 2", Some("CmdOrCtrl+2"))?)
         .item(&mi("heading:3", "Heading 3", Some("CmdOrCtrl+3"))?)
         .item(&mi("heading:0", "Body Text", Some("CmdOrCtrl+0"))?)
+        .separator()
+        .item(&mi("list:bullet", "Bullet List", Some("CmdOrCtrl+Shift+8"))?)
+        .item(&mi("list:ordered", "Numbered List", Some("CmdOrCtrl+Shift+7"))?)
+        .item(&mi("list:task", "To-do List", None)?)
+        .separator()
+        .item(&mi("block:quote", "Block Quote", None)?)
+        .item(&mi("block:code", "Code Block", None)?)
+        .item(&mi("insert:table", "Table", None)?)
+        .item(&mi("insert:hr", "Horizontal Rule", None)?)
+        .separator()
+        .item(&mi("addNote", "Add Note for Agent", Some("CmdOrCtrl+J"))?)
         .build()?;
 
     let view = SubmenuBuilder::new(app, "View")
@@ -1894,12 +2179,40 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
         .item(&mi("workspace", "Sessions & Context…", Some("CmdOrCtrl+Shift+P"))?)
         .build()?;
 
-    let menu = MenuBuilder::new(app)
+    let window_menu = SubmenuBuilder::new(app, "Window")
+        .minimize()
+        .maximize() // "Zoom" on macOS
+        .fullscreen()
+        .separator()
+        .close_window()
+        .build()?;
+
+    let mut mb = MenuBuilder::new(app);
+    // On macOS the FIRST submenu becomes the application menu. Without one, File
+    // was silently promoted — so there was no About/Hide and, critically, no
+    // Quit ⌘Q (#2). Windows/Linux skip it: Quit lives under File there instead.
+    #[cfg(target_os = "macos")]
+    {
+        let app_menu = SubmenuBuilder::new(app, "Plume")
+            .about(None)
+            .separator()
+            .services()
+            .separator()
+            .hide()
+            .hide_others()
+            .show_all()
+            .separator()
+            .quit()
+            .build()?;
+        mb = mb.item(&app_menu);
+    }
+    let menu = mb
         .item(&file)
         .item(&edit)
         .item(&format)
         .item(&view)
         .item(&go)
+        .item(&window_menu)
         .build()?;
     app.set_menu(menu)?;
     Ok(())
@@ -1959,7 +2272,10 @@ fn main() {
             link_preview,
             agent_reply,
             set_recent_files,
-            set_doc_dirty
+            set_doc_dirty,
+            untitled_recovery,
+            discard_untitled_recovery,
+            close_window_now
         ])
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();
@@ -1967,6 +2283,13 @@ fn main() {
             // path is the sentinel `initial_file` reads as "untitled".
             if id == "new" {
                 let _ = spawn_window(app, "");
+                return;
+            }
+            // File > Open with no window alive (macOS after ⌘W): there is no
+            // renderer to run the dialog, so run it natively off-thread.
+            if id == "open" && app.webview_windows().is_empty() {
+                let appc = app.clone();
+                std::thread::spawn(move || { let _ = open_via_dialog(&appc); });
                 return;
             }
             let (base, arg) = match id.split_once(':') {
@@ -1978,9 +2301,54 @@ fn main() {
                 (_, Some(a)) => json!(a),
                 (_, None) => Value::Null,
             };
-            let _ = app.emit("menu", json!({ "channel": format!("menu:{}", base), "arg": arg_val }));
+            let payload = json!({ "channel": format!("menu:{}", base), "arg": arg_val });
+            // Deliver to the FOCUSED window only. The old app-wide broadcast made
+            // every window apply the action (bold in three buffers at once).
+            match focused_or_main(app) {
+                Some(win) => { let _ = app.emit_to(win.label(), "menu", payload); }
+                None => { let _ = app.emit("menu", payload); }
+            }
+        })
+        .on_window_event(|window, event| {
+            let label = window.label().to_string();
+            // Hidden pdf* export windows carry no document state.
+            if label.starts_with("pdf") {
+                return;
+            }
+            match event {
+                // Closing an untitled buffer with unsaved edits would destroy the
+                // only copy (#4) — hold the close and let the renderer prompt.
+                // The renderer resolves via save/materialize or close_window_now.
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    let app = window.app_handle();
+                    let st = app.state::<AppState>();
+                    let untitled = window_doc_path(app, &label).is_none();
+                    if untitled && st.untitled_dirty.lock().unwrap().contains(&label) {
+                        api.prevent_close();
+                        let _ = app.emit_to(&label, "close-requested", json!({}));
+                    }
+                }
+                // Window gone: retire its doc state so the agent write scope and
+                // dirty set shrink with it (a dead window must not pin either).
+                tauri::WindowEvent::Destroyed => {
+                    let app = window.app_handle();
+                    let st = app.state::<AppState>();
+                    let old = st.docs.lock().unwrap().remove(&label);
+                    if let Some(d) = &old {
+                        if !d.path.is_empty() {
+                            let key = canonical_key(Path::new(&d.path)).to_string_lossy().to_string();
+                            st.dirty_files.lock().unwrap().remove(&key);
+                        }
+                    }
+                    st.window_files.lock().unwrap().remove(&label);
+                    st.untitled_dirty.lock().unwrap().remove(&label);
+                    drop(old); // watcher dropped outside any state lock
+                }
+                _ => {}
+            }
         })
         .setup(|app| {
+            launched_at_ms(); // pin the recovery cutoff to actual app start
             let handle = app.handle().clone();
             let args: Vec<String> = std::env::args().collect();
             if let Some(p) = args.iter().skip(1).find(|a| !a.starts_with('-')) {
@@ -1991,7 +2359,8 @@ fn main() {
             let _ = build_and_set_menu(&handle);
             start_socket(handle.clone());
 
-            // plume://open?path=/abs/file.md deep links
+            // plume://open?path=/abs/file.md&line=42 deep links (#9: line= jumps
+            // the opened window to that line, same as the CLI's --line).
             use tauri_plugin_deep_link::DeepLinkExt;
             let _ = app.deep_link().register("plume");
             let dl_handle = handle.clone();
@@ -1999,9 +2368,18 @@ fn main() {
                 for url in event.urls() {
                     let s = url.to_string();
                     if let Some(q) = s.split('?').nth(1) {
+                        let mut path: Option<String> = None;
+                        let mut line: Option<i64> = None;
                         for kv in q.split('&') {
                             if let Some(p) = kv.strip_prefix("path=") {
-                                open_external_file(&dl_handle, &urlencoding_decode(p));
+                                path = Some(urlencoding_decode(p));
+                            } else if let Some(l) = kv.strip_prefix("line=") {
+                                line = l.parse().ok();
+                            }
+                        }
+                        if let Some(p) = path {
+                            if Path::new(&p).is_file() {
+                                deliver_open(&dl_handle, &p, line);
                             }
                         }
                     }
@@ -2016,13 +2394,31 @@ fn main() {
             // macOS-only variant). Windows/Linux receive paths via argv +
             // single-instance + OS file associations instead.
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Opened { urls } = _event {
-                for url in urls {
-                    let s = url.to_string();
-                    let p = s.strip_prefix("file://").unwrap_or(&s);
-                    let p = urlencoding_decode(p);
-                    open_external_file(_app, &p);
+            match _event {
+                tauri::RunEvent::Opened { urls } => {
+                    for url in urls {
+                        let s = url.to_string();
+                        let p = s.strip_prefix("file://").unwrap_or(&s);
+                        let p = urlencoding_decode(p);
+                        open_external_file(_app, &p);
+                    }
                 }
+                // macOS convention (#2): closing the last window (⌘W) keeps the
+                // app alive in the Dock; only an explicit quit (⌘Q → exit code)
+                // ends the process. exit(0) arrives with code Some(0), so only
+                // the implicit all-windows-closed request (code None) is held.
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    if code.is_none() {
+                        api.prevent_exit();
+                    }
+                }
+                // Dock icon click with no windows: reopen a blank one.
+                tauri::RunEvent::Reopen { has_visible_windows, .. } => {
+                    if !has_visible_windows {
+                        let _ = spawn_window(_app, "");
+                    }
+                }
+                _ => {}
             }
         });
 }
