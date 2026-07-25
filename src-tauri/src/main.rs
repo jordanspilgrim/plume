@@ -221,6 +221,40 @@ fn sidecar_script(app: &AppHandle) -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
+// ---- lazy app-local Node runtime (#8) ----
+// The sidecar needs a Node runtime, which is NOT bundled (it would add ~50 MB
+// to a ~5 MB app). Resolution order: Plume's private runtime in app-data
+// (installed once via `install_node` below), then `node` reachable from this
+// process. Neither → structured NODE_MISSING, which the renderer turns into
+// the one-time "Enable export" download flow (ensureExportRuntime).
+const NODE_VERSION: &str = "v22.22.0";
+const NODE_DIST_BASE: &str = "https://nodejs.org/dist";
+
+fn managed_node_path(app: &AppHandle) -> Option<PathBuf> {
+    Some(app.path().app_data_dir().ok()?.join("node/bin/node"))
+}
+
+fn system_node() -> Option<PathBuf> {
+    // GUI-launched macOS apps inherit a minimal PATH (/usr/bin:/bin:...), so a
+    // plain `Command::new("node")` misses Homebrew/nvm installs. Probe the
+    // common install spots, then whatever PATH we do have.
+    for cand in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"] {
+        let p = PathBuf::from(cand);
+        if p.is_file() { return Some(p); }
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|d| d.join(if cfg!(windows) { "node.exe" } else { "node" }))
+        .find(|p| p.is_file())
+}
+
+fn resolve_node(app: &AppHandle) -> Option<PathBuf> {
+    if let Some(p) = managed_node_path(app) {
+        if p.is_file() { return Some(p); }
+    }
+    system_node()
+}
+
 // Hard deadline on any sidecar run (#8): a hung Node process (stuck OAuth flow,
 // dead network fetch) previously blocked wait_with_output forever, wedging the
 // export path for the rest of the session. Generous enough for a first-time
@@ -233,7 +267,11 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
         Some(p) => p,
         None => return json!({ "ok": false, "error": "export sidecar not found" }),
     };
-    let mut child = match Command::new("node")
+    let node = match resolve_node(app) {
+        Some(n) => n,
+        None => return json!({ "ok": false, "error": "export needs a Node runtime", "code": "NODE_MISSING" }),
+    };
+    let mut child = match Command::new(&node)
         .arg(&script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -241,7 +279,7 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return json!({ "ok": false, "error": "Node.js not found on PATH — it's required for DOCX and Google Docs export. Install Node 18+ and restart Plume." }),
+        Err(e) => return json!({ "ok": false, "error": format!("export helper failed to start: {e}") }),
     };
     // Feed stdin and drain stdout on their own threads so a child that never
     // reads (or floods) a pipe can't deadlock us against the timeout loop below.
@@ -276,6 +314,175 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
     }
     let stdout = reader.and_then(|t| t.join().ok()).unwrap_or_default();
     serde_json::from_slice(&stdout).unwrap_or(json!({ "ok": false, "error": "no result" }))
+}
+
+// Runtime hardware arch — NOT the compile target: an x64 build running under
+// Rosetta should still install the native arm64 runtime.
+fn node_arch() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(o) = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.optional.arm64"]).output() {
+            if String::from_utf8_lossy(&o.stdout).trim() == "1" {
+                return "arm64";
+            }
+        }
+        "x64"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" }
+    }
+}
+
+// Find `<hex>  <file>` in Node's published SHASUMS256.txt.
+fn shasum_for(shasums: &str, file: &str) -> Option<String> {
+    shasums.lines().find_map(|l| {
+        let (hash, name) = l.split_once(char::is_whitespace)?;
+        (name.trim() == file).then(|| hash.trim().to_lowercase())
+    })
+}
+
+// Download the official pinned-LTS Node for this machine into
+// <data_dir>/node/bin/node: fetch SHASUMS256.txt, stream the tarball to disk
+// hashing as we go, verify, extract only bin/node (it's self-contained), and
+// prove the result runs. No sudo, no PATH mutation; survives app updates
+// because app-data does. Errors are (code, message) — codes are part of the
+// renderer contract (DOWNLOAD_FAILED / VERIFY_FAILED / EXTRACT_FAILED /
+// UNSUPPORTED / IN_PROGRESS).
+fn install_node_runtime(
+    data_dir: &Path,
+    progress: &dyn Fn(&str, u64, u64),
+) -> Result<(PathBuf, String), (String, String)> {
+    use sha2::{Digest, Sha256};
+    if cfg!(windows) {
+        return Err(("UNSUPPORTED".into(), "automatic Node install isn't supported on Windows yet — install Node from nodejs.org and relaunch Plume".into()));
+    }
+    let platform = if cfg!(target_os = "macos") { "darwin" } else { "linux" };
+    let name = format!("node-{NODE_VERSION}-{platform}-{}", node_arch());
+    let tarball = format!("{name}.tar.gz");
+    let dl = |m: String| ("DOWNLOAD_FAILED".to_string(), m);
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(60))
+        .build();
+
+    let shasums = agent
+        .get(&format!("{NODE_DIST_BASE}/{NODE_VERSION}/SHASUMS256.txt"))
+        .call()
+        .map_err(|e| dl(format!("couldn't fetch checksums: {e}")))?
+        .into_string()
+        .map_err(|e| dl(e.to_string()))?;
+    let expected = shasum_for(&shasums, &tarball)
+        .ok_or_else(|| ("VERIFY_FAILED".to_string(), format!("{tarball} not listed in SHASUMS256.txt")))?;
+
+    let resp = agent
+        .get(&format!("{NODE_DIST_BASE}/{NODE_VERSION}/{tarball}"))
+        .call()
+        .map_err(|e| dl(format!("download failed: {e}")))?;
+    let total: u64 = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    let work = data_dir.join("node.download");
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work).map_err(|e| dl(e.to_string()))?;
+    let tgz = work.join(&tarball);
+
+    const MAX_BYTES: u64 = 256 * 1024 * 1024; // sanity cap, tarballs are ~50 MB
+    let mut hasher = Sha256::new();
+    let mut reader = resp.into_reader();
+    let mut file = fs::File::create(&tgz).map_err(|e| dl(e.to_string()))?;
+    let mut buf = [0u8; 128 * 1024];
+    let mut received: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| dl(format!("download interrupted: {e}")))?;
+        if n == 0 { break; }
+        received += n as u64;
+        if received > MAX_BYTES {
+            let _ = fs::remove_dir_all(&work);
+            return Err(dl("download exceeded size cap".into()));
+        }
+        hasher.update(&buf[..n]);
+        file.write_all(&buf[..n]).map_err(|e| dl(e.to_string()))?;
+        progress("download", received, total);
+    }
+    drop(file);
+
+    progress("verify", received, total);
+    let got = format!("{:x}", hasher.finalize());
+    if got != expected {
+        let _ = fs::remove_dir_all(&work);
+        return Err(("VERIFY_FAILED".into(), format!("checksum mismatch for {tarball}")));
+    }
+
+    progress("extract", received, total);
+    let status = std::process::Command::new("tar")
+        .arg("-xzf").arg(&tgz).arg("-C").arg(&work).arg(format!("{name}/bin/node"))
+        .status()
+        .map_err(|e| ("EXTRACT_FAILED".to_string(), e.to_string()))?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&work);
+        return Err(("EXTRACT_FAILED".into(), "tar extraction failed".into()));
+    }
+
+    let bin_dir = data_dir.join("node/bin");
+    fs::create_dir_all(&bin_dir).map_err(|e| ("EXTRACT_FAILED".to_string(), e.to_string()))?;
+    let final_path = bin_dir.join("node");
+    let _ = fs::remove_file(&final_path);
+    fs::rename(work.join(&name).join("bin/node"), &final_path)
+        .map_err(|e| ("EXTRACT_FAILED".to_string(), e.to_string()))?;
+    let _ = fs::remove_dir_all(&work);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&final_path, fs::Permissions::from_mode(0o755));
+    }
+
+    // Prove it: runs and is the pinned version.
+    let out = std::process::Command::new(&final_path)
+        .arg("--version")
+        .output()
+        .map_err(|e| ("VERIFY_FAILED".to_string(), format!("installed node won't run: {e}")))?;
+    let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !ver.starts_with(NODE_VERSION) {
+        return Err(("VERIFY_FAILED".into(), format!("installed node reports unexpected version '{ver}'")));
+    }
+    progress("done", received, total);
+    Ok((final_path, ver))
+}
+
+static NODE_INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[tauri::command]
+fn node_status(app: AppHandle) -> Value {
+    let managed = managed_node_path(&app).map(|p| p.is_file()).unwrap_or(false);
+    json!({ "available": managed || system_node().is_some(), "managed": managed })
+}
+
+#[tauri::command]
+async fn install_node(app: AppHandle) -> Value {
+    if NODE_INSTALLING.swap(true, Ordering::SeqCst) {
+        return json!({ "ok": false, "error": "a Node install is already running", "code": "IN_PROGRESS" });
+    }
+    let data_dir = match app.path().app_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            NODE_INSTALLING.store(false, Ordering::SeqCst);
+            return json!({ "ok": false, "error": e.to_string(), "code": "DOWNLOAD_FAILED" });
+        }
+    };
+    let appc = app.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        install_node_runtime(&data_dir, &|phase, received, total| {
+            let _ = appc.emit("node-install-progress", json!({ "phase": phase, "received": received, "total": total }));
+        })
+    })
+    .await;
+    NODE_INSTALLING.store(false, Ordering::SeqCst);
+    match res {
+        Ok(Ok((_, ver))) => json!({ "ok": true, "version": ver }),
+        Ok(Err((code, msg))) => json!({ "ok": false, "error": msg, "code": code }),
+        Err(e) => json!({ "ok": false, "error": e.to_string(), "code": "DOWNLOAD_FAILED" }),
+    }
 }
 
 #[tauri::command]
@@ -2247,6 +2454,8 @@ fn main() {
             export_doc,
             export_pdf,
             publish_google,
+            node_status,
+            install_node,
             open_external,
             open_dialog,
             save_dialog,
@@ -2440,4 +2649,55 @@ fn urlencoding_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+#[cfg(test)]
+mod node_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn shasum_parsing_matches_exact_file() {
+        let shasums = "\
+abc123DEF  node-v22.22.0-darwin-arm64.tar.gz
+999888  node-v22.22.0-darwin-arm64.tar.xz
+777666  node-v22.22.0-darwin-x64.tar.gz";
+        assert_eq!(
+            shasum_for(shasums, "node-v22.22.0-darwin-arm64.tar.gz").as_deref(),
+            Some("abc123def")
+        );
+        assert_eq!(
+            shasum_for(shasums, "node-v22.22.0-darwin-x64.tar.gz").as_deref(),
+            Some("777666")
+        );
+        assert_eq!(shasum_for(shasums, "node-v22.22.0-linux-x64.tar.gz"), None);
+    }
+
+    #[test]
+    fn node_arch_is_a_known_value() {
+        assert!(matches!(node_arch(), "arm64" | "x64"));
+    }
+
+    // Real network, ~50 MB download. Run explicitly:
+    //   cargo test -- --ignored node_install_end_to_end
+    // Set PLUME_NODE_TEST_DIR to install into a fixed dir and keep it (lets a
+    // harness chain the installed runtime into a sidecar-level export check).
+    #[test]
+    #[ignore]
+    fn node_install_end_to_end() {
+        let (dir, keep) = match std::env::var("PLUME_NODE_TEST_DIR") {
+            Ok(d) => (PathBuf::from(d), true),
+            Err(_) => (std::env::temp_dir().join(format!("plume-node-test-{}", std::process::id())), false),
+        };
+        let _ = fs::remove_dir_all(&dir);
+        let (path, ver) = install_node_runtime(&dir, &|_, _, _| {}).expect("install should succeed");
+        assert!(path.is_file());
+        assert!(ver.starts_with(NODE_VERSION), "got {ver}");
+        assert_eq!(path, dir.join("node/bin/node"), "lands at the managed location");
+        let out = std::process::Command::new(&path)
+            .args(["-e", "console.log(21*2)"])
+            .output()
+            .expect("installed node should run");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
+        if !keep { let _ = fs::remove_dir_all(&dir); }
+    }
 }
