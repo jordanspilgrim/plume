@@ -4,144 +4,20 @@
   "description": "A fast, single-surface Markdown editor — renders like a document, saves like a text file.",
   "author": "Gabriel",
   "license": "MIT",
-  "main": "src/main/main.js",
   "bin": {
     "plume": "bin/plume.js"
   },
   "scripts": {
-    "test": "node --test test/*.test.js",
     "build:renderer": "node esbuild.config.mjs",
     "watch:renderer": "node esbuild.config.mjs --watch",
-    "start": "npm run build:renderer && electron .",
-    "dev": "npm run build:renderer && electron .",
-    "dist": "npm run build:renderer && electron-builder",
-    "dist:dir": "npm run build:renderer && electron-builder --dir",
+    "dev": "npm run tauri:dev",
     "tauri:frontend": "npm run build:renderer && node scripts/build-tauri.mjs",
     "tauri:build": "npm run tauri:frontend && tauri build",
-    "tauri:dev": "npm run tauri:frontend && tauri dev"
-  },
-  "build": {
-    "appId": "com.gabriel.plume",
-    "productName": "Plume",
-    "directories": {
-      "output": "release",
-      "buildResources": "build"
-    },
-    "files": [
-      "src/main/**/*",
-      "src/preload/**/*",
-      "src/renderer/index.html",
-      "src/renderer/styles.css",
-      "bin/**/*",
-      "dist/**/*",
-      "package.json"
-    ],
-    "protocols": [
-      {
-        "name": "Plume",
-        "schemes": [
-          "plume"
-        ]
-      }
-    ],
-    "mac": {
-      "category": "public.app-category.productivity",
-      "target": [
-        {
-          "target": "dir",
-          "arch": [
-            "arm64"
-          ]
-        }
-      ],
-      "icon": "build/icon.icns",
-      "extendInfo": {
-        "CFBundleDocumentTypes": [
-          {
-            "CFBundleTypeName": "Markdown Document",
-            "CFBundleTypeRole": "Editor",
-            "LSHandlerRank": "Owner",
-            "LSItemContentTypes": [
-              "net.daringfireball.markdown",
-              "public.plain-text"
-            ],
-            "CFBundleTypeExtensions": [
-              "md",
-              "markdown",
-              "mdown",
-              "mkd",
-              "mdx",
-              "text",
-              "txt"
-            ]
-          },
-          {
-            "CFBundleTypeName": "Source & Data File",
-            "CFBundleTypeRole": "Editor",
-            "LSHandlerRank": "Alternate",
-            "CFBundleTypeExtensions": [
-              "json",
-              "jsonc",
-              "jsonl",
-              "ndjson",
-              "yaml",
-              "yml",
-              "toml",
-              "ini",
-              "env",
-              "conf",
-              "cfg",
-              "diff",
-              "patch",
-              "log",
-              "csv",
-              "tsv",
-              "mmd",
-              "xml",
-              "svg",
-              "js",
-              "jsx",
-              "mjs",
-              "cjs",
-              "ts",
-              "tsx",
-              "py",
-              "rs",
-              "go",
-              "sh",
-              "bash",
-              "zsh",
-              "sql",
-              "css",
-              "html"
-            ]
-          }
-        ],
-        "UTImportedTypeDeclarations": [
-          {
-            "UTTypeIdentifier": "net.daringfireball.markdown",
-            "UTTypeConformsTo": [
-              "public.plain-text"
-            ],
-            "UTTypeDescription": "Markdown Document",
-            "UTTypeTagSpecification": {
-              "public.filename-extension": [
-                "md",
-                "markdown",
-                "mdown",
-                "mkd",
-                "mdx"
-              ]
-            }
-          }
-        ]
-      }
-    }
+    "tauri:dev": "npm run tauri:frontend && tauri dev",
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.2",
-    "electron": "^42.4.0",
-    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.1"
   },
   "dependencies": {
