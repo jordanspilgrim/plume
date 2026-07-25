@@ -13,7 +13,7 @@
         "/fake/a.md": "# Alpha\n\nContent of a.md\n",
         "/fake/b.md": "# Beta\n\nContent of b.md\n",
       };
-      let openCb = null, closeCb = null, menuCb = null, extCb = null;
+      let openCb = null, closeCb = null, menuCb = null, extCb = null, progressCb = null;
       window.__stub = {
         fs: FS,
         fireClose: () => closeCb && closeCb(),
@@ -64,10 +64,24 @@
         pickImage: async () => null,
         linkPreview: async () => null,
         openInNewWindow: log("openInNewWindow"),
-        exportDoc: async () => null,
-        publishGoogle: async () => null,
+        exportDoc: async (format, html, name) => { window.__stub.calls.push(["exportDoc", format]); return "/fake/out." + format; },
+        publishGoogle: async () => { window.__stub.calls.push(["publishGoogle"]); return window.__stub.publishResult; },
         setDirty: log("setDirty"),
+        // ---- pkg-dev export-runtime contract (PR #2) ----
+        nodeStatus: async () => ({ available: window.__stub.nodeAvailable, managed: true }),
+        installNode: async () => {
+          window.__stub.calls.push(["installNode"]);
+          progressCb && progressCb({ phase: "download", received: 10485760, total: 50331648 });
+          progressCb && progressCb({ phase: "download", received: 50331648, total: 50331648 });
+          progressCb && progressCb({ phase: "verify", received: 0, total: 0 });
+          progressCb && progressCb({ phase: "done", received: 0, total: 0 });
+          window.__stub.nodeAvailable = true;
+          return { ok: true, version: "v22.12.0" };
+        },
+        onNodeInstallProgress: (cb) => { progressCb = cb; },
       };
+      window.__stub.nodeAvailable = false;
+      window.__stub.publishResult = { ok: true, url: null };
     </script>
   </head>
   <body>

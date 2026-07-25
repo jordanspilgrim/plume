@@ -669,15 +669,70 @@ async function copyAsHtml() {
     flashMessage("Copied HTML source");
   } catch (e) { flashMessage("Copy failed: " + e.message); }
 }
+/* ---------- Export runtime enablement (pkg-dev contract, PR #2) ----------
+   docx export + Google publish run through a Node sidecar. For external users
+   without Node, pkg-dev bundles a one-time managed download; the renderer owns
+   the prompt + progress UI. Every bridge call is optional-chained, so until
+   pkg-dev's branch lands this is byte-identical to the old behavior. PDF/HTML
+   export is native and must never enter this path. */
+let nodeInstallBannerUp = false;
+window.plume.onNodeInstallProgress?.((p) => {
+  if (p.phase === "done") {
+    if (nodeInstallBannerUp) { nodeInstallBannerUp = false; clearBanner(); }
+    return;
+  }
+  nodeInstallBannerUp = true;
+  const mb = (n) => Math.max(1, Math.round(n / 1048576));
+  bannerEl.className = "";
+  bannerEl.textContent =
+    p.phase === "download"
+      ? (p.total ? `Downloading export helper… ${mb(p.received)} MB of ${mb(p.total)} MB` : "Downloading export helper…")
+      : p.phase === "verify" ? "Verifying export helper…"
+      : "Setting up export helper…";
+});
+// True when docx/publish can proceed. Prompts for (and runs) the one-time
+// download when the helper is missing; call BEFORE any save dialog.
+async function ensureExportRuntime() {
+  if (!window.plume.nodeStatus) return true; // contract not landed → old behavior
+  const st = await window.plume.nodeStatus().catch(() => null);
+  if (!st || st.available) return true;
+  const choice = await askConfirm({
+    message: "Enable export?",
+    detail: "Exporting to Word and publishing to Google Docs uses a small helper that needs a one-time ~40 MB download.",
+    buttons: [
+      { label: "Download & Enable", kind: "primary", value: "enable" },
+      { label: "Cancel", kind: "ghost", value: "cancel" },
+    ],
+  });
+  if (choice !== "enable") return false;
+  const r = await window.plume.installNode().catch((e) => ({ ok: false, error: String(e) }));
+  nodeInstallBannerUp = false;
+  clearBanner();
+  if (r?.ok) return true;
+  flashMessage(
+    r?.code === "IN_PROGRESS"
+      ? "The export helper is already downloading — try again in a moment."
+      : "Couldn't enable export: " + (r?.error || "download failed") + " — check your connection and try again."
+  );
+  return false;
+}
+
 async function exportAs(format) {
+  if (format === "docx" && !(await ensureExportRuntime())) return;
   const html = fullHtmlDocument(mdToHtml(view.state.doc.toString()), docBaseName());
   const result = await window.plume.exportDoc(format, html, docBaseName());
   if (result) flashMessage("Exported " + result.split("/").pop());
 }
-async function publishGoogle() {
+async function publishGoogle(retried = false) {
   if (currentMode !== "markdown") { flashMessage("Publish to Google Docs works on Markdown documents."); return; }
+  if (!(await ensureExportRuntime())) return;
   flashMessage("Publishing to Google Docs…");
-  await window.plume.publishGoogle(view.state.doc.toString(), docBaseName());
+  const r = await window.plume.publishGoogle(view.state.doc.toString(), docBaseName());
+  // Belt-and-braces: raced past the status check and the sidecar was missing —
+  // run the enable flow once, then retry the publish.
+  if (!retried && r && r.ok === false && r.code === "NODE_MISSING") {
+    if (await ensureExportRuntime()) return publishGoogle(true);
+  }
 }
 
 /* ---------- File I/O ---------- */
