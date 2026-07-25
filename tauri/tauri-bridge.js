@@ -8,16 +8,17 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 let onOpenFile = null;
 let onExternalChange = null;
-let onFolderOpen = null;
+let onCloseRequested = null;
 let onMenuCb = null;
 let currentPath = null;
 
-listen("file-opened", (e) => {
-  currentPath = e.payload.filePath;
-  if (onOpenFile) onOpenFile(e.payload);
-});
+// file-changed is per-window: the native side emits { path, content } only to
+// the window whose document changed on disk. (The legacy "file-opened" /
+// "folder-opened" channels were never emitted by the Tauri side — removed.)
 listen("file-changed", (e) => { if (onExternalChange) onExternalChange(e.payload); });
-listen("folder-opened", (e) => { if (onFolderOpen) onFolderOpen(e.payload); });
+// Native side held a close because this window's untitled buffer has unsaved
+// edits — the renderer prompts, then saves/materializes or calls confirmClose().
+listen("close-requested", () => { if (onCloseRequested) onCloseRequested(); });
 // Native side (CLI / double-click / File>Open) asks THIS window to open a path.
 // Route through smartOpen so an empty window is reused and anything else opens a new
 // window on top — instead of the old global broadcast that hit every window.
@@ -45,7 +46,8 @@ window.plume = {
   // events
   onOpenFile: (cb) => { onOpenFile = cb; },
   onExternalChange: (cb) => { onExternalChange = cb; },
-  onFolderOpen: (cb) => { onFolderOpen = cb; },
+  onFolderOpen: () => {}, // legacy Electron channel — never emitted by the Tauri side
+  onCloseRequested: (cb) => { onCloseRequested = cb; },
   onMenu: (cb) => { onMenuCb = cb; },
 
   // Push the renderer's recents list so the native File > Open Recent menu reflects it.
@@ -96,8 +98,14 @@ window.plume = {
   loadAnnotations: (filePath) => invoke("load_annotations", { path: filePath }).catch(() => []),
   saveAnnotations: (filePath, annotations) =>
     invoke("save_annotations", { path: filePath, annotations }).catch(() => false),
+  // snapshot works for untitled buffers too — the native side files those under
+  // a per-window untitled slot, surfaced at next launch via untitledRecovery().
   snapshot: (content) => { invoke("snapshot", { content }).catch(noop); },
   discardRecovery: () => { invoke("discard_recovery").catch(noop); },
+  untitledRecovery: () => invoke("untitled_recovery").catch(() => null),
+  discardUntitledRecovery: (key) => { invoke("discard_untitled_recovery", { key }).catch(noop); },
+  // Complete a close the native side held for an unsaved untitled buffer.
+  confirmClose: () => { invoke("close_window_now").catch(noop); },
 
   // Claude Code sessions + context
   listSessions: (dir) => invoke("list_sessions", { dir }).catch(() => []),
@@ -126,8 +134,9 @@ window.plume = {
     return r;
   },
   // Report dirty state up to the native side so write_document refuses to clobber
-  // a buffer with unsaved edits (P1-4). Keyed by the window's current file.
-  setDirty: (dirty) => { if (currentPath) invoke("set_doc_dirty", { path: currentPath, dirty }).catch(noop); },
+  // a buffer with unsaved edits (P1-4). Keyed by the window's current file; a
+  // null path flags this window's UNTITLED buffer so close can prompt (#4).
+  setDirty: (dirty) => { invoke("set_doc_dirty", { path: currentPath, dirty }).catch(noop); },
 };
 
 // Pull the launch file once the renderer has registered its handler.
