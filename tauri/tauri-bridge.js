@@ -133,6 +133,14 @@ window.plume = {
     if (r && r.ok && r.url) invoke("open_external", { url: r.url }).catch(noop);
     return r;
   },
+
+  // Lazy app-local Node runtime for docx/gdocs export (#8). PDF/HTML are
+  // native and never need this. Contract consumed by the renderer's
+  // ensureExportRuntime() flow.
+  nodeStatus: () => invoke("node_status").catch(() => ({ available: false, managed: false })),
+  installNode: () =>
+    invoke("install_node").catch((e) => ({ ok: false, error: String(e), code: "DOWNLOAD_FAILED" })),
+  onNodeInstallProgress: (cb) => { listen("node-install-progress", (e) => cb(e.payload)); },
   // Report dirty state up to the native side so write_document refuses to clobber
   // a buffer with unsaved edits (P1-4). Keyed by the window's current file; a
   // null path flags this window's UNTITLED buffer so close can prompt (#4).

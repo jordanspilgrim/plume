@@ -16,6 +16,24 @@ const MarkdownIt = require("markdown-it");
 const md = new MarkdownIt({ html: false, linkify: true });
 const TOKEN_FILE = path.join(os.homedir(), ".plume", "google-token.json");
 
+// Deadlines: an abandoned consent tab or a wedged Google endpoint must never
+// hang the caller (or orphan the sidecar process) forever.
+const OAUTH_TIMEOUT_MS = 5 * 60_000;
+const FETCH_TIMEOUT_MS = 30_000;
+
+async function timedFetch(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  try {
+    return await fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    if (e && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      const err = new Error(`Request to ${new URL(url).host} timed out after ${Math.round(timeoutMs / 1000)}s`);
+      err.code = "TIMEOUT";
+      throw err;
+    }
+    throw e;
+  }
+}
+
 // ---------- Markdown -> Docs batchUpdate requests ----------
 // Insert all text once at index 1, then apply paragraph styles, text styles, and
 // bullets by absolute index. Pure + offline-testable.
@@ -152,16 +170,36 @@ async function loadCreds() {
   return cid && cs ? { cid, cs } : null;
 }
 
-function runOAuthFlow(creds, openUrl) {
+function runOAuthFlow(creds, openUrl, { timeoutMs = OAUTH_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
+    let timer = null;
+    let settled = false;
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (server.closeAllConnections) server.closeAllConnections();
+      server.close();
+      fn(val);
+    };
     const server = http.createServer(async (req, res) => {
       try {
         const u = new URL(req.url, "http://127.0.0.1");
+        // Browsers also request /favicon.ico etc. — those must not consume the flow.
+        if (u.pathname !== "/") { res.statusCode = 404; res.end(); return; }
+        const denied = u.searchParams.get("error");
+        if (denied) {
+          res.setHeader("Content-Type", "text/html");
+          const e = new Error("Google consent was declined (" + denied + ")");
+          e.code = "OAUTH_DENIED";
+          // Flush the page before finish() tears down connections.
+          res.end("<body style='font:16px -apple-system;padding:40px'><h2>Google Docs connection was declined.</h2><p>You can close this tab and try again from Plume.</p></body>", () => finish(reject, e));
+          return;
+        }
         const code = u.searchParams.get("code");
         if (!code) { res.statusCode = 400; res.end("Missing code"); return; }
         res.setHeader("Content-Type", "text/html");
         res.end("<body style='font:16px -apple-system;padding:40px'><h2>✅ Plume is connected to Google Docs.</h2><p>You can close this tab.</p></body>");
-        server.close();
         const port = server.address().port;
         const tok = await exchangeCode(creds, code, `http://127.0.0.1:${port}`);
         await fs.mkdir(path.dirname(TOKEN_FILE), { recursive: true });
@@ -169,11 +207,16 @@ function runOAuthFlow(creds, openUrl) {
         // Owner-only: this is a long-lived Google refresh token.
         await fs.writeFile(TOKEN_FILE, JSON.stringify(tok), { mode: 0o600 });
         await fs.chmod(TOKEN_FILE, 0o600).catch(() => {});
-        resolve(tok.refresh_token);
-      } catch (e) { reject(e); }
+        finish(resolve, tok.refresh_token);
+      } catch (e) { finish(reject, e); }
     });
-    server.on("error", reject);
+    server.on("error", (e) => finish(reject, e));
     server.listen(0, "127.0.0.1", () => {
+      timer = setTimeout(() => {
+        const e = new Error(`Google consent was not completed within ${Math.round(timeoutMs / 60_000) || 1} minute(s)`);
+        e.code = "OAUTH_TIMEOUT";
+        finish(reject, e);
+      }, timeoutMs);
       const port = server.address().port;
       const authUrl = "https://accounts.google.com/o/oauth2/v2/auth?" + new URLSearchParams({
         client_id: creds.cid,
@@ -189,7 +232,7 @@ function runOAuthFlow(creds, openUrl) {
 }
 
 async function exchangeCode(creds, code, redirectUri) {
-  const res = await fetch("https://oauth2.googleapis.com/token", {
+  const res = await timedFetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -202,7 +245,7 @@ async function exchangeCode(creds, code, redirectUri) {
 }
 
 async function accessTokenFromRefresh(creds, refresh) {
-  const res = await fetch("https://oauth2.googleapis.com/token", {
+  const res = await timedFetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -232,7 +275,7 @@ async function publishToGoogleDocs(mdText, defaultName, openUrl) {
   const { title, requests } = markdownToDocsRequests(mdText);
   if (!requests.length) { const e = new Error("empty"); e.code = "EMPTY"; throw e; }
 
-  const createRes = await fetch("https://docs.googleapis.com/v1/documents", {
+  const createRes = await timedFetch("https://docs.googleapis.com/v1/documents", {
     method: "POST",
     headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" },
     body: JSON.stringify({ title: title || defaultName || "Untitled" }),
@@ -240,7 +283,7 @@ async function publishToGoogleDocs(mdText, defaultName, openUrl) {
   if (!createRes.ok) throw new Error("Create failed: " + (await createRes.text()).slice(0, 200));
   const docId = (await createRes.json()).documentId;
 
-  const upRes = await fetch(`https://docs.googleapis.com/v1/documents/${docId}:batchUpdate`, {
+  const upRes = await timedFetch(`https://docs.googleapis.com/v1/documents/${docId}:batchUpdate`, {
     method: "POST",
     headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" },
     body: JSON.stringify({ requests }),
@@ -250,4 +293,4 @@ async function publishToGoogleDocs(mdText, defaultName, openUrl) {
   return `https://docs.google.com/document/d/${docId}/edit`;
 }
 
-module.exports = { markdownToDocsRequests, publishToGoogleDocs };
+module.exports = { markdownToDocsRequests, publishToGoogleDocs, runOAuthFlow };
