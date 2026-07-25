@@ -1,0 +1,118 @@
+<!doctype html>
+<!-- QA harness (NOT shipped): loads dist/renderer.js with a stubbed window.plume
+     bridge so the renderer can be smoke-tested in a plain browser. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Plume QA Harness</title>
+    <link rel="stylesheet" href="src/renderer/styles.css" />
+    <link rel="stylesheet" href="dist/renderer.css" />
+    <script>
+      // ---- Stub of the Tauri bridge (tauri/tauri-bridge.js) ----
+      const FS = {
+        "/fake/a.md": "# Alpha\n\nContent of a.md\n",
+        "/fake/b.md": "# Beta\n\nContent of b.md\n",
+      };
+      let openCb = null, closeCb = null, menuCb = null, extCb = null;
+      window.__stub = {
+        fs: FS,
+        fireClose: () => closeCb && closeCb(),
+        fireMenu: (ch, arg) => menuCb && menuCb(ch, arg),
+        fireExternal: (path, content) => extCb && extCb({ path, content }),
+        calls: [],
+      };
+      const log = (name) => (...a) => { window.__stub.calls.push([name, ...a]); };
+      window.plume = {
+        onOpenFile: (cb) => { openCb = cb; },
+        onExternalChange: (cb) => { extCb = cb; },
+        onFolderOpen: () => {},
+        onCloseRequested: (cb) => { closeCb = cb; },
+        onMenu: (cb) => { menuCb = cb; },
+        setRecentFiles: log("setRecentFiles"),
+        openDialog: async () => null,
+        openInThisWindow: async (p, line) => {
+          window.__stub.calls.push(["openInThisWindow", p, line]);
+          if (!(p in FS)) return; // simulate a failed disk read
+          openCb && openCb({ filePath: p, content: FS[p], recovery: null, gotoLine: line });
+        },
+        save: async (content) => { window.__stub.calls.push(["save", content.length]); return "/fake/a.md"; },
+        saveAs: async () => null,
+        materializeDoc: async () => null,
+        renameFile: async () => null,
+        pickFolder: async () => null,
+        defaultDocsDir: async () => null,
+        pushToAgent: async () => null,
+        listSessionTargets: async () => [],
+        startWindowDrag: () => {},
+        resolveLink: async () => null,
+        listDir: async () => [],
+        searchFiles: async () => [],
+        openExternal: () => {},
+        loadAnnotations: async () => [],
+        saveAnnotations: async () => true,
+        snapshot: log("snapshot"),
+        discardRecovery: () => {},
+        untitledRecovery: async () => null,
+        discardUntitledRecovery: log("discardUntitledRecovery"),
+        confirmClose: log("confirmClose"),
+        listSessions: async () => [],
+        searchSessions: async () => [],
+        listContext: async () => [],
+        readSession: async () => "",
+        saveImage: async () => null,
+        toAssetUrl: (p) => p,
+        pickImage: async () => null,
+        linkPreview: async () => null,
+        openInNewWindow: log("openInNewWindow"),
+        exportDoc: async () => null,
+        publishGoogle: async () => null,
+        setDirty: log("setDirty"),
+      };
+    </script>
+  </head>
+  <body>
+    <div id="app" data-theme="system">
+      <div id="titlebar" data-tauri-drag-region>
+        <span id="titlebar-brand" data-tauri-drag-region></span>
+        <span id="titlebar-name" title="Click to rename">Plume</span>
+        <div id="titlebar-tools"></div>
+      </div>
+      <button id="view-toggle" class="hidden" title="Toggle source / rendered (⌘/)"></button>
+      <div id="tabbar" class="hidden" role="tablist" aria-label="Open documents"></div>
+      <div id="toolbar" class="hidden" role="toolbar" aria-label="Formatting"></div>
+      <div id="banner" class="hidden"></div>
+      <div id="selbar" class="hidden"></div>
+      <div id="main">
+        <nav id="rail" aria-label="Plume surfaces"></nav>
+        <div id="workarea">
+          <aside id="sidebar" class="hidden" aria-label="Files"></aside>
+          <aside id="outline" class="hidden" aria-label="Document outline"></aside>
+          <div id="editor-host"></div>
+          <div id="render-host" class="hidden"></div>
+          <div id="welcome" class="hidden"></div>
+          <aside id="notes" class="hidden" aria-label="Notes"></aside>
+        </div>
+      </div>
+      <div id="statusbar"></div>
+      <div id="palette" class="overlay hidden">
+        <div class="overlay-box">
+          <input id="palette-input" placeholder="Search files, or type a command…" spellcheck="false" />
+          <div id="palette-list"></div>
+        </div>
+      </div>
+      <div id="searchpanel" class="overlay hidden">
+        <div class="overlay-box">
+          <input id="search-input" placeholder="Search across this folder…" spellcheck="false" />
+          <div id="search-results"></div>
+        </div>
+      </div>
+      <div id="workspace" class="overlay hidden">
+        <div class="overlay-box">
+          <input id="ws-input" placeholder="Filter sessions & context, or search transcripts…" spellcheck="false" />
+          <div id="ws-list"></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="dist/renderer.js"></script>
+  </body>
+</html>
