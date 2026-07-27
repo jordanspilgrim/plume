@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId,
-  tabDisplayName, isCapturedDirty, isBlankTab, closeDecision, dirtyBackgroundTabs, isDraftTab,
+  tabDisplayName, isCapturedDirty, isBlankTab, closeDecision, dirtyBackgroundTabs, isDraftTab, isKeepableDraft,
 } from "../src/renderer/tabs-model.js";
 
 test("createTab: unique ids, defaults, partial override", () => {
@@ -183,4 +183,14 @@ test("dirtyBackgroundTabs: clean background DRAFT with content still needs a dec
   assert.deepEqual(dirtyBackgroundTabs([active, cleanDraft, emptyDraft, cleanDoc], active.id, DIR).map((x) => x.id), [cleanDraft.id]);
   // Without a draftsDir, only genuinely dirty tabs qualify (no draft semantics).
   assert.deepEqual(dirtyBackgroundTabs([active, cleanDraft, cleanDoc], active.id), []);
+});
+
+// M4: a clean draft tab is archived (file kept) only when it has content;
+// empty drafts delete their file with the tab.
+test("isKeepableDraft: content-bearing drafts only, dir-authoritative", () => {
+  const DIR = "/Users/x/Documents/Plume/Autosave";
+  assert.equal(isKeepableDraft(createTab({ path: DIR + "/n.md", text: "body", savedText: "body" }), DIR), true);
+  assert.equal(isKeepableDraft(createTab({ path: DIR + "/n.md", text: "  ", savedText: "  " }), DIR), false);
+  assert.equal(isKeepableDraft(createTab({ path: "/real/doc.md", text: "body", savedText: "body" }), DIR), false);
+  assert.equal(isKeepableDraft(createTab({ path: DIR + "/n.md", text: "body" }), null), false);
 });
