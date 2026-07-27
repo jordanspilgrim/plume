@@ -11,6 +11,7 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
+const crypto = require("node:crypto");
 const MarkdownIt = require("markdown-it");
 
 const md = new MarkdownIt({ html: false, linkify: true });
@@ -171,6 +172,21 @@ async function loadCreds() {
 }
 
 function runOAuthFlow(creds, openUrl, { timeoutMs = OAUTH_TIMEOUT_MS } = {}) {
+  // PKCE (S256) + state: the loopback callback is reachable by ANY local
+  // process/webpage during the consent window, so a bare ?code= could bind
+  // Plume to an attacker's Google account. `state` proves the callback belongs
+  // to THIS flow; the code_verifier proves the token exchange does. Callbacks
+  // with a wrong/missing state are ignored (400) rather than settling the
+  // flow, so an injector can neither hijack nor cancel it — the legitimate
+  // callback still works and the deadline still bounds the wait.
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  const state = crypto.randomBytes(16).toString("base64url");
+  const stateMatches = (got) => {
+    const a = Buffer.from(String(got || ""));
+    const b = Buffer.from(state);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
   return new Promise((resolve, reject) => {
     let timer = null;
     let settled = false;
@@ -187,6 +203,12 @@ function runOAuthFlow(creds, openUrl, { timeoutMs = OAUTH_TIMEOUT_MS } = {}) {
         const u = new URL(req.url, "http://127.0.0.1");
         // Browsers also request /favicon.ico etc. — those must not consume the flow.
         if (u.pathname !== "/") { res.statusCode = 404; res.end(); return; }
+        // State gate FIRST — applies to success and error callbacks alike.
+        if (!stateMatches(u.searchParams.get("state"))) {
+          res.statusCode = 400;
+          res.end("Invalid state");
+          return;
+        }
         const denied = u.searchParams.get("error");
         if (denied) {
           res.setHeader("Content-Type", "text/html");
@@ -201,7 +223,7 @@ function runOAuthFlow(creds, openUrl, { timeoutMs = OAUTH_TIMEOUT_MS } = {}) {
         res.setHeader("Content-Type", "text/html");
         res.end("<body style='font:16px -apple-system;padding:40px'><h2>✅ Plume is connected to Google Docs.</h2><p>You can close this tab.</p></body>");
         const port = server.address().port;
-        const tok = await exchangeCode(creds, code, `http://127.0.0.1:${port}`);
+        const tok = await exchangeCode(creds, code, `http://127.0.0.1:${port}`, verifier);
         await fs.mkdir(path.dirname(TOKEN_FILE), { recursive: true });
         await fs.chmod(path.dirname(TOKEN_FILE), 0o700).catch(() => {});
         // Owner-only: this is a long-lived Google refresh token.
@@ -225,19 +247,23 @@ function runOAuthFlow(creds, openUrl, { timeoutMs = OAUTH_TIMEOUT_MS } = {}) {
         scope: "https://www.googleapis.com/auth/documents",
         access_type: "offline",
         prompt: "consent",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        state,
       });
       openUrl(authUrl);
     });
   });
 }
 
-async function exchangeCode(creds, code, redirectUri) {
+async function exchangeCode(creds, code, redirectUri, codeVerifier) {
   const res = await timedFetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       code, client_id: creds.cid, client_secret: creds.cs,
       redirect_uri: redirectUri, grant_type: "authorization_code",
+      code_verifier: codeVerifier,
     }),
   });
   if (!res.ok) throw new Error("Token exchange failed: " + (await res.text()).slice(0, 200));
