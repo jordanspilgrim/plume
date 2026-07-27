@@ -1,0 +1,64 @@
+# Dependency advisories for both ecosystems.
+#
+# DELIBERATELY SEPARATE from build.yml rather than a step in its `test` gate.
+# The gate must be deterministic: the same commit gates the same way today and
+# next month. Advisory databases are not — a new CVE published against an
+# existing, unchanged dependency would turn every build red overnight and block
+# merges on work that has nothing to do with it. That pressure is what teaches
+# people to bypass gates.
+#
+# So this runs on the same PRs and pushes (a red check here is loud and must be
+# triaged), plus weekly so a new advisory surfaces without waiting for someone
+# to open a PR — but it does not sit in `build`'s needs: chain.
+#
+# If the owner wants advisories to hard-block merges, move these two steps into
+# build.yml's `test` job; it's a copy-paste and the trade-off above is the only
+# reason they aren't there already.
+name: audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, off the hour so it isn't competing with everyone else's cron.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+
+      # npm ci (not install) so the committed lockfile is what gets audited —
+      # auditing a freshly-resolved tree would report on versions we don't ship.
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: npm audit (high and above)
+        run: npm audit --audit-level=high
+
+      # Installed from source rather than via a third-party action: this repo
+      # pins every action to a full commit SHA to keep the supply chain narrow,
+      # and an advisory scanner is a poor place to widen it. Slower, but this
+      # job gates nothing so latency costs nothing.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit --file src-tauri/Cargo.lock
