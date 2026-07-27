@@ -109,6 +109,12 @@ export function isDraftTab(tab, draftsDir) {
   return tab.path.startsWith(dir);
 }
 
+// A draft worth keeping around when its tab goes away: non-empty content.
+// (Empty drafts get their file deleted instead — the listDrafts orphan rule.)
+export function isKeepableDraft(tab, draftsDir) {
+  return isDraftTab(tab, draftsDir) && tab.text != null && tab.text.trim().length > 0;
+}
+
 export function dirtyBackgroundTabs(tabs, activeId, draftsDir = null) {
   // A background DRAFT with content also needs a decision even when captured
   // clean — drafts prompt on close regardless of dirty (SAVEFLOW option B).

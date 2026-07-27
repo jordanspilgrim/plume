@@ -20,7 +20,7 @@ import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from 
 import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId, tabDisplayName, isCapturedDirty, isBlankTab,
-  closeDecision, dirtyBackgroundTabs, isDraftTab,
+  closeDecision, dirtyBackgroundTabs, isDraftTab, isKeepableDraft,
 } from "./tabs-model.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
@@ -344,7 +344,10 @@ function buildWelcome() {
   const rec = document.createElement("div");
   rec.className = "welcome-recents";
   rec.id = "welcome-recents";
-  welcomeEl.append(art, tag, hints, blink, rec);
+  const drafts = document.createElement("div");
+  drafts.className = "welcome-recents";
+  drafts.id = "welcome-drafts";
+  welcomeEl.append(art, tag, hints, blink, drafts, rec);
 }
 function renderWelcomeRecents() {
   const host = document.getElementById("welcome-recents");
@@ -367,10 +370,34 @@ function renderWelcomeRecents() {
     host.appendChild(row);
   }
 }
+// M4: autosaved drafts get a visible home — without this they were invisible
+// after switching away (files persist in Autosave/ with no in-app surface).
+async function renderWelcomeDrafts() {
+  const host = document.getElementById("welcome-drafts");
+  if (!host || !window.plume.listDrafts) return;
+  const open = new Set(tabs.map((t) => t.path).filter(Boolean));
+  const drafts = ((await window.plume.listDrafts()) || []).filter((d) => !open.has(d.path)).slice(0, 6);
+  host.innerHTML = "";
+  if (!drafts.length) return;
+  const head = document.createElement("div");
+  head.className = "welcome-recents-head";
+  head.textContent = "DRAFTS";
+  host.appendChild(head);
+  for (const d of drafts) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "welcome-recent";
+    const name = document.createElement("span"); name.className = "welcome-recent-name"; name.textContent = d.title || d.path.split("/").pop();
+    const path = document.createElement("span"); path.className = "welcome-recent-path"; path.textContent = "draft";
+    row.append(name, path);
+    row.onclick = () => smartOpen(d.path);
+    host.appendChild(row);
+  }
+}
 function updateWelcome() {
   const empty = view.state.doc.length === 0 && !currentPath && currentMode === "markdown";
   welcomeEl.classList.toggle("hidden", !empty);
-  if (empty) renderWelcomeRecents();
+  if (empty) { renderWelcomeRecents(); renderWelcomeDrafts(); }
 }
 
 /* ---------- Steer-loop annotations (notes the agent can read via MCP) ---------- */
@@ -1867,7 +1894,7 @@ function toggleSidebar() { sidebarEl.classList.toggle("hidden"); refreshSidebar(
 const paletteEl = document.getElementById("palette");
 const paletteInput = document.getElementById("palette-input");
 const paletteList = document.getElementById("palette-list");
-let paletteFiles = [], paletteItems = [], paletteSel = 0;
+let paletteFiles = [], paletteDrafts = [], paletteItems = [], paletteSel = 0;
 /* ---------- Recent files (Open Recent) ---------- */
 const RECENTS_KEY = "plume-recents";
 const RECENTS_MAX = 15;
@@ -1947,6 +1974,8 @@ async function openPalette() {
   paletteInput.value = "";
   const dir = currentDir();
   paletteFiles = dir ? flattenFiles(await window.plume.listDir(dir, 3)) : [];
+  const openPaths = new Set(tabs.map((t) => t.path).filter(Boolean));
+  paletteDrafts = ((await window.plume.listDrafts?.()) || []).filter((d) => !openPaths.has(d.path));
   renderPalette("");
   paletteInput.focus();
 }
@@ -1956,14 +1985,18 @@ function renderPalette(q) {
   const term = (cmdMode ? q.slice(1) : q).trim();
   const cmds = COMMANDS.filter((c) => !term || fuzzy(term, c.label)).map((c) => ({ kind: "cmd", label: c.label, run: c.run }));
   const recents = cmdMode ? [] : recentItems(term);
+  const drafts = cmdMode ? [] : paletteDrafts
+    .filter((d) => !term || fuzzy(term, d.title || d.path.split("/").pop()))
+    .slice(0, 8)
+    .map((d) => ({ kind: "draft", label: d.title || d.path.split("/").pop(), run: () => smartOpen(d.path) }));
   const recentPaths = new Set(recents.map((r) => r.sub));
   const files = cmdMode ? [] : paletteFiles.filter((f) => !recentPaths.has(f.path) && (!term || fuzzy(term, f.name))).slice(0, 40)
     .map((f) => ({ kind: "file", label: f.name, run: () => smartOpen(f.path) }));
-  paletteItems = [...recents, ...files, ...cmds];
+  paletteItems = [...drafts, ...recents, ...files, ...cmds];
   paletteSel = 0;
   drawPalette();
 }
-const PAL_GROUP = { recent: "Recent", file: "Files", cmd: "Commands" };
+const PAL_GROUP = { draft: "Drafts", recent: "Recent", file: "Files", cmd: "Commands" };
 function drawPalette() {
   paletteList.innerHTML = "";
   let lastKind = null;
@@ -1976,7 +2009,7 @@ function drawPalette() {
     const row = document.createElement("div");
     row.className = "pal-item" + (i === paletteSel ? " sel" : "");
     const icon = document.createElement("span"); icon.className = "pal-icon";
-    icon.textContent = it.kind === "file" ? "›" : it.kind === "recent" ? "↺" : "⚡";
+    icon.textContent = it.kind === "file" ? "›" : it.kind === "recent" ? "↺" : it.kind === "draft" ? "✎" : "⚡";
     const label = document.createElement("span"); label.className = "pal-label"; label.textContent = it.label;
     row.append(icon, label);
     if (it.sub) {
@@ -2401,6 +2434,16 @@ async function closeTabRequest(id) {
     // Background tabs are flushed on switch-away, so dirty ones only exist when
     // autosave is off — surface them before discarding.
     if (isCapturedDirty(t)) { await activateTab(id); return closeActiveTab(); }
+    // M4: a clean draft tab is ARCHIVED, not discarded — the Autosave file
+    // stays and is reachable from the Drafts group; tell the user where.
+    if (isKeepableDraft(t, draftsDir)) {
+      tabs = closeTab(tabs, id).tabs;
+      renderTabbar();
+      flashMessage(`Draft kept — reopen “${tabDisplayName(t)}” from Drafts.`);
+      return;
+    }
+    // An EMPTY draft's file is deleted with its tab (listDrafts orphan rule).
+    if (isDraft(t) && t.path) window.plume.discardDraft?.(t.path);
     tabs = closeTab(tabs, id).tabs;
     renderTabbar();
     return;
