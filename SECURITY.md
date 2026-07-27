@@ -23,8 +23,25 @@ scoping what the agent path itself can do.
 ### Write & read containment (P0-1) — server-authoritative
 A write (`writeDocument`) or annotation read (`getAnnotations`) is allowed only if its
 **canonical** target is either a file Plume currently has open, or inside the
-**directory of an open file**. This scope is established entirely by the user opening
-something — it does **not** trust any value supplied by the caller.
+**directory of an open file** — **and** is not sensitive (see below). This scope is
+established entirely by the user opening something — it does **not** trust any value
+supplied by the caller.
+
+**Scope alone is not sufficient.** Because scope is directory-inclusive, opening one
+file in a repository would otherwise put the whole repository within reach. A deny list
+(credential material, `.env*`, `.git` internals, shell/REPL history, keys) therefore
+overrides scope for both reads and writes, with one carve-out: a file the user opened
+**explicitly** — via File ▸ Open, a launch argument, the token-gated socket's `open`, or
+a link inside the open document's own directory — remains readable and writable, so
+deliberately editing your own `.env` still works.
+
+This was tightened after an adversarial review: the write gate was previously scope-only,
+on the reasoning that the socket is authenticated and an agent editing a `.env` the user
+pointed it at is legitimate. That reasoning weighed secret *disclosure* and missed *code
+execution* — `<repo>/.git/hooks/pre-commit` is arbitrary code on the user's next commit,
+and an authenticated channel does not help when the threat is a compromised or confused
+agent rather than an unauthenticated attacker. Reads and writes now share one decision
+function (`scope_decision`), unit-tested.
 
 An earlier design trusted a client-supplied `root` field. That was wrong: the adversary
 speaks the raw socket and could forge `root:"/Users/you"` to authorize writing anywhere
