@@ -184,28 +184,60 @@ function draftTimestampName() {
 // markdown buffer becomes non-empty it is backed by an Autosave draft file —
 // no debounce window in which a crash could lose a brand-new note. Untitled
 // crash snapshots are gone (native subsystem deleted); this replaces them.
-let draftCreateInFlight = false;
+// Per-TAB in-flight set: a second untitled tab's first keystroke creates its
+// own draft concurrently (native unique_path handles names) instead of being
+// dropped by a global flag.
+const draftCreatesInFlight = new Set();
 async function maybeCreateDraft() {
-  if (draftCreateInFlight || currentPath || currentMode !== "markdown") return;
+  if (currentPath || currentMode !== "markdown") return;
   if (!window.plume.createDraft || !autosaveEnabled()) return;
+  const initTabId = activeTabId;
+  if (draftCreatesInFlight.has(initTabId)) return;
   const t = activeTab();
   if (t && t.unbound) return;
   const text0 = view.state.doc.toString();
   if (!text0.trim()) return;
-  draftCreateInFlight = true;
+  draftCreatesInFlight.add(initTabId);
   try {
     const r = await window.plume.createDraft(pendingName || draftTimestampName(), text0);
-    if (r && r.path) {
+    if (!r || !r.path) return;
+    if (!draftsDir) draftsDir = r.path.slice(0, r.path.lastIndexOf("/") + 1); // fallback derivation
+    // The user may have switched tabs, closed the tab, or Saved-As during the
+    // round-trip (HIGH regression: completion used to mutate whatever tab was
+    // active NOW). Dispatch on the INITIATING tab's identity + state:
+    const t0 = findTab(tabs, initTabId);
+    if (!t0 || t0.path !== null) {
+      // Initiator closed (e.g. Don't Save mid-flight) or no longer untitled
+      // (Saved-As / retargeted): the landed draft contradicts the user's
+      // expressed intent — remove it, touch nothing else.
+      window.plume.discardDraft?.(r.path);
+    } else if (initTabId === activeTabId && !currentPath) {
+      // Initiator still active and untitled: the original full update.
       savedText = text0;
-      if (!draftsDir) draftsDir = r.path.slice(0, r.path.lastIndexOf("/") + 1); // fallback derivation
-      setTitle(r.path); // native bound it; renderer records
-      const t0 = activeTab();
-      if (t0) { t0.path = r.path; t0.unbound = false; }
+      setTitle(r.path);
+      t0.path = r.path;
+      t0.unbound = false;
       // The user keeps typing during the round-trip — recompute, never assert clean.
       setDirty(view.state.doc.toString() !== savedText);
       pushOpenPaths();
+    } else {
+      // Initiator alive but BACKGROUNDED: update only its captured record —
+      // no global (active-doc) state may move. savedText = what was written,
+      // so isCapturedDirty reflects any pre-switch typing.
+      t0.path = r.path;
+      t0.unbound = false;
+      t0.pendingName = null;
+      t0.savedText = text0;
+      pushOpenPaths(); // tab-set-derived, safe globally
     }
-  } finally { draftCreateInFlight = false; }
+    // Binding re-assert: native bound the new draft to this WINDOW at create
+    // completion, which may have stolen the binding from whatever the user
+    // switched to mid-flight. Re-align native to the ACTIVE tab.
+    if (initTabId !== activeTabId || currentPath) {
+      if (currentPath && !(activeTab() && activeTab().unbound)) window.plume.bindDoc(currentPath); // fire-and-forget rebind
+      else if (!currentPath) window.plume.detachDoc?.();
+    }
+  } finally { draftCreatesInFlight.delete(initTabId); }
 }
 
 let autosaving = false;
