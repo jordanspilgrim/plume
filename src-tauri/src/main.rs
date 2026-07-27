@@ -562,12 +562,34 @@ fn node_arch() -> &'static str {
     }
 }
 
-// Find `<hex>  <file>` in Node's published SHASUMS256.txt.
-fn shasum_for(shasums: &str, file: &str) -> Option<String> {
-    shasums.lines().find_map(|l| {
-        let (hash, name) = l.split_once(char::is_whitespace)?;
-        (name.trim() == file).then(|| hash.trim().to_lowercase())
-    })
+// Build-time pinned SHA-256 digests for the tarballs we install (Cluster D /
+// review #9). Previously the expected digest was fetched at runtime from
+// SHASUMS256.txt over the SAME channel as the tarball, so the check only ever
+// proved "the server was self-consistent" — anyone able to serve the tarball
+// (a compromised mirror, or TLS interception on the user's machine) could
+// serve a matching checksum file alongside it. A digest baked into the binary
+// is something an attacker on that channel cannot influence.
+//
+// Supplied by pkg-dev: arm64 independently re-downloaded and hashed locally,
+// x64 from the published SHASUMS256.txt. Bumping NODE_VERSION REQUIRES
+// re-pinning both — `pinned_digests_match_node_version` fails the build's test
+// run if a half-bump leaves these stale.
+const NODE_TARBALL_SHA256: [(&str, &str); 2] = [
+    (
+        "node-v22.22.0-darwin-arm64.tar.gz",
+        "5ed4db0fcf1eaf84d91ad12462631d73bf4576c1377e192d222e48026a902640",
+    ),
+    (
+        "node-v22.22.0-darwin-x64.tar.gz",
+        "5ea50c9d6dea3dfa3abb66b2656f7a4e1c8cef23432b558d45fb538c7b5dedce",
+    ),
+];
+
+// The pinned digest for a tarball name, if we have one.
+fn pinned_sha256(file: &str) -> Option<&'static str> {
+    NODE_TARBALL_SHA256
+        .iter()
+        .find_map(|(name, hash)| (*name == file).then_some(*hash))
 }
 
 // Download the official pinned-LTS Node for this machine into
@@ -590,19 +612,23 @@ fn install_node_runtime(
     let tarball = format!("{name}.tar.gz");
     let dl = |m: String| ("DOWNLOAD_FAILED".to_string(), m);
 
+    // redirects(0): the download must come from the host we chose. A redirect
+    // to another origin is not a download path we want to follow silently.
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(60))
+        .redirects(0)
         .build();
 
-    let shasums = agent
-        .get(&format!("{NODE_DIST_BASE}/{NODE_VERSION}/SHASUMS256.txt"))
-        .call()
-        .map_err(|e| dl(format!("couldn't fetch checksums: {e}")))?
-        .into_string()
-        .map_err(|e| dl(e.to_string()))?;
-    let expected = shasum_for(&shasums, &tarball)
-        .ok_or_else(|| ("VERIFY_FAILED".to_string(), format!("{tarball} not listed in SHASUMS256.txt")))?;
+    // Build-pinned digest — no runtime SHASUMS256.txt fetch (see the constant).
+    let expected = pinned_sha256(&tarball)
+        .ok_or_else(|| {
+            (
+                "UNSUPPORTED".to_string(),
+                format!("no pinned checksum for {tarball} — this build can't install Node for this platform"),
+            )
+        })?
+        .to_string();
 
     let resp = agent
         .get(&format!("{NODE_DIST_BASE}/{NODE_VERSION}/{tarball}"))
@@ -1433,39 +1459,57 @@ fn host_port(url: &str) -> Option<(String, u16)> {
     Some((host.trim_matches(|c| c == '[' || c == ']').to_string(), port))
 }
 
-// True only if the URL is http(s) AND every address the host resolves to is public.
-fn url_is_safe(url: &str) -> bool {
+// Resolve a URL's host ONCE and return the vetted addresses, or None if the URL
+// isn't http(s) or ANY record is non-public.
+//
+// Cluster D (review #6, DNS rebinding): the old shape was a boolean check
+// followed by a separate `agent.get(url)`, so ureq re-resolved the hostname at
+// connect time — a second lookup the guard never saw. An attacker controlling
+// the DNS answer (short TTL, round-robin) returns a public address for the
+// check and 127.0.0.1 or 169.254.169.254 for the connect: the classic
+// check-then-connect rebinding window. Returning the vetted addresses lets the
+// caller connect to an address that was actually inspected.
+fn resolve_public_addrs(url: &str) -> Option<Vec<std::net::SocketAddr>> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return false;
+        return None;
     }
-    let (host, port) = match host_port(url) {
-        Some(hp) => hp,
-        None => return false,
-    };
-    match (host.as_str(), port).to_socket_addrs() {
-        Ok(addrs) => {
-            let mut any = false;
-            for a in addrs {
-                any = true;
-                if !ip_is_public(&a.ip()) {
-                    return false; // any private/loopback record fails the whole URL
-                }
-            }
-            any
-        }
-        Err(_) => false,
+    let (host, port) = host_port(url)?;
+    let addrs: Vec<std::net::SocketAddr> = (host.as_str(), port).to_socket_addrs().ok()?.collect();
+    if addrs.is_empty() {
+        return None;
     }
+    // Every record must be public: a host that answers with one public and one
+    // private address fails the whole URL rather than racing which one is used.
+    if addrs.iter().any(|a| !ip_is_public(&a.ip())) {
+        return None;
+    }
+    Some(addrs)
 }
 
+// (The former `url_is_safe` boolean is gone: a check that doesn't hand back the
+// addresses it vetted invites exactly the re-resolve gap this cluster closes.
+// Callers take resolve_public_addrs and connect to what it returned.)
+
 fn fetch_preview(url: &str) -> Value {
-    if !url_is_safe(url) {
-        return Value::Null;
-    }
+    // Resolve ONCE and keep the vetted addresses (Cluster D / review #6).
+    let vetted = match resolve_public_addrs(url) {
+        Some(a) => a,
+        None => return Value::Null,
+    };
     // redirects(0): never follow a redirect — a public URL that 30x-redirects to an
     // internal host is the classic SSRF-via-redirect bypass. No follow, no bypass.
+    //
+    // The pinned resolver closes the *other* half: without it ureq performs its
+    // own DNS lookup at connect time, which the guard above never inspected, so
+    // a short-TTL / round-robin answer could hand back 127.0.0.1 or
+    // 169.254.169.254 for the connection (DNS rebinding). Every connection this
+    // agent makes now goes to an address that was actually vetted; anything
+    // else — including a host we didn't resolve — is refused rather than
+    // silently falling back to the system resolver.
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(6))
         .redirects(0)
+        .resolver(move |_netloc: &str| Ok(vetted.clone()))
         .build();
     let resp = match agent
         .get(url)
@@ -3798,21 +3842,35 @@ fn urlencoding_decode(s: &str) -> String {
 mod node_runtime_tests {
     use super::*;
 
+    // A half-bump — NODE_VERSION moved but the pinned digests left stale —
+    // would silently make every install fail verification (or, worse, pin the
+    // wrong build). Fail loudly here instead.
     #[test]
-    fn shasum_parsing_matches_exact_file() {
-        let shasums = "\
-abc123DEF  node-v22.22.0-darwin-arm64.tar.gz
-999888  node-v22.22.0-darwin-arm64.tar.xz
-777666  node-v22.22.0-darwin-x64.tar.gz";
-        assert_eq!(
-            shasum_for(shasums, "node-v22.22.0-darwin-arm64.tar.gz").as_deref(),
-            Some("abc123def")
-        );
-        assert_eq!(
-            shasum_for(shasums, "node-v22.22.0-darwin-x64.tar.gz").as_deref(),
-            Some("777666")
-        );
-        assert_eq!(shasum_for(shasums, "node-v22.22.0-linux-x64.tar.gz"), None);
+    fn pinned_digests_match_node_version() {
+        assert_eq!(NODE_TARBALL_SHA256.len(), 2, "expected one pin per supported arch");
+        for (name, hash) in NODE_TARBALL_SHA256 {
+            assert!(
+                name.starts_with(&format!("node-{NODE_VERSION}-")),
+                "pinned tarball {name} does not match NODE_VERSION {NODE_VERSION} — re-pin both digests when bumping"
+            );
+            assert!(name.ends_with(".tar.gz"), "unexpected archive form: {name}");
+            assert_eq!(hash.len(), 64, "SHA-256 must be 64 hex chars: {name}");
+            assert!(
+                hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "digest must be lowercase hex (compared against a lowercase hex encoding): {name}"
+            );
+        }
+    }
+
+    // The tarball this build actually asks for must be one we pinned; if it
+    // isn't, install fails closed with UNSUPPORTED rather than downloading
+    // something unverifiable.
+    #[test]
+    fn this_platforms_tarball_is_pinned() {
+        let name = format!("node-{NODE_VERSION}-darwin-{}.tar.gz", node_arch());
+        assert!(pinned_sha256(&name).is_some(), "no pinned digest for {name}");
+        assert!(pinned_sha256("node-v22.22.0-linux-x64.tar.gz").is_none());
+        assert!(pinned_sha256("nonsense.tar.gz").is_none());
     }
 
     #[test]
