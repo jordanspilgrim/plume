@@ -20,7 +20,7 @@ import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from 
 import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId, tabDisplayName, isCapturedDirty, isBlankTab,
-  closeDecision,
+  closeDecision, dirtyBackgroundTabs,
 } from "./tabs-model.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
@@ -41,9 +41,8 @@ import "@fontsource/jetbrains-mono/700.css";
 
 /* ---------- State ---------- */
 let savedText = "";
-let currentPath = null;
-let pendingName = null; // a name set via the title bar before an untitled doc is materialized
-let windowEverHadPath = false; // this window has shown a path-backed doc (see snapshot guard)
+let currentPath = null; // THE single source of truth for the active doc's path (bridge is stateless)
+let pendingName = null; // a name set via the title bar before an untitled doc is saved
 const appEl = document.getElementById("app");
 const titlebar = document.getElementById("titlebar");
 const titlebarName = document.getElementById("titlebar-name");
@@ -151,17 +150,13 @@ function scheduleSideEffects() {
     updateStatus();
   }, 120);
 
-  // Crash-recovery snapshot (path-backed docs; untitled buffers snapshot to a
-  // per-window slot on the native side — see untitledRecovery()).
+  // Crash-recovery snapshot. Routes by the native binding, which detachDoc()
+  // now really clears on untitled tabs — no misroute guard needed. (Interim
+  // note: until A-native lands detach_doc, an untitled tab in a previously
+  // file-backed window can misfile its snapshot into that file's recovery
+  // slot — benign, user-confirmed banner content only; merge order handles it.)
   if (snapshotTimer) clearTimeout(snapshotTimer);
-  snapshotTimer = setTimeout(() => {
-    // Guard: an untitled TAB in a window that previously showed a file — the
-    // native side's per-window doc binding still points at that file, so a
-    // snapshot would be misfiled into ITS recovery slot. Skip until the native
-    // side grows a detachDoc() to clear the binding (requested from be-dev).
-    if (!currentPath && windowEverHadPath && !window.plume.detachDoc) return;
-    window.plume.snapshot(view.state.doc.toString());
-  }, 700);
+  snapshotTimer = setTimeout(() => window.plume.snapshot(view.state.doc.toString()), 700);
 
   // Autosave the open file after a short idle.
   if (autosaveTimer) clearTimeout(autosaveTimer);
@@ -178,12 +173,24 @@ let autosaving = false;
 // Save As, or the close prompt); crash recovery still snapshots it separately.
 async function autosave() {
   if (!autosaveEnabled() || autosaving || !currentPath) return;
+  // A dropped binding (file moved/deleted under this tab) must never autosave —
+  // the next save is an explicit Save As so the user picks the destination.
+  const t = activeTab();
+  if (t && t.unbound) return;
   const text = view.state.doc.toString();
   if (text === savedText) return;
   autosaving = true;
   try {
-    const result = await window.plume.save(text);
-    if (result) { savedText = text; setDirty(false); }
+    const result = await window.plume.save(currentPath, text);
+    if (result) { savedText = text; setDirty(false); return; }
+    // Refused/failed write mid-autosave: the binding is gone (file moved?).
+    // Autosave must not pop dialogs — mark the tab unbound (stops further
+    // autosaves; ⌘S now routes to Save As) and tell the user once.
+    const t2 = activeTab();
+    if (t2 && !t2.unbound) {
+      t2.unbound = true;
+      flashMessage(`Autosave couldn't write ${currentPath.split("/").pop()} — it may have moved. Save (⌘S) to choose where.`);
+    }
   } finally {
     autosaving = false;
   }
@@ -191,7 +198,9 @@ async function autosave() {
 
 function setDirty(dirty) {
   titlebar.classList.toggle("dirty", dirty);
-  window.plume.setDirty(dirty);
+  // Per-PATH flag feeding only the agent write_document guard; the renderer is
+  // its single writer (cleared on save / tab close / close resolution).
+  if (currentPath) window.plume.setDocDirty(currentPath, dirty);
   if (tabs.length > 1) renderTabbar(); // keep the active tab's dirty dot honest
 }
 
@@ -230,7 +239,7 @@ async function commitTitleRename(cancel) {
   titlebarName.contentEditable = "false";
   if (cancel || !raw) { setTitle(currentPath); return; }
   if (currentPath) {
-    const p = await window.plume.renameFile(raw);
+    const p = await window.plume.renameFile(currentPath, raw);
     setTitle(p || currentPath);
   } else {
     pendingName = raw; // applied when the untitled doc materializes
@@ -749,7 +758,7 @@ function loadDocument(content, filePath, recovery, gotoLine) {
   });
   setDocPath(view, filePath);
   setTitle(filePath);
-  if (filePath) { windowEverHadPath = true; recordRecent(filePath); }
+  if (filePath) recordRecent(filePath);
   setDirty(false);
   renderOutline();
   updateStatus();
@@ -777,7 +786,7 @@ function loadDocument(content, filePath, recovery, gotoLine) {
   // Keep the active tab's record pointing at what this window now shows
   // (in-place navigation from the sidebar retargets the current tab).
   const at = findTab(tabs, activeTabId);
-  if (at) { at.path = filePath || null; at.pendingName = null; at.text = null; at.savedText = null; }
+  if (at) { at.path = filePath || null; at.pendingName = null; at.text = null; at.savedText = null; at.unbound = false; }
   renderTabbar();
   refreshSidebar();
   view.focus();
@@ -925,7 +934,7 @@ async function commitReview() {
   reviewEl.classList.add("hidden"); reviewEl.innerHTML = "";
   setDoc(merged);
   savedText = merged; // so our own write-back doesn't re-trigger a review
-  if (currentPath) await window.plume.save(merged);
+  if (currentPath) await window.plume.save(currentPath, merged);
   setDirty(false);
   persistAnnotations(); refreshAnnotRanges();
   if (isRenderMode() && !showSource) renderCurrent();
@@ -948,30 +957,41 @@ function showDiskChangedBanner(content) {
 }
 
 async function save(thenClose = false) {
-  // Untitled docs have no path yet — route to Save As so the user picks a location.
-  // (Electron's backend prompted implicitly; Tauri's write_file errors on a null path.)
-  if (!currentPath) {
+  // No path (untitled) or a dropped binding (file moved/deleted) → Save As so
+  // the user picks the destination; a stale path must never be written blindly.
+  const t = activeTab();
+  if (!currentPath || (t && t.unbound)) {
     const saved = await saveAs();
     if (saved && thenClose) window.close();
     return;
   }
   const content = view.state.doc.toString();
-  const result = await window.plume.save(content);
+  const result = await window.plume.save(currentPath, content);
   if (result) {
     savedText = content;
     setTitle(result);
     setDirty(false);
     if (thenClose) window.close();
+    return;
   }
+  // Native refused the write (binding raced/dropped — write_file only accepts
+  // this window's bound path) or the disk write failed. Never drop edits
+  // silently: mark the tab unbound and route through Save As (contract rule).
+  if (t) t.unbound = true;
+  const saved = await saveAs();
+  if (saved && thenClose) window.close();
 }
 
 async function saveAs() {
   const content = view.state.doc.toString();
-  const result = await window.plume.saveAs(content);
+  const result = await window.plume.saveAs(content); // native writes AND rebinds atomically
   if (result) {
     savedText = content;
+    const t = activeTab();
+    if (t) { t.path = result; t.unbound = false; }
     setTitle(result);
     setDirty(false);
+    pushOpenPaths();
   }
   return result;
 }
@@ -1786,7 +1806,7 @@ function renderTree(nodes, parent, depth) {
     if (n.type === "file") {
       row.textContent = n.name;
       if (n.path === currentPath) row.classList.add("active");
-      row.onclick = () => window.plume.openInThisWindow(n.path);
+      row.onclick = () => openInCurrentTab(n.path);
       parent.appendChild(row);
     } else {
       row.textContent = "▸ " + n.name;
@@ -1964,7 +1984,7 @@ searchInput.addEventListener("input", () => {
       const meta = document.createElement("div"); meta.className = "sr-meta"; meta.textContent = `${r.name}:${r.line}`;
       const txt = document.createElement("div"); txt.className = "sr-text"; txt.textContent = r.text;
       row.append(meta, txt);
-      row.onmousedown = (e) => { e.preventDefault(); closeSearch(); window.plume.openInThisWindow(r.path, r.line); };
+      row.onmousedown = (e) => { e.preventDefault(); closeSearch(); openInCurrentTab(r.path, r.line); };
       searchResults.appendChild(row);
     }
   }, 160);
@@ -1998,7 +2018,7 @@ function activateWsRow(openPath, line) {
   const insert = wsInsertMode;
   closeWorkspace();
   if (insert) insertSessionText(openPath);
-  else window.plume.openInThisWindow(openPath, line);
+  else openInCurrentTab(openPath, line);
 }
 
 function tsLabel(ms) {
@@ -2133,16 +2153,38 @@ document.addEventListener("keydown", (e) => {
 }, true);
 
 /* ---------- Document tabs (#10 — in-window switching) ---------- */
-// The renderer owns the tab list; the native side still sees one document per
-// window. Every switch to a path-backed tab goes through openInThisWindow →
-// read_path, which rebinds the native watcher + per-window doc map, so saves
-// and file-changed events always route to the file this window is showing.
+// The renderer owns the tab list AND is the single source of truth for what
+// this window shows (Cluster A). The native side sees one bound document per
+// window, managed exclusively through bindDoc()/detachDoc(); the full tab
+// path-set is mirrored via setOpenPaths() so background tabs stay inside the
+// agent write scope and listOpenFiles.
 const tabbarEl = document.getElementById("tabbar");
 let tabs = [createTab()];
 let activeTabId = tabs[0].id;
 let pendingTabRestore = null; // consumed by loadDocument when a switch is in flight
 
 function activeTab() { return findTab(tabs, activeTabId); }
+
+// Mirror the window's tab path-set to the native side (agent scope +
+// listOpenFiles + the Destroyed-time dirty_files GC). Deduped push.
+let lastOpenPathsPushed = "";
+function pushOpenPaths() {
+  const paths = [...new Set(tabs.map((t) => t.path).filter(Boolean))];
+  const key = paths.join("\n");
+  if (key === lastOpenPathsPushed) return;
+  lastOpenPathsPushed = key;
+  window.plume.setOpenPaths?.(paths);
+}
+
+// Bind `path` as this window's doc and load it into the editor (in the current
+// tab). The single entry point for in-place file opens: sidebar, search,
+// session rows, tab activation, and new-tab opens all come through here.
+async function openInCurrentTab(path, line) {
+  const r = await window.plume.bindDoc(path);
+  if (!r) { flashMessage("Couldn't open " + path.split("/").pop()); return false; }
+  loadDocument(r.content, path, r.recovery, line);
+  return true;
+}
 
 // Freeze the live editor state into the active tab's record (before switching away).
 function captureActiveTab() {
@@ -2157,6 +2199,7 @@ function captureActiveTab() {
 }
 
 function renderTabbar() {
+  pushOpenPaths(); // every tab add/remove/retarget re-renders — keep the native mirror current
   tabbarEl.classList.toggle("hidden", tabs.length < 2);
   tabbarEl.innerHTML = "";
   if (tabs.length < 2) return;
@@ -2196,9 +2239,8 @@ function renderTabbar() {
 
 // Show an untitled tab's buffer. Mirrors loadDocument for the no-path case.
 function presentUntitledTab(t) {
-  // Ask the native side to clear this window's doc binding so saves/snapshots
-  // can't route to the previously shown file. No-op until detachDoc lands
-  // (requested from be-dev); the snapshot guard covers the gap.
+  // Clear this window's native binding so saves/snapshots route to the
+  // untitled slot, never to the previously shown file.
   window.plume.detachDoc?.();
   const text = t.text ?? "";
   applyMode(null, text);
@@ -2223,29 +2265,46 @@ function presentUntitledTab(t) {
 
 // Load tab `t` into the editor (native rebind for path-backed tabs).
 async function presentTab(t) {
-  if (t.path) {
-    pendingTabRestore = t;
-    await window.plume.openInThisWindow(t.path);
-    if (pendingTabRestore === t) {
-      // Disk read failed (file moved/deleted) — show the captured buffer so
-      // nothing is lost; savedText marks it dirty against what disk last had.
+  if (t.path && !t.unbound) {
+    // P2-C: only a DIRTY captured buffer is restored over disk content — a
+    // clean tab always takes the (possibly newer) state of the file on disk.
+    pendingTabRestore = isCapturedDirty(t) ? t : null;
+    const r = await window.plume.bindDoc(t.path);
+    if (r) {
+      loadDocument(r.content, t.path, r.recovery);
+    } else {
+      // Read failed (file moved/deleted): DROP the binding (Cluster A pillar 2).
+      // The buffer stays; the next save is an explicit Save As — a stale path
+      // is never written blindly.
       pendingTabRestore = null;
+      window.plume.detachDoc?.();
       const text = t.text ?? "";
       loadDocument(text, t.path);
+      t.unbound = true;
       if (t.savedText != null && t.savedText !== text) { savedText = t.savedText; setDirty(true); }
-      flashMessage(`Couldn't re-read ${tabDisplayName(t)} from disk — showing the buffered copy.`);
+      flashMessage(`${tabDisplayName(t)} can't be read from disk — showing the buffer; saving will ask where.`);
     }
+  } else if (t.path && t.unbound) {
+    // Known-unbound tab: present the buffer, no native binding.
+    window.plume.detachDoc?.();
+    const text = t.text ?? "";
+    loadDocument(text, t.path);
+    t.unbound = true; // loadDocument resets the flag on the tab record
+    if (t.savedText != null && t.savedText !== text) { savedText = t.savedText; setDirty(true); }
   } else {
     presentUntitledTab(t);
   }
   renderTabbar();
 }
 
-async function activateTab(id) {
+// flush:false is for the window-close iteration — the outgoing tab there may
+// have just been explicitly DISCARDED (Don't Save), and the normal autosave
+// flush would write the very edits the user chose to drop.
+async function activateTab(id, { flush = true } = {}) {
   if (id === activeTabId) return;
   const t = findTab(tabs, id);
   if (!t) return;
-  await autosave(); // flush the outgoing tab so background tabs are clean
+  if (flush) await autosave(); // flush the outgoing tab so background tabs are clean
   captureActiveTab();
   activeTabId = id;
   await presentTab(t);
@@ -2263,19 +2322,18 @@ async function newTab() {
 
 async function openInNewTab(path, line) {
   // Reuse a blank scratch surface (e.g. the welcome screen) instead of stacking a tab.
-  if (!currentPath && view.state.doc.length === 0) { window.plume.openInThisWindow(path, line); return; }
+  if (!currentPath && view.state.doc.length === 0) { await openInCurrentTab(path, line); return; }
   await autosave();
   captureActiveTab();
   const prevActive = activeTabId;
   const t = createTab({ path });
   tabs = addTab(tabs, t);
   activeTabId = t.id;
-  await window.plume.openInThisWindow(path, line);
-  if (currentPath !== path) {
-    // Read failed — drop the new tab and stay put.
+  if (!(await openInCurrentTab(path, line))) {
+    // Read failed — drop the new tab and stay put (bindDoc left the previous
+    // binding untouched, so the editor still shows the prior tab's doc).
     tabs = closeTab(tabs, t.id).tabs;
     activeTabId = prevActive;
-    flashMessage("Couldn't open " + path.split("/").pop());
   }
   renderTabbar();
 }
@@ -2312,22 +2370,38 @@ function promptSaveChoice(detail) {
   });
 }
 
+// Dirty computed synchronously from the buffer — the titlebar flag lags behind
+// the 120ms side-effect debounce, and the close iteration runs right after a
+// tab switch restores a dirty buffer (Codex PR#9 P1: the race dropped drafts).
+function activeDocDirtySync() { return view.state.doc.toString() !== savedText; }
+
 // Resolve the close decision for the ACTIVE doc, running the prompt and any
-// requested save. Returns true when the close may proceed.
+// requested save. Returns true when the close may proceed. On resolution the
+// doc's agent-guard dirty flag is cleared (the renderer is its single writer;
+// a closing window can't clean up post-mortem), and an explicit Don't Save
+// also clears the crash-recovery snapshot so the discard can't resurrect.
 async function resolveCloseOfActiveDoc(detail) {
-  const state = () => ({ dirty: titlebar.classList.contains("dirty"), hasPath: !!currentPath });
+  const state = () => ({ dirty: activeDocDirtySync(), hasPath: !!currentPath });
   let action = closeDecision(state());
   if (action === "prompt") action = closeDecision(state(), (await promptSaveChoice(detail)) ?? "cancel");
   if (action === "stay") return false;
+  const path = currentPath;
+  const t = activeTab();
   if (action === "save-then-close") {
+    // An unbound tab (dropped binding) must not write its stale path — save()
+    // routes it to Save As.
     await save();
-    return !titlebar.classList.contains("dirty"); // save failed → keep the doc open
-  }
-  if (action === "saveas-then-close") {
+    if (activeDocDirtySync()) return false; // save failed/cancelled → keep the doc open
+  } else if (action === "saveas-then-close") {
     if (!(await saveAs())) return false; // dialog cancelled — keep the doc open
-    return !titlebar.classList.contains("dirty");
+    if (activeDocDirtySync()) return false;
+  } else if (path && !(t && t.unbound) && activeDocDirtySync()) {
+    // Explicit Don't Save of a path-backed doc: final — drop its recovery
+    // snapshot so a later launch can't offer the discarded edits back.
+    window.plume.discardRecovery?.(path);
   }
-  return true; // "close": clean doc, or an explicit Don't Save (buffer is dropped, nothing written)
+  if (path) window.plume.setDocDirty(path, false); // resolved either way
+  return true;
 }
 
 async function closeActiveTab() {
@@ -2372,14 +2446,27 @@ window.plume.onFolderOpen(({ dir }) => {
   refreshSidebar();
 });
 
-// #4 (renderer side): the native side held this window's close because its
-// doc has unsaved edits (untitled today; dirty saved docs once be-dev extends
-// the gate). Same decision path as tab close: prompt, save if asked, then
-// complete or abandon the close. Don't Save never writes anything.
+// Renderer-authoritative close (Cluster A pillar 3): the native side ALWAYS
+// holds the close and emits close-requested (the bridge acks liveness
+// immediately). Resolve the ACTIVE doc, then every captured-dirty BACKGROUND
+// tab (untitled and saved) — activating each so its prompt names the right doc
+// and Save routes correctly. Any Cancel aborts the whole close via
+// cancelClose(); confirmClose() fires only when every dirty doc is saved or
+// explicitly discarded. Don't Save never writes anything.
 window.plume.onCloseRequested?.(async () => {
-  if (await resolveCloseOfActiveDoc("Your changes will be lost if you don't save them.")) {
-    window.plume.confirmClose?.();
+  const detail = "Your changes will be lost if you don't save them.";
+  if (!(await resolveCloseOfActiveDoc(detail))) { window.plume.cancelClose?.(); return; }
+  // Track resolved tabs by id: a tab discarded via Don't Save keeps its dirty
+  // captured buffer when we move on, and must not be prompted again.
+  const resolvedIds = new Set([activeTabId]);
+  for (;;) {
+    const t = dirtyBackgroundTabs(tabs, activeTabId).find((x) => !resolvedIds.has(x.id));
+    if (!t) break;
+    await activateTab(t.id, { flush: false }); // no autosave flush: outgoing tab may be freshly discarded
+    if (!(await resolveCloseOfActiveDoc(detail))) { window.plume.cancelClose?.(); return; }
+    resolvedIds.add(t.id);
   }
+  window.plume.confirmClose?.();
 });
 
 // Offer the newest untitled crash snapshot from a previous run when this window

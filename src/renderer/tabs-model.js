@@ -17,6 +17,10 @@ export function createTab(partial = {}) {
     savedText: null,
     sel: null,
     scrollTop: 0,
+    // Cluster A pillar 2: the tab's file could not be re-read (moved/deleted),
+    // so its native binding was dropped. The buffer stays; the next save must
+    // go through Save As — the stale path is never written blindly.
+    unbound: false,
     ...partial,
   };
 }
@@ -81,4 +85,12 @@ export function closeDecision({ dirty, hasPath }, choice) {
   if (choice === "save") return hasPath ? "save-then-close" : "saveas-then-close";
   if (choice === "discard") return "close";
   return "stay";
+}
+
+// Background tabs that still need a close decision when the WINDOW closes —
+// every captured-dirty tab except the active one (the active doc is resolved
+// live, first). Renderer-authoritative close: each of these gets its own
+// Save / Don't Save / Cancel; none may be dropped silently.
+export function dirtyBackgroundTabs(tabs, activeId) {
+  return tabs.filter((t) => t.id !== activeId && isCapturedDirty(t));
 }

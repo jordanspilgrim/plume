@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId,
-  tabDisplayName, isCapturedDirty, isBlankTab, closeDecision,
+  tabDisplayName, isCapturedDirty, isBlankTab, closeDecision, dirtyBackgroundTabs,
 } from "../src/renderer/tabs-model.js";
 
 test("createTab: unique ids, defaults, partial override", () => {
@@ -112,4 +112,34 @@ test("closeDecision: Cancel / Escape / unknown keep the doc open", () => {
   assert.equal(closeDecision({ dirty: true, hasPath: false }, "cancel"), "stay");
   assert.equal(closeDecision({ dirty: true, hasPath: true }, "cancel"), "stay");
   assert.equal(closeDecision({ dirty: true, hasPath: true }, "bogus"), "stay");
+});
+
+// Renderer-authoritative close (Cluster A): every captured-dirty background
+// tab gets its own decision on window close — none may be dropped silently.
+test("dirtyBackgroundTabs: finds dirty drafts (untitled AND saved) behind the active tab", () => {
+  const active = createTab({ path: "/notes/a.md" });
+  const draft = createTab({ text: "unsaved draft", savedText: "" }); // dirty untitled
+  const dirtySaved = createTab({ path: "/notes/c.md", text: "edited", savedText: "orig" });
+  const clean = createTab({ path: "/notes/b.md", text: "x", savedText: "x" });
+  const tabs = [active, draft, dirtySaved, clean];
+  assert.deepEqual(dirtyBackgroundTabs(tabs, active.id).map((t) => t.id), [draft.id, dirtySaved.id]);
+  // The active tab is never in the background list, even if captured-dirty.
+  const dirtyActive = createTab({ text: "y", savedText: "z" });
+  assert.deepEqual(dirtyBackgroundTabs([dirtyActive], dirtyActive.id), []);
+});
+
+// Cluster A pillar 2: unbound tabs (file moved/deleted) keep their identity in
+// the model; only an explicit re-load clears the flag.
+test("createTab: unbound defaults false and is preserved via partials", () => {
+  assert.equal(createTab().unbound, false);
+  assert.equal(createTab({ unbound: true, path: "/gone.md" }).unbound, true);
+});
+
+// P2-C rule pin: only a DIRTY captured buffer may be restored over disk
+// content; a clean tab takes whatever is on disk (possibly newer).
+test("isCapturedDirty is the restore-eligibility rule (clean tabs never restore)", () => {
+  const clean = createTab({ path: "/a.md", text: "same", savedText: "same" });
+  const dirty = createTab({ path: "/a.md", text: "edited", savedText: "orig" });
+  assert.equal(isCapturedDirty(clean), false); // → present disk content
+  assert.equal(isCapturedDirty(dirty), true);  // → restore the buffer
 });
