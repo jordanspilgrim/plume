@@ -1920,10 +1920,18 @@ fn rename_file(app: AppHandle, window: tauri::WebviewWindow, old_path: String, n
     // Same containment as write_file: only this window's bound document may be
     // renamed from this window.
     let bound = window_doc_path(&app, window.label())?;
-    if canonical_key(Path::new(&old_path)) != canonical_key(Path::new(&bound)) {
+    // Class 1 (round 4): bind the canonical value the guard compares, then
+    // rename THAT. This compared canonical paths and then operated on the raw
+    // `old_path`, so a document opened through a symlink renamed the LINK
+    // instead of the document: `dir` became the symlink's directory (outside
+    // the workspace), unique_path probed there, fs::rename moved the link, the
+    // real file kept its name, and set_current then bound the window to a path
+    // that isn't the document. The guard proved the two paths resolve to the
+    // same file; that resolved file is the one to operate on.
+    let old = canonical_key(Path::new(&old_path));
+    if old != canonical_key(Path::new(&bound)) {
         return None;
     }
-    let old = PathBuf::from(&old_path);
     let dir = old.parent()?.to_path_buf();
     let ext = old.extension().and_then(|e| e.to_str()).unwrap_or("md").to_string();
     let stem = sanitize_stem(&new_name);
@@ -2409,18 +2417,36 @@ fn href_is_relative(href: &str) -> bool {
         || h.as_bytes().get(1) == Some(&b':'))
 }
 
+// The directory link resolution walks, derived from the SAME value the scope
+// gate vets. Pure so this decision is testable without an AppHandle.
+//
+// Round-4 class 1: `resolve_link` gated `canonical_key(base)` and then rebuilt
+// its directory from `Path::new(raw_base).parent()`. Those two agree only while
+// the final component is a real file. Make it a symlink and they diverge — and
+// the exploitable direction is a symlink sitting OUTSIDE the workspace that
+// points at a document INSIDE it: the gate vets the in-scope target and passes,
+// while resolution walks the unvetted directory the symlink lives in, and the
+// containment check is then performed against that same unvetted directory, so
+// it accepts everything there. Deriving the directory from the canonical base
+// closes it by construction — there is no second value to disagree.
+fn link_base_dir(base: &Path) -> Option<PathBuf> {
+    canonical_key(base).parent().map(|p| p.to_path_buf())
+}
+
 #[tauri::command]
 fn resolve_link(app: AppHandle, href: String, base: Option<String>) -> Option<String> {
-    let base = base?;
+    // Bind the canonical base ONCE; nothing downstream sees the raw string.
+    let base = canonical_key(Path::new(&base?));
     // Cluster B: links only resolve FROM a doc that is itself in scope.
-    if !fs_scope_allows(&app, &canonical_key(Path::new(&base))) {
+    if !fs_scope_allows(&app, &base) {
         return None;
     }
     if !href_is_relative(&href) {
         return None;
     }
-    let dir = Path::new(&base).parent()?;
-    let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    // Canonical base => canonical parent, so the containment check no longer
+    // needs a separately-canonicalized `dir_canon` that could diverge from it.
+    let dir = &link_base_dir(&base)?;
     let target = dir.join(&href);
     for cand in [
         target.clone(),
@@ -2431,13 +2457,17 @@ fn resolve_link(app: AppHandle, href: String, base: Option<String>) -> Option<St
             // Resolve symlinks/.. BEFORE deciding: the target must still live
             // inside the document's own directory subtree.
             let resolved = canonical_key(&cand);
-            if !link_target_allowed(&dir_canon, &resolved) {
+            if !link_target_allowed(dir, &resolved) {
                 return None;
             }
             // Safe to approve: it is inside territory the open document
-            // already establishes, so this widens nothing.
-            approve_file(&app, &cand, false);
-            return Some(cand.to_string_lossy().to_string());
+            // already establishes, so this widens nothing. Approve AND return
+            // the resolved path — approve_file canonicalizes internally, so
+            // returning the raw `cand` handed the renderer a path that was not
+            // the one approved, leaving a swap window between this check and
+            // the renderer's open.
+            approve_file(&app, &resolved, false);
+            return Some(resolved.to_string_lossy().to_string());
         }
     }
     None
@@ -3974,6 +4004,122 @@ mod tests {
     // code execution (a git credential-helper line runs on the next auth).
     // The carve-out's premise is "a HUMAN chose this exact path", so the flag
     // must track that, not merely which function called.
+    // Round-4 class 1, second site: rename must move the document the guard
+    // proved, not the caller's raw string. `rename_file` compared canonical
+    // paths and then built `old`/`dir` from the raw one, so a document reached
+    // through a symlink renamed the LINK — the real file kept its name, the
+    // rename and its unique_path probe happened in the symlink's (unvetted)
+    // directory, and the window was left bound to a path that is not the
+    // document. Equality of canonical paths is exactly the proof that the
+    // resolved path is the right thing to operate on.
+    #[cfg(unix)]
+    #[test]
+    fn rename_moves_the_document_not_the_link_used_to_reach_it() {
+        let root = std::env::temp_dir().join(format!("plume-renamecanon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let inside = root.join("workspace");
+        let outside = root.join("elsewhere");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let doc = inside.join("real.md");
+        fs::write(&doc, "# in scope").unwrap();
+        let alias = outside.join("alias.md");
+        std::os::unix::fs::symlink(&doc, &alias).unwrap();
+
+        // The guard's premise: both paths resolve to the same document, so the
+        // rename is authorized. That is the case that reaches the derivation.
+        assert_eq!(canonical_key(&alias), canonical_key(&doc));
+
+        // The derivation the fix uses: the directory to rename within is the
+        // document's own, not the symlink's.
+        let vetted = canonical_key(&alias);
+        let vetted_dir = vetted.parent().unwrap().to_path_buf();
+        assert_eq!(
+            vetted_dir,
+            canonical_key(&inside),
+            "rename must operate in the document's real directory"
+        );
+
+        // The raw derivation the old shape used pointed at the unvetted dir.
+        let raw_dir = Path::new(&alias).parent().unwrap().canonicalize().unwrap();
+        assert_ne!(
+            raw_dir, vetted_dir,
+            "precondition: raw and canonical derivations must diverge"
+        );
+
+        // And renaming the RAW path moves the link while the document keeps its
+        // name — the concrete data-integrity failure the old shape produced.
+        let moved_link = outside.join("renamed.md");
+        fs::rename(&alias, &moved_link).unwrap();
+        assert!(doc.is_file(), "the real document is untouched by a link rename");
+        assert!(
+            !alias.exists() && moved_link.exists(),
+            "only the link moved, so the app would bind a path that is not the document"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Round-4 class 1: link resolution must walk the directory of the document
+    // the GATE vetted, not the directory of the caller's raw string. A symlink
+    // outside the workspace pointing at an in-scope document makes those two
+    // diverge in the dangerous direction: the gate sees the in-scope target and
+    // passes, while the old derivation walked (and bounded containment by) the
+    // unvetted directory the symlink sits in — so every non-sensitive file
+    // there became linkable and then approved for reading.
+    #[cfg(unix)]
+    #[test]
+    fn link_resolution_walks_the_vetted_documents_directory() {
+        let root = std::env::temp_dir().join(format!("plume-linkbase-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let inside = root.join("workspace");
+        let outside = root.join("elsewhere");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let doc = inside.join("real.md");
+        fs::write(&doc, "# in scope").unwrap();
+        let neighbor = outside.join("neighbor.md");
+        fs::write(&neighbor, "not in scope").unwrap();
+        // The document is reached through a symlink that lives OUTSIDE scope.
+        let alias = outside.join("alias.md");
+        std::os::unix::fs::symlink(&doc, &alias).unwrap();
+
+        // Precondition: the gate resolves the alias to the in-scope document,
+        // so it passes — this is the case that reaches the derivation at all.
+        assert_eq!(canonical_key(&alias), canonical_key(&doc));
+
+        // The security property: resolution starts in the directory of the
+        // document the gate actually vetted, NOT the directory the caller's
+        // string happened to sit in. The old raw-base derivation returned
+        // `elsewhere/` here and this assertion is what catches a regression.
+        let raw_dir = Path::new(&alias).parent().unwrap().canonicalize().unwrap();
+        let vetted_dir = link_base_dir(&alias).unwrap();
+        assert_eq!(
+            vetted_dir,
+            canonical_key(&inside),
+            "link resolution must start in the vetted document's real directory"
+        );
+
+        // And the two derivations genuinely disagree here — without this the
+        // assertion above could pass for the wrong reason.
+        assert_ne!(
+            raw_dir, vetted_dir,
+            "precondition: raw-base and canonical-base derivations must diverge"
+        );
+
+        // And containment bounded by the vetted directory refuses the
+        // out-of-scope neighbour that the raw derivation would have accepted.
+        let target = canonical_key(&neighbor);
+        assert!(
+            link_target_allowed(&raw_dir, &target),
+            "precondition: the raw derivation would have approved the neighbour"
+        );
+        assert!(
+            !link_target_allowed(&vetted_dir, &target),
+            "the vetted derivation must refuse a file outside the document's real directory"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // The read side must consume the SAME value the gate approved. A symlink is
     // the concrete way those diverge: gating on the resolved target and then
     // reading the raw argument means the bytes returned aren't the file that
