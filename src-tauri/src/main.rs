@@ -167,6 +167,17 @@ fn start_watcher(app: &AppHandle, label: &str, path: &str) -> Option<Recommended
         if res.is_err() {
             return;
         }
+        // OOM amplifier: this fires on every change to the OPEN file, so an
+        // agent appending gigabytes to it would read the whole thing here and
+        // take the process down — with every other window's unsaved work. Skip
+        // the emit past a generous ceiling (the editor keeps its last-known
+        // content) rather than truncating, which would silently replace the
+        // buffer with a partial document. Deliberately scoped to the WATCHER:
+        // read_path/bind_doc/initial_file stay unbounded because those are
+        // documents the user chose to open.
+        if fs::metadata(&file).map(|m| m.len() > MAX_WATCHED_RELOAD_BYTES).unwrap_or(false) {
+            return;
+        }
         if let Ok(content) = fs::read_to_string(&file) {
             let st = app2.state::<AppState>();
             let mut changed = false;
@@ -301,6 +312,20 @@ fn initial_file(app: AppHandle, window: tauri::WebviewWindow) -> Option<InitialF
         Some(p) => Some(p),
         None => st.initial.lock_or_recover().clone(),
     }?;
+    // Defense in depth: this is the one read that never passes fs_scope_allows
+    // (it IS the bootstrap that establishes scope), so it gets the deny
+    // directly. A sensitive file may only arrive here if a human explicitly
+    // picked it — a launch argument, or a dialog — which is exactly what
+    // approved_files records. Everything else is refused even if some earlier
+    // gate was bypassed.
+    let target = canonical_key(Path::new(&p));
+    if is_sensitive_path(&target)
+        && !app.state::<AppState>().approved_files.lock_or_recover().contains(&target)
+    {
+        eprintln!("initial_file refused: {} is sensitive and was not explicitly opened", target.display());
+        return None;
+    }
+    let p = target.to_string_lossy().to_string();
     let content = fs::read_to_string(&p).ok()?;
     let recovery = recovery_for(&p);
     // Consuming the pending entry moves the file into docs — write scope keeps it.
@@ -333,12 +358,17 @@ fn open_in_new_window(app: AppHandle, file_path: String) -> Result<(), String> {
     // scope feeding both the renderer read gate and the socket's write_allowed.
     // Ungated it is the same privilege escalation as an unfiltered tab set —
     // so the target must already be user-established territory.
-    if !fs_scope_allows(&app, &canonical_key(Path::new(&file_path))) {
+    let target = canonical_key(Path::new(&file_path));
+    if !fs_scope_allows(&app, &target) {
         return Err("outside the open workspace".to_string());
     }
     // Window creation (and its initial_file content load) must run on the main
     // thread — commands run off it, so dispatch like the socket "open" path does.
     // Calling spawn_window directly built the window but left it empty.
+    // Spawn the CANONICAL path: window_files feeds initial_file, which reads it
+    // milliseconds later on another thread — a raw path leaves a symlink to swap
+    // in between (class 1).
+    let file_path = target.to_string_lossy().to_string();
     let appc = app.clone();
     app.run_on_main_thread(move || { let _ = spawn_window(&appc, &file_path); })
         .map_err(|e| e.to_string())
@@ -1429,8 +1459,8 @@ fn materialize_doc(app: AppHandle, window: tauri::WebviewWindow, dir: Option<Str
     };
     // Cluster B: a renderer-supplied target folder must be user territory; the
     // default ~/Documents/Plume is always Plume's own to create into.
-    let base_ok = canonical_key(&base) == canonical_key(&default_plume_dir())
-        || fs_scope_allows(&app, &canonical_key(&base));
+    let base = canonical_key(&base); // create in the dir we vet (class 1)
+    let base_ok = base == canonical_key(&default_plume_dir()) || fs_scope_allows(&app, &base);
     if !base_ok {
         return None;
     }
@@ -1572,6 +1602,10 @@ const AGENT_INDEX_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 // An annotations sidecar is a list of margin notes; far above any real one.
 const MAX_ANNOTATIONS_BYTES: u64 = 16 * 1024 * 1024;
 
+// Ceiling for auto-reloading a watched file. Far above any document a person
+// edits; only an automated writer reaches it.
+const MAX_WATCHED_RELOAD_BYTES: u64 = 128 * 1024 * 1024;
+
 // Read at most `cap` bytes from the head of a file, lossily. Never loads a file
 // whole, so an attacker-sized (or agent-sized) draft can't exhaust memory.
 fn read_head(path: &Path, cap: u64) -> String {
@@ -1632,6 +1666,11 @@ fn discard_draft(path: String) -> bool {
     }
     match fs::remove_file(&target) {
         Ok(()) => {
+            // Remove the notes with the draft (class 2). Otherwise unique_path
+            // later hands the freed name to a NEW draft, which silently adopts
+            // the discarded directives — resurrected onto unrelated content.
+            let (_, notes) = sidecar(&target.to_string_lossy());
+            let _ = fs::remove_file(&notes);
             // Clear the recovery snapshot keyed by the CANONICAL bound path
             // snapshot() wrote under (create_draft binds the canonical form) —
             // not the raw arg, which can diverge under a symlinked ~/Documents (N3).
@@ -1718,6 +1757,55 @@ mod saveflow_tests {
     // HIGH-2: graduating a draft moved the .md but stranded its annotations in
     // Autosave/.plume/, so reopening the saved file showed zero steer
     // directives — silent loss of user-authored content on a normal ⌘S.
+    // Class 2: the sidecar follows the doc on EVERY lifecycle move, not only
+    // graduation. A rename that leaves notes behind loses them silently —
+    // getAnnotations(new) returns [] and nothing reports an error.
+    #[test]
+    fn renaming_a_doc_carries_its_annotations_across() {
+        let root = tmp("rename-notes");
+        let old = root.join("draft-name.md");
+        fs::write(&old, "body").unwrap();
+        let (od, on) = sidecar(&old.to_string_lossy());
+        fs::create_dir_all(&od).unwrap();
+        fs::write(&on, r#"[{"quote":"body","note":"keep me"}]"#).unwrap();
+
+        // Mirror rename_file's core: move the doc, then the notes follow.
+        let new = root.join("better-name.md");
+        fs::rename(&old, &new).unwrap();
+        migrate_annotations(&old, &new);
+
+        let (_, nn) = sidecar(&new.to_string_lossy());
+        assert!(nn.is_file(), "notes must land beside the renamed doc");
+        assert!(fs::read_to_string(&nn).unwrap().contains("keep me"));
+        assert!(!on.exists(), "and must not be stranded at the old name");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Class 2, the delete half: a discarded draft's notes must go with it, or
+    // unique_path hands the freed name to a NEW draft that adopts them.
+    #[test]
+    fn a_discarded_drafts_notes_cannot_resurrect_on_a_later_draft() {
+        let root = tmp("discard-notes");
+        let av = root.join("Autosave");
+        let draft = write_new_draft(&av, "notes-me", "first").unwrap();
+        let (sd, sn) = sidecar(&draft.to_string_lossy());
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(&sn, r#"[{"quote":"first","note":"discarded directive"}]"#).unwrap();
+
+        // Mirror discard_draft's core: remove the .md AND its sidecar.
+        fs::remove_file(&draft).unwrap();
+        let (_, notes) = sidecar(&draft.to_string_lossy());
+        let _ = fs::remove_file(&notes);
+        assert!(!sn.exists(), "the discarded draft's notes must not survive it");
+
+        // A later draft reusing the freed name inherits nothing.
+        let reused = write_new_draft(&av, "notes-me", "unrelated content").unwrap();
+        assert_eq!(reused.file_name(), draft.file_name(), "same slug is reused");
+        let (_, rn) = sidecar(&reused.to_string_lossy());
+        assert!(!rn.exists(), "a fresh draft must not adopt a discarded draft's directives");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn graduating_a_draft_carries_its_annotations_across() {
         let root = tmp("notes");
@@ -1843,6 +1931,12 @@ fn rename_file(app: AppHandle, window: tauri::WebviewWindow, old_path: String, n
     let new_path = if candidate == old { candidate } else { unique_path(&dir, &stem, &ext) };
     if new_path != old {
         fs::rename(&old, &new_path).ok()?;
+        // The sidecar follows the document on EVERY move, not just graduation
+        // (class 2). Without this a rename silently loses the user's steer
+        // directives: getAnnotations(new) returns [] and the old notes sit
+        // orphaned at <old>.notes.json. Same ordering as graduate — the move
+        // is confirmed first, then the notes follow it.
+        migrate_annotations(&old, &new_path);
     }
     let p = new_path.to_string_lossy().to_string();
     let content = fs::read_to_string(&p).unwrap_or_default();
@@ -2388,10 +2482,11 @@ fn walk(dir: &Path, depth: i32) -> Vec<Value> {
 fn list_dir(app: AppHandle, dir: String, depth: Option<i32>) -> Vec<Value> {
     // Cluster B: the sidebar tree may only walk user-established territory
     // (an open doc's folder or a picked folder). Fail soft — empty tree.
-    if !fs_scope_allows(&app, &canonical_key(Path::new(&dir))) {
+    let target = canonical_key(Path::new(&dir));
+    if !fs_scope_allows(&app, &target) {
         return vec![];
     }
-    walk(Path::new(&dir), depth.unwrap_or(3))
+    walk(&target, depth.unwrap_or(3)) // walk what we gated (class 1)
 }
 
 fn search_walk(dir: &Path, q: &str, results: &mut Vec<Value>, scanned: &mut u32, depth: i32) {
@@ -2442,12 +2537,13 @@ fn search_files(app: AppHandle, dir: String, query: String) -> Vec<Value> {
         return vec![];
     }
     // Cluster B: same territory rule as list_dir — no scanning outside it.
-    if !fs_scope_allows(&app, &canonical_key(Path::new(&dir))) {
+    let target = canonical_key(Path::new(&dir));
+    if !fs_scope_allows(&app, &target) {
         return vec![];
     }
     let mut results = vec![];
     let mut scanned = 0;
-    search_walk(Path::new(&dir), &query.to_lowercase(), &mut results, &mut scanned, 4);
+    search_walk(&target, &query.to_lowercase(), &mut results, &mut scanned, 4); // class 1
     results
 }
 
@@ -2471,10 +2567,11 @@ fn load_annotations(app: AppHandle, path: Option<String>) -> Value {
         None => return json!([]),
     };
     // Cluster B: read scope = write scope, matching the socket's getAnnotations.
-    if !fs_scope_allows(&app, &canonical_key(Path::new(&p))) {
+    let target = canonical_key(Path::new(&p));
+    if !fs_scope_allows(&app, &target) {
         return json!([]);
     }
-    let (_, file) = sidecar(&p);
+    let (_, file) = sidecar(&target.to_string_lossy()); // class 1
     // Bounded: the sidecar sits next to a user's document and can be written by
     // an agent, so it gets the same ceiling as every other untrusted read.
     if file.metadata().map(|m| m.len() > MAX_ANNOTATIONS_BYTES).unwrap_or(true) {
@@ -2494,10 +2591,11 @@ fn save_annotations(app: AppHandle, path: Option<String>, annotations: Value) ->
     };
     // Cluster B: the .plume/<file>.notes.json sidecar write stays inside the
     // territory of the doc it annotates.
-    if !fs_scope_allows(&app, &canonical_key(Path::new(&p))) {
+    let target = canonical_key(Path::new(&p));
+    if !fs_scope_allows(&app, &target) {
         return false;
     }
-    let (dir, file) = sidecar(&p);
+    let (dir, file) = sidecar(&target.to_string_lossy()); // class 1
     if annotations.as_array().map(|a| a.is_empty()).unwrap_or(true) {
         let _ = fs::remove_file(&file);
         return true;
@@ -2978,12 +3076,13 @@ fn list_context(app: AppHandle, dir: Option<String>) -> Vec<Value> {
         None => return vec![],
     };
     // Cluster B: context files are probed only inside user territory.
-    if !fs_scope_allows(&app, &canonical_key(Path::new(&dir))) {
+    let target = canonical_key(Path::new(&dir));
+    if !fs_scope_allows(&app, &target) {
         return vec![];
     }
     let mut out = vec![];
     for name in CONTEXT_FILES {
-        let full = Path::new(&dir).join(name);
+        let full = target.join(name); // probe under what we gated (class 1)
         if full.is_file() {
             out.push(json!({ "name": name, "path": full.to_string_lossy() }));
         }
@@ -3020,6 +3119,8 @@ fn session_read_allowed(app: &AppHandle, target: &Path) -> bool {
 
 #[tauri::command]
 fn session_read(app: AppHandle, path: String) -> String {
+    // Class 1: gate and read the same resolved value.
+    let path = canonical_key(Path::new(&path)).to_string_lossy().to_string();
     const TAIL: u64 = 6 * 1024 * 1024;
     const CAP: usize = 40000;
     let p = Path::new(&path);
@@ -3367,12 +3468,14 @@ fn is_sensitive_path(p: &Path) -> bool {
     // on Unix, file_name() of "c:\\users\\x\\.ssh\\id_rsa" is the whole
     // backslash string, which would miss the id_rsa/.env checks below.
     let name = s.rsplit('/').next().unwrap_or_default().to_string();
-    const NAMES: [&str; 11] = [
+    const NAMES: [&str; 13] = [
         ".env", ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".pgpass",
         // DB/registry client configs hold plaintext passwords. The GLOBAL git
         // config earns its place for the same reason .git/hooks does: it can
         // set a credential.helper, i.e. code that runs on the next auth.
         ".my.cnf", ".dockercfg", ".gitconfig",
+        // .envrc: direnv, routinely holds AWS/API secrets. .htpasswd: hashes.
+        ".envrc", ".htpasswd",
         // Shell/REPL history routinely contains pasted tokens and passwords.
         ".history", ".lesshst",
     ];
@@ -3392,7 +3495,8 @@ fn is_sensitive_path(p: &Path) -> bool {
     }
     // Extension from the normalized final segment, for the same reason.
     let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    ["pem", "key", "p12", "pfx", "ovpn"].contains(&ext)
+    // .p8 = Apple AuthKey; .jks/.keystore = Java keystores.
+    ["pem", "key", "p12", "pfx", "ovpn", "p8", "jks", "keystore"].contains(&ext)
 }
 
 #[cfg(test)]
@@ -3927,6 +4031,56 @@ mod tests {
         }
     }
 
+    // Class 1, the async shape: the socket newWindow branch checked a resolved
+    // path, then stored the RAW one for initial_file to read milliseconds later
+    // on another thread — ample room to repoint the symlink in between. Storing
+    // the resolved path leaves nothing to swap.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_windows_target_cannot_be_swapped_after_the_gate() {
+        let root = std::env::temp_dir().join(format!("plume-spawnswap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let harmless = root.join("harmless.md");
+        fs::write(&harmless, "harmless").unwrap();
+        let secret = root.join("secret.env");
+        fs::write(&secret, "SECRET=1").unwrap();
+        let link = root.join("link.md");
+        std::os::unix::fs::symlink(&harmless, &link).unwrap();
+
+        // What the handler now stores: the resolved target, not the link.
+        let stored = canonical_key(&link);
+        assert_eq!(stored, canonical_key(&harmless));
+
+        // Repoint the link at the secret, as an attacker would between the
+        // gate and the spawned window's read.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        // The stored path still reads the vetted file. (Reading the raw link
+        // here — the old behavior — would return SECRET=1.)
+        assert_eq!(fs::read_to_string(&stored).unwrap(), "harmless");
+        assert_eq!(fs::read_to_string(&link).unwrap(), "SECRET=1", "the swap really happened");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn round3_deny_list_additions() {
+        for p in [
+            "/Users/x/proj/.envrc",      // direnv — AWS/API secrets
+            "/Users/x/site/.htpasswd",
+            "/Users/x/keys/AuthKey.p8",  // Apple
+            "/Users/x/android/release.jks",
+            "/Users/x/android/my.keystore",
+        ] {
+            assert!(is_sensitive_path(Path::new(p)), "should refuse: {p}");
+        }
+        // False-positive guards: these are ordinary documents.
+        for ok in ["/Users/x/notes/envrc-guide.md", "/Users/x/notes/keystore-setup.md"] {
+            assert!(!is_sensitive_path(Path::new(ok)), "should allow: {ok}");
+        }
+    }
+
     #[test]
     fn pgpass_and_netrc_are_denied() {
         assert!(is_sensitive_path(Path::new("/Users/x/.pgpass")));
@@ -4346,8 +4500,14 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
                     "error": "refused: sensitive path — open it from File ▸ Open if you mean to edit it" });
             }
             if req["newWindow"].as_bool().unwrap_or(false) {
+                // Spawn the CANONICAL path. The raw one was checked above and
+                // then handed to spawn_window, which stores it for initial_file
+                // to read on another thread milliseconds later — ample room to
+                // repoint a symlink between the check and the read, turning a
+                // gated open of ws/link.md into a read of .git/config. A
+                // resolved path has no symlink left to swap.
                 let appc = app.clone();
-                let path = p.to_string();
+                let path = canon.to_string_lossy().to_string();
                 let _ = app.run_on_main_thread(move || { let _ = spawn_window(&appc, &path); });
                 return json!({ "ok": true });
             }
