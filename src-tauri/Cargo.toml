@@ -49,4 +49,11 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# NOTE: deliberately NOT panic = "abort" (cluster C / adversarial review #3).
+# Plume holds unsaved user text in memory, and several code paths parse hostile
+# input (link-preview response bodies, deep-link URLs, transcripts). With abort,
+# one missed edge case anywhere — including in a dependency — takes the whole
+# app down and every unsaved buffer with it. With unwind, a panic on a worker or
+# command thread is contained: Tauri's command layer turns it into an Err and the
+# editor keeps running. The known panic sites are fixed and tested, but unwind is
+# the safety net for the ones we haven't found. Costs a small binary-size bump.
