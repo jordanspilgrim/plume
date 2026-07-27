@@ -34,7 +34,7 @@ jobs:
       # release is built with isn't gating the release. Keep the two in lockstep
       # if either moves. (The 20-vs-22 split between this workflow and build.yml
       # is pre-existing and worth resolving separately.)
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with: { node-version: 20, cache: npm }
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -56,7 +56,7 @@ jobs:
       # Third-party actions pinned to full commit SHAs (a mutable @tag could be
       # repointed to exfiltrate the Apple signing cert + updater key below).
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with: { node-version: 20, cache: npm }
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with: { targets: aarch64-apple-darwin,x86_64-apple-darwin }
