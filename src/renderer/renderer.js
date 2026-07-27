@@ -234,8 +234,16 @@ async function maybeCreateDraft() {
     // completion, which may have stolen the binding from whatever the user
     // switched to mid-flight. Re-align native to the ACTIVE tab.
     if (initTabId !== activeTabId || currentPath) {
-      if (currentPath && !(activeTab() && activeTab().unbound)) window.plume.bindDoc(currentPath); // fire-and-forget rebind
-      else if (!currentPath) window.plume.detachDoc?.();
+      // Deterministic: whenever we can't rebind the active tab's path (untitled
+      // OR unbound — a stale path must never be re-bound), detach. The old
+      // `else if (!currentPath)` left the binding stale when the user switched
+      // to an UNBOUND tab mid-flight, letting the 700ms snapshot write that
+      // tab's content into the new draft's recovery slot (re-verify MED).
+      if (currentPath && !(activeTab() && activeTab().unbound)) {
+        window.plume.bindDoc(currentPath).catch(() => {}); // bridge already catch-nulls; belt-and-braces
+      } else {
+        window.plume.detachDoc?.();
+      }
     }
   } finally { draftCreatesInFlight.delete(initTabId); }
 }
