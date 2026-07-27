@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId,
   tabDisplayName, isCapturedDirty, isBlankTab, closeDecision,
+  dirtyBackgroundTabs, anyDirtyUntitled,
 } from "../src/renderer/tabs-model.js";
 
 test("createTab: unique ids, defaults, partial override", () => {
@@ -112,4 +113,41 @@ test("closeDecision: Cancel / Escape / unknown keep the doc open", () => {
   assert.equal(closeDecision({ dirty: true, hasPath: false }, "cancel"), "stay");
   assert.equal(closeDecision({ dirty: true, hasPath: true }, "cancel"), "stay");
   assert.equal(closeDecision({ dirty: true, hasPath: true }, "bogus"), "stay");
+});
+
+// P1 regression (coord msg 6024): a dirty untitled BACKGROUND tab must be
+// accounted for on window close — pre-#6 autosave materialized it; post-#6 it
+// was silently dropped because only the active doc was inspected.
+test("dirtyBackgroundTabs: finds the dirty untitled draft behind a clean active tab", () => {
+  const active = createTab({ path: "/notes/a.md" });
+  const draft = createTab({ text: "unsaved draft", savedText: "" }); // dirty untitled, captured
+  const clean = createTab({ path: "/notes/b.md", text: "x", savedText: "x" });
+  const tabs = [active, draft, clean];
+  assert.deepEqual(dirtyBackgroundTabs(tabs, active.id).map((t) => t.id), [draft.id]);
+  // The active tab is never in the background list, even if captured-dirty.
+  const dirtyActive = createTab({ text: "y", savedText: "z" });
+  assert.deepEqual(dirtyBackgroundTabs([dirtyActive], dirtyActive.id), []);
+});
+
+test("dirtyBackgroundTabs: includes dirty SAVED background tabs too", () => {
+  const active = createTab();
+  const dirtySaved = createTab({ path: "/notes/c.md", text: "edited", savedText: "orig" });
+  assert.deepEqual(dirtyBackgroundTabs([active, dirtySaved], active.id).map((t) => t.id), [dirtySaved.id]);
+});
+
+test("anyDirtyUntitled: true for a live dirty untitled active doc", () => {
+  const t = createTab();
+  assert.equal(anyDirtyUntitled([t], t.id, { dirty: true, hasPath: false }), true);
+  assert.equal(anyDirtyUntitled([t], t.id, { dirty: true, hasPath: true }), false); // dirty but saved
+  assert.equal(anyDirtyUntitled([t], t.id, { dirty: false, hasPath: false }), false);
+});
+
+test("anyDirtyUntitled: true for a captured background untitled draft even when active is clean/saved", () => {
+  const active = createTab({ path: "/notes/a.md" });
+  const draft = createTab({ text: "unsaved draft", savedText: "" });
+  const tabs = [active, draft];
+  assert.equal(anyDirtyUntitled(tabs, active.id, { dirty: false, hasPath: true }), true);
+  // A dirty background SAVED tab does not raise the untitled flag.
+  const dirtySaved = createTab({ path: "/notes/c.md", text: "edited", savedText: "orig" });
+  assert.equal(anyDirtyUntitled([active, dirtySaved], active.id, { dirty: false, hasPath: true }), false);
 });

@@ -67,6 +67,7 @@
         exportDoc: async (format, html, name) => { window.__stub.calls.push(["exportDoc", format]); return "/fake/out." + format; },
         publishGoogle: async () => { window.__stub.calls.push(["publishGoogle"]); return window.__stub.publishResult; },
         setDirty: log("setDirty"),
+        setUntitledDirty: (v) => { window.__stub.calls.push(["setUntitledDirty", v]); window.__stub.untitledDirtyFlag = v; },
         // ---- pkg-dev export-runtime contract (PR #2) ----
         nodeStatus: async () => ({ available: window.__stub.nodeAvailable, managed: true }),
         installNode: async () => {

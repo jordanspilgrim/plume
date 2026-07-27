@@ -20,7 +20,7 @@ import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from 
 import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId, tabDisplayName, isCapturedDirty, isBlankTab,
-  closeDecision,
+  closeDecision, dirtyBackgroundTabs, anyDirtyUntitled,
 } from "./tabs-model.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
@@ -189,10 +189,27 @@ async function autosave() {
   }
 }
 
+// The native close gate holds this window when ANY tab has an unsaved untitled
+// buffer — not just the active one (P1: background drafts were dropped
+// silently). The renderer is the single writer of that flag; pushed after the
+// per-doc setDirty so the OR wins. Optional-chained: inert until the native
+// set_untitled_dirty command lands.
+let lastUntitledDirtyPushed = null;
+function pushUntitledDirtyFlag() {
+  const v = anyDirtyUntitled(tabs, activeTabId, {
+    dirty: titlebar.classList.contains("dirty"),
+    hasPath: !!currentPath,
+  });
+  if (v === lastUntitledDirtyPushed) return;
+  lastUntitledDirtyPushed = v;
+  window.plume.setUntitledDirty?.(v);
+}
+
 function setDirty(dirty) {
   titlebar.classList.toggle("dirty", dirty);
   window.plume.setDirty(dirty);
   if (tabs.length > 1) renderTabbar(); // keep the active tab's dirty dot honest
+  pushUntitledDirtyFlag();
 }
 
 // Flush a save when the window loses focus, so nothing is lost on app switch.
@@ -2157,6 +2174,7 @@ function captureActiveTab() {
 }
 
 function renderTabbar() {
+  pushUntitledDirtyFlag(); // every tab add/remove/switch/capture re-renders — keep the gate flag in sync
   tabbarEl.classList.toggle("hidden", tabs.length < 2);
   tabbarEl.innerHTML = "";
   if (tabs.length < 2) return;
@@ -2241,11 +2259,14 @@ async function presentTab(t) {
   renderTabbar();
 }
 
-async function activateTab(id) {
+// flush:false is for the window-close iteration — the outgoing tab there may
+// have just been explicitly DISCARDED (Don't Save), and the normal autosave
+// flush would write the very edits the user chose to drop.
+async function activateTab(id, { flush = true } = {}) {
   if (id === activeTabId) return;
   const t = findTab(tabs, id);
   if (!t) return;
-  await autosave(); // flush the outgoing tab so background tabs are clean
+  if (flush) await autosave(); // flush the outgoing tab so background tabs are clean
   captureActiveTab();
   activeTabId = id;
   await presentTab(t);
@@ -2372,14 +2393,26 @@ window.plume.onFolderOpen(({ dir }) => {
   refreshSidebar();
 });
 
-// #4 (renderer side): the native side held this window's close because its
-// doc has unsaved edits (untitled today; dirty saved docs once be-dev extends
-// the gate). Same decision path as tab close: prompt, save if asked, then
-// complete or abandon the close. Don't Save never writes anything.
+// #4 (renderer side): the native side held this window's close because a doc
+// has unsaved edits. Resolve the ACTIVE doc first, then every captured-dirty
+// BACKGROUND tab (P1: those drafts used to be dropped silently) — activating
+// each so its prompt names the right doc and Save routes correctly. Any
+// Cancel aborts the whole close; confirmClose fires only when every dirty doc
+// has been saved or explicitly discarded. Don't Save never writes anything.
 window.plume.onCloseRequested?.(async () => {
-  if (await resolveCloseOfActiveDoc("Your changes will be lost if you don't save them.")) {
-    window.plume.confirmClose?.();
+  const detail = "Your changes will be lost if you don't save them.";
+  if (!(await resolveCloseOfActiveDoc(detail))) return;
+  // Track resolved tabs by id: a tab discarded via Don't Save keeps its dirty
+  // captured buffer when we move on, and must not be prompted again.
+  const resolvedIds = new Set([activeTabId]);
+  for (;;) {
+    const t = dirtyBackgroundTabs(tabs, activeTabId).find((x) => !resolvedIds.has(x.id));
+    if (!t) break;
+    await activateTab(t.id, { flush: false }); // no autosave flush: outgoing tab may be freshly discarded
+    if (!(await resolveCloseOfActiveDoc(detail))) return;
+    resolvedIds.add(t.id);
   }
+  window.plume.confirmClose?.();
 });
 
 // Offer the newest untitled crash snapshot from a previous run when this window

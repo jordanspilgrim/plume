@@ -82,3 +82,19 @@ export function closeDecision({ dirty, hasPath }, choice) {
   if (choice === "discard") return "close";
   return "stay";
 }
+
+// Background tabs that still need a close decision when the WINDOW closes —
+// every captured-dirty tab except the active one (the active doc is resolved
+// live, first). P1 regression fix: pre-#6 autosave materialized these; now
+// each must get its own Save / Don't Save / Cancel.
+export function dirtyBackgroundTabs(tabs, activeId) {
+  return tabs.filter((t) => t.id !== activeId && isCapturedDirty(t));
+}
+
+// Should the native close gate hold this window? True when ANY tab holds an
+// unsaved untitled buffer: the live active one (state passed in by the
+// renderer) or any captured background tab without a path.
+export function anyDirtyUntitled(tabs, activeId, active) {
+  if (active && active.dirty && !active.hasPath) return true;
+  return tabs.some((t) => t.id !== activeId && !t.path && isCapturedDirty(t));
+}
