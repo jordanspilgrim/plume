@@ -2592,14 +2592,24 @@ fn main() {
                 return;
             }
             match event {
-                // Closing an untitled buffer with unsaved edits would destroy the
-                // only copy (#4) — hold the close and let the renderer prompt.
-                // The renderer resolves via save/materialize or close_window_now.
+                // Closing a doc with unsaved edits would lose them — hold the
+                // close and let the renderer prompt Save / Don't Save / Cancel.
+                // Two dirty sources: an untitled buffer (only copy is in memory,
+                // tracked by window label) and a path-backed file with unsaved
+                // edits (tracked by canonical path in dirty_files). Both emit the
+                // same "close-requested" the renderer already resolves via
+                // save / Save As / close_window_now.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     let app = window.app_handle();
                     let st = app.state::<AppState>();
-                    let untitled = window_doc_path(app, &label).is_none();
-                    if untitled && st.untitled_dirty.lock().unwrap().contains(&label) {
+                    let dirty = match window_doc_path(app, &label) {
+                        None => st.untitled_dirty.lock().unwrap().contains(&label),
+                        Some(p) => {
+                            let key = canonical_key(Path::new(&p)).to_string_lossy().to_string();
+                            st.dirty_files.lock().unwrap().contains(&key)
+                        }
+                    };
+                    if dirty {
                         api.prevent_close();
                         let _ = app.emit_to(&label, "close-requested", json!({}));
                     }
