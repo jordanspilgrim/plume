@@ -747,8 +747,8 @@ async fn export_doc(app: AppHandle, format: String, html: String, default_name: 
     let picked = match app
         .dialog()
         .file()
-        .add_filter(&ext.to_uppercase(), &[ext])
-        .set_file_name(&format!("{}.{}", default_name.unwrap_or_else(|| "document".into()), ext))
+        .add_filter(ext.to_uppercase(), &[ext])
+        .set_file_name(format!("{}.{}", default_name.unwrap_or_else(|| "document".into()), ext))
         .blocking_save_file()
     {
         Some(p) => p,
@@ -760,6 +760,12 @@ async fn export_doc(app: AppHandle, format: String, html: String, default_name: 
     };
     let p = path.to_string_lossy().to_string();
     if ext == "html" {
+        // Same vetting as docx/PDF. Nothing in OUR process fetches here, but
+        // the saved file keeps live remote <img> that the user's browser
+        // fetches on open — a beacon fired later, from their machine. Inlining
+        // also makes the export self-contained, which is what people expect a
+        // saved HTML document to be.
+        let html = sanitize_export_html(&html);
         return match fs::write(&p, html) {
             Ok(()) => json!({ "ok": true, "path": p }),
             Err(e) => json!({ "ok": false, "error": e.to_string() }),
@@ -824,6 +830,16 @@ fn base64_encode(bytes: &[u8]) -> String {
 fn is_remote_url(src: &str) -> bool {
     let s = src.trim().to_ascii_lowercase();
     s.starts_with("http://") || s.starts_with("https://") || s.starts_with("//")
+}
+
+// Sources this rewriter refuses to carry into an export. Remote ones are
+// fetched + vetted; `file:` is dropped outright — an absolute file URL in a
+// hostile document is an attempt to pull a local file into a document the user
+// may then share, and no export format needs it (local images arrive as
+// relative paths or data:). Downstream layers already stop it; refusing here
+// too means one layer is enough on its own.
+fn is_refusable_src(src: &str) -> bool {
+    is_remote_url(src) || src.trim().to_ascii_lowercase().starts_with("file:")
 }
 
 // Fetch one image through the vetted-address path and return a data: URI.
@@ -957,10 +973,13 @@ fn rewrite_img_tag(tag: &str, fetch: &mut dyn FnMut(&str) -> Option<String>) -> 
         Some(s) if !s.trim().is_empty() => s.to_string(),
         _ => return alt_fallback(), // no usable src — nothing to render
     };
-    if !is_remote_url(&src) {
-        // data:/relative/file: never makes Plume fetch a remote host. Keep the
-        // src, but still emit only the attributes we parsed.
+    if !is_refusable_src(&src) {
+        // data: and relative paths never make Plume fetch a remote host. Keep
+        // the src, but still emit only the attributes we parsed.
         return format!("<img src=\"{}\" alt=\"{}\">", html_escape(&src), html_escape(&alt));
+    }
+    if !is_remote_url(&src) {
+        return alt_fallback(); // file: — never fetched, never carried through
     }
     match fetch(&src) {
         Some(data_uri) => format!("<img src=\"{}\" alt=\"{}\">", data_uri, html_escape(&alt)),
@@ -1262,7 +1281,7 @@ async fn export_pdf(app: AppHandle, html: String, default_name: Option<String>) 
         .dialog()
         .file()
         .add_filter("PDF", &["pdf"])
-        .set_file_name(&format!("{}.pdf", default_name.unwrap_or_else(|| "document".into())))
+        .set_file_name(format!("{}.pdf", default_name.unwrap_or_else(|| "document".into())))
         .blocking_save_file()?;
     let out = picked.into_path().ok()?.to_string_lossy().to_string();
     // Same choke point for PDF: WKWebView receives no remote URLs, and the
@@ -1531,6 +1550,15 @@ fn draft_title(content: &str, stem_fallback: &str) -> String {
 // contain no newline gets a truncated title rather than an OOM.
 const DRAFT_TITLE_SCAN_BYTES: u64 = 64 * 1024;
 
+// Agent-written files (session transcripts, the Codex session index) have no
+// size ceiling we control, and these run on listing paths. Bound every read of
+// them; a title/index entry past the window is simply not found.
+const AGENT_SESSION_SCAN_BYTES: u64 = 256 * 1024;
+const AGENT_INDEX_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+
+// An annotations sidecar is a list of margin notes; far above any real one.
+const MAX_ANNOTATIONS_BYTES: u64 = 16 * 1024 * 1024;
+
 // Read at most `cap` bytes from the head of a file, lossily. Never loads a file
 // whole, so an attacker-sized (or agent-sized) draft can't exhaust memory.
 fn read_head(path: &Path, cap: u64) -> String {
@@ -1561,7 +1589,7 @@ fn list_drafts_in(dir: &Path) -> Vec<Value> {
         let ts = file_mtime_ms(&path);
         rows.push((ts, json!({ "path": path.to_string_lossy(), "ts": ts, "title": title })));
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts)); // newest first
     rows.into_iter().map(|(_, v)| v).collect()
 }
 
@@ -1899,8 +1927,17 @@ fn recovery_path(path: &str) -> PathBuf {
 
 fn recovery_for(path: &str) -> Option<String> {
     let file = recovery_path(path);
+    // Skip an implausibly large snapshot rather than truncating it: this
+    // content is what would be RESTORED, so a truncated read would hand back a
+    // corrupted document (same reasoning as untitled_recovery).
+    if file.metadata().map(|m| m.len() > MAX_RECOVERY_SNAPSHOT_BYTES).unwrap_or(true) {
+        return None;
+    }
     let snap: Value = serde_json::from_str(&fs::read_to_string(&file).ok()?).ok()?;
     let snap_content = snap["content"].as_str()?.to_string();
+    if Path::new(path).metadata().map(|m| m.len() > MAX_RECOVERY_SNAPSHOT_BYTES).unwrap_or(true) {
+        return None;
+    }
     let disk = fs::read_to_string(path).ok()?;
     // Only surface if the snapshot differs from disk (best-effort; ts compare omitted).
     if snap_content != disk { Some(snap_content) } else { None }
@@ -2117,7 +2154,7 @@ fn ip_is_public(ip: &IpAddr) -> bool {
 // Parse host:port from an http(s) URL without pulling a URL crate.
 fn host_port(url: &str) -> Option<(String, u16)> {
     let https = url.starts_with("https://");
-    let after = url.splitn(2, "://").nth(1)?;
+    let after = url.split_once("://")?.1;
     let authority = after.split(['/', '?', '#']).next()?;
     let authority = authority.rsplit('@').next()?; // strip any userinfo
     let (host, port) = match authority.rsplit_once(':') {
@@ -2425,6 +2462,11 @@ fn load_annotations(app: AppHandle, path: Option<String>) -> Value {
         return json!([]);
     }
     let (_, file) = sidecar(&p);
+    // Bounded: the sidecar sits next to a user's document and can be written by
+    // an agent, so it gets the same ceiling as every other untrusted read.
+    if file.metadata().map(|m| m.len() > MAX_ANNOTATIONS_BYTES).unwrap_or(true) {
+        return json!([]);
+    }
     fs::read_to_string(&file)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -2729,7 +2771,10 @@ fn walk_rollouts(d: &Path, depth: u32, acc: &mut Vec<PathBuf>) {
 }
 fn codex_index() -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
-    if let Ok(txt) = fs::read_to_string(home_dir().join(".codex/session_index.jsonl")) {
+    // Bounded: this index is appended to by another tool and has no size
+    // ceiling of our own.
+    let txt = read_head(&home_dir().join(".codex/session_index.jsonl"), AGENT_INDEX_SCAN_BYTES);
+    {
         for line in txt.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -2746,7 +2791,10 @@ fn codex_index() -> std::collections::HashMap<String, String> {
 fn codex_sessions_for(dir: &str) -> Vec<Value> {
     let mut files = vec![];
     walk_rollouts(&home_dir().join(".codex/sessions"), 0, &mut files);
-    files.sort_by(|a, b| file_mtime_ms(b).cmp(&file_mtime_ms(a)));
+    // _cached_key, not _key: the key is a stat(), and sort_by_key may call it
+    // many times per element — O(n log n) syscalls over up to 250 files on the
+    // welcome path. Cached computes it exactly once each.
+    files.sort_by_cached_key(|f| std::cmp::Reverse(file_mtime_ms(f))); // newest first
     files.truncate(250);
     let idx = codex_index();
     let mut out = vec![];
@@ -2795,7 +2843,12 @@ fn gemini_sessions_for(dir: &str) -> Vec<Value> {
                 continue;
             }
             let mut title = "(Gemini session)".to_string();
-            if let Ok(txt) = fs::read_to_string(&p) {
+            // Bounded head, like session_meta (32 KiB) and codex_sessions_for
+            // (8 KiB): these files are agent-written and unbounded, and this
+            // runs on the welcome path — reading them whole is the same OOM
+            // class already fixed for draft titles.
+            let txt = read_head(&p, AGENT_SESSION_SCAN_BYTES);
+            if !txt.is_empty() {
                 if let Ok(o) = serde_json::from_str::<Value>(&txt) {
                     if let Some(arr) = o["messages"].as_array() {
                         if let Some(u) = arr.iter().find(|m| m["type"] == "user") {
@@ -2861,10 +2914,14 @@ fn search_sessions(query: String, dir: Option<String>) -> Vec<Value> {
         cands.extend(gemini_sessions_for(d));
     }
     let mut results = vec![];
+    // A scan BUDGET, not an index: it bounds how many files we actually open,
+    // and the loop can `continue` past candidates without spending any. An
+    // enumerate() index would count those too and cut the search short.
     let mut scanned = 0;
     // One 4 MiB scratch buffer reused across candidates — not a fresh alloc per file
     // (which churned ~2 GB of transient allocation on a full 500-candidate scan).
     let mut buf = vec![0u8; 4 * 1024 * 1024];
+    #[allow(clippy::explicit_counter_loop)]
     for c in cands {
         if results.len() >= 40 || scanned > 500 {
             break;
@@ -3297,8 +3354,12 @@ fn is_sensitive_path(p: &Path) -> bool {
     // on Unix, file_name() of "c:\\users\\x\\.ssh\\id_rsa" is the whole
     // backslash string, which would miss the id_rsa/.env checks below.
     let name = s.rsplit('/').next().unwrap_or_default().to_string();
-    const NAMES: [&str; 8] = [
+    const NAMES: [&str; 11] = [
         ".env", ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".pgpass",
+        // DB/registry client configs hold plaintext passwords. The GLOBAL git
+        // config earns its place for the same reason .git/hooks does: it can
+        // set a credential.helper, i.e. code that runs on the next auth.
+        ".my.cnf", ".dockercfg", ".gitconfig",
         // Shell/REPL history routinely contains pasted tokens and passwords.
         ".history", ".lesshst",
     ];
@@ -3554,12 +3615,18 @@ mod tests {
         for (html, keep) in [
             (r#"<img src="data:image/png;base64,AAAA" alt="x">"#, "data:image/png;base64,AAAA"),
             (r#"<img src="assets/local.png" alt="x">"#, "assets/local.png"),
-            (r#"<img src="file:///tmp/x.png">"#, "file:///tmp/x.png"),
         ] {
             let out = sanitize_export_html_with(html, &mut fetch);
             assert!(out.contains(keep), "local src must survive: {out}");
             assert!(out.starts_with("<img "), "still an image: {out}");
         }
+        // file: is NOT kept: an absolute file URL in an untrusted document is an
+        // attempt to pull a local file into an export the user may share, and no
+        // format needs it (local images arrive relative or as data:). It is
+        // never fetched either — it drops straight to alt text.
+        let out = sanitize_export_html_with(r#"<img src="file:///etc/passwd" alt="report">"#, &mut fetch);
+        assert!(!out.contains("/etc/passwd"), "file: src must not survive: {out}");
+        assert_eq!(out, "<span>report</span>");
         // No usable src → nothing to render; alt text carries the meaning.
         assert_eq!(sanitize_export_html_with(r#"<img alt="no src">"#, &mut fetch), "<span>no src</span>");
     }
@@ -4049,6 +4116,52 @@ fn set_doc_dirty(state: tauri::State<AppState>, path: String, dirty: bool) {
     }
 }
 
+// Round-2: another window may already hold this path. Window B opening a draft
+// that Window A has open double-binds it — two autosave loops on one file, and
+// graduating in A resurrects it via B. The renderer asks here BEFORE binding.
+//
+// Native owns this decision because native owns the path→window map; handing
+// the raw map to the renderer would put the same policy in two places and give
+// it a copy that can desync — the class cluster A exists to prevent.
+//
+// Returns true only if another window was actually found AND focused, so a
+// false answer always means "go ahead and bind" rather than a dead end.
+#[tauri::command]
+fn focus_path(app: AppHandle, window: tauri::WebviewWindow, path: String) -> bool {
+    let target = canonical_key(Path::new(&path));
+    let me = window.label().to_string();
+    let st = app.state::<AppState>();
+    // Search registered tab sets UNION each window's bound doc: a window that
+    // has bound a path but not yet pushed its tab set would otherwise be
+    // invisible for exactly the interval in which a race double-binds.
+    let owner = {
+        let tabs = st.open_tabs.lock_or_recover();
+        let docs = st.docs.lock_or_recover();
+        tabs.iter()
+            .find(|(label, paths)| **label != me && paths.contains(&target))
+            .map(|(label, _)| label.clone())
+            .or_else(|| {
+                docs.iter()
+                    .find(|(label, d)| {
+                        **label != me
+                            && !d.path.is_empty()
+                            && canonical_key(Path::new(&d.path)) == target
+                    })
+                    .map(|(label, _)| label.clone())
+            })
+    };
+    let Some(label) = owner else { return false };
+    let Some(win) = app.get_webview_window(&label) else {
+        return false; // it closed between the lookup and now — caller binds normally
+    };
+    // Emit BEFORE focusing so the owning window activates the right tab whether
+    // or not the OS honors the focus request.
+    let _ = app.emit_to(&label, "activate-path", json!({ "path": target.to_string_lossy() }));
+    let _ = win.show();
+    let _ = win.set_focus();
+    true
+}
+
 // Cluster A delta 4: the renderer registers THIS window's full open tab
 // path-set (canonical) on every tab add/remove/retarget and at startup. Keeps
 // background tabs inside the agent write scope + listOpenFiles, and gives the
@@ -4090,6 +4203,15 @@ fn focused_doc(app: &AppHandle) -> Option<String> {
 // then focused "main" regardless of where it went — the cause of both the
 // opens-behind and the intermittent replace-the-foreground-window bugs.
 fn deliver_open(app: &AppHandle, path: &str, line: Option<i64>, user_picked: bool) {
+    // Resolve ONCE and hand the canonical path onward — to the approval, to the
+    // renderer (which binds and reads it), and to any spawned window. The write
+    // path already writes the canonical target it validated, precisely so a
+    // symlink swapped between check and write cannot redirect it; the READ path
+    // lacked that, vetting a canonical form and then passing the RAW string on
+    // to be resolved a second time, later.
+    let canon = canonical_key(Path::new(path));
+    let canon_str = canon.to_string_lossy().to_string();
+    let path: &str = &canon_str;
     // Every delivery point is a legitimate grant: user dialog picks, the
     // token-gated socket, and externally-driven opens that already passed the
     // deliver_external_open gate. Approving here lets the renderer's follow-up
@@ -4545,16 +4667,21 @@ fn deliver_external_open(app: &AppHandle, path: &str, line: Option<i64>) {
         return;
     }
     let canon = canonical_key(Path::new(path));
+    // Everything below hands THIS resolved value onward — deliver_open would
+    // otherwise canonicalize the raw path a second time, leaving a (narrow,
+    // synchronous) window in which the path vetted and the path read are two
+    // different resolves.
+    let canon_str = canon.to_string_lossy().to_string();
     if is_sensitive_path(&canon) {
         eprintln!("plume: refused externally-driven open of sensitive path {}", canon.display());
         return;
     }
     if fs_scope_allows(app, &canon) {
-        deliver_open(app, path, line, false);
+        deliver_open(app, &canon_str, line, false);
         return;
     }
     let appc = app.clone();
-    let p = path.to_string();
+    let p = canon_str;
     app.dialog()
         .message(format!("Open “{}” in Plume?\n\nThis request came from outside Plume (a link, another app, or Finder).", canon.display()))
         .title("Open File")
@@ -4625,6 +4752,7 @@ fn main() {
             set_recent_files,
             set_doc_dirty,
             set_open_paths,
+            focus_path,
             bind_doc,
             detach_doc,
             untitled_recovery,
@@ -4851,11 +4979,10 @@ fn main() {
                     }
                 }
                 // Dock icon click with no windows: reopen a blank one.
-                tauri::RunEvent::Reopen { has_visible_windows, .. } => {
-                    if !has_visible_windows {
+                tauri::RunEvent::Reopen { has_visible_windows, .. }
+                    if !has_visible_windows => {
                         let _ = spawn_window(_app, "");
                     }
-                }
                 _ => {}
             }
         });
