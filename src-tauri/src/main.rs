@@ -1413,7 +1413,6 @@ async fn save_dialog(app: AppHandle, window: tauri::WebviewWindow, content: Stri
             .lock_or_recover()
             .insert(canonical_key(parent));
     }
-    clear_untitled_recovery(window.label());
     set_current(&app, window.label(), &p, &content);
     Some(p)
 }
@@ -1448,31 +1447,12 @@ fn default_docs_dir() -> String {
     default_plume_dir().to_string_lossy().to_string()
 }
 
-// Create a new file for a never-saved doc: resolve the target folder (default
-// ~/Documents/Plume), ensure it exists, pick a collision-free name, write, and
-// make it the current doc so autosave takes over.
-#[tauri::command]
-fn materialize_doc(app: AppHandle, window: tauri::WebviewWindow, dir: Option<String>, name: String, content: String) -> Option<String> {
-    let base = match dir.filter(|d| !d.trim().is_empty()) {
-        Some(d) => PathBuf::from(d),
-        None => default_plume_dir(),
-    };
-    // Cluster B: a renderer-supplied target folder must be user territory; the
-    // default ~/Documents/Plume is always Plume's own to create into.
-    let base = canonical_key(&base); // create in the dir we vet (class 1)
-    let base_ok = base == canonical_key(&default_plume_dir()) || fs_scope_allows(&app, &base);
-    if !base_ok {
-        return None;
-    }
-    fs::create_dir_all(&base).ok()?;
-    let path = unique_path(&base, &sanitize_stem(&name), "md");
-    fs::write(&path, &content).ok()?;
-    let p = path.to_string_lossy().to_string();
-    // The buffer is now a real file — its untitled crash snapshot is obsolete.
-    clear_untitled_recovery(window.label());
-    set_current(&app, window.label(), &p, &content);
-    Some(p)
-}
+// materialize_doc ("turn an untitled buffer into a real file") lived here. It
+// was removed as DEAD CODE, not as a first-keystroke consequence: a repo-wide
+// grep found no caller at all — no bridge export, no renderer reference, only
+// its own definition and command registration. create_draft is the live path
+// that turns an untitled buffer into a file, and under first-keystroke it runs
+// on character one.
 
 // ---- SAVEFLOW: draft autosave ----
 // Untitled markdown buffers autosave here as real .md files — the Autosave file
@@ -2637,145 +2617,62 @@ fn save_annotations(app: AppHandle, path: Option<String>, annotations: Value) ->
 }
 
 // ---- crash-recovery snapshot ----
-// Untitled (never-saved) buffers snapshot to recovery/untitled-<label>.json (#4).
-// Labels restart each launch, so surfacing recovery scans the whole set and offers
-// the newest — see untitled_recovery.
-fn untitled_recovery_dir() -> PathBuf {
-    plume_dir().join("recovery")
-}
+// SAVED documents only. Untitled buffers used to snapshot to
+// recovery/untitled-<label>.json, but under first-keystroke autosave an
+// untitled buffer becomes a real draft file on disk the moment it contains a
+// single character, so the draft IS the persistence and a parallel snapshot
+// subsystem has nothing left to protect. The only unprotected state is a
+// zero-character buffer, which holds no user content — agreed explicitly with
+// fe rather than left to be discovered.
+//
+// Saved-document recovery below is NOT subsumed by that and stays: a saved file
+// with unsaved edits that dies before the next save is a different failure,
+// and autosave-drafts do not cover it.
 
 // Generous OOM backstop, not a policy limit: far above any document a person
 // edits, so no realistic recovery is lost, while a runaway snapshot can't
-// abort the app during startup recovery.
+// abort the app during startup recovery. Still load-bearing for recovery_for —
+// it bounds BOTH the snapshot read and the on-disk comparison there.
 const MAX_RECOVERY_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
-
-fn untitled_recovery_file(label: &str) -> PathBuf {
-    let clean: String = label
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .collect();
-    untitled_recovery_dir().join(format!("untitled-{}.json", clean))
-}
-
-fn clear_untitled_recovery(label: &str) {
-    let _ = fs::remove_file(untitled_recovery_file(label));
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-// Pinned in setup(). Snapshots written before this instant are crash leftovers
-// from a PREVIOUS run; anything newer belongs to a live untitled window in THIS
-// session and must never be offered to another window as "recovery".
-static LAUNCHED_AT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-fn launched_at_ms() -> u64 {
-    *LAUNCHED_AT_MS.get_or_init(now_ms)
-}
 
 #[tauri::command]
 fn snapshot(app: AppHandle, window: tauri::WebviewWindow, content: String) {
-    let label = window.label();
-    if let Some(path) = window_doc_path(&app, label) {
+    // Unbound (untitled) windows no longer snapshot at all — there is no
+    // untitled slot to write to, and an unbound buffer with content is a draft
+    // whose file already exists. The renderer additionally declines to call
+    // this for drafts; that policy lives in one place (the caller) on purpose.
+    if let Some(path) = window_doc_path(&app, window.label()) {
         let file = recovery_path(&path);
         if let Some(dir) = file.parent() {
             let _ = fs::create_dir_all(dir);
         }
         let _ = fs::write(file, json!({ "filePath": path, "content": content }).to_string());
-    } else if content.trim().is_empty() {
-        // Nothing worth recovering — don't leave a stale untitled snapshot behind.
-        clear_untitled_recovery(label);
-    } else {
-        let file = untitled_recovery_file(label);
-        if let Some(dir) = file.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
-        let _ = fs::write(file, json!({ "content": content }).to_string());
     }
 }
 
 // Discard the crash-recovery snapshot (banner "Discard", or a Don't-Save close
 // resolution). Cluster A: `path` is explicit when the discarded doc is a TAB
-// that isn't this window's binding; no path falls back to the binding (or the
-// untitled slot). An explicit discard must never resurrect on reopen.
+// that isn't this window's binding; no path falls back to the binding. An
+// explicit discard must never resurrect on reopen. An unbound window has no
+// snapshot to discard, so a pathless call on one is now a no-op.
 #[tauri::command]
 fn discard_recovery(app: AppHandle, window: tauri::WebviewWindow, path: Option<String>) {
-    match path.filter(|p| !p.trim().is_empty()).or_else(|| window_doc_path(&app, window.label())) {
-        Some(p) => { let _ = fs::remove_file(recovery_path(&p)); }
-        None => clear_untitled_recovery(window.label()),
+    if let Some(p) = path
+        .filter(|p| !p.trim().is_empty())
+        .or_else(|| window_doc_path(&app, window.label()))
+    {
+        let _ = fs::remove_file(recovery_path(&p));
     }
-}
-
-// Newest untitled crash snapshot, if any — the renderer calls this when a blank
-// window opens and offers a restore banner. Non-destructive; the renderer clears
-// it via discard_untitled_recovery(key) after restoring or dismissing.
-#[tauri::command]
-fn untitled_recovery() -> Option<Value> {
-    let dir = untitled_recovery_dir();
-    let mut best: Option<(u64, String, String)> = None; // (mtime, key, content)
-    for e in fs::read_dir(&dir).ok()?.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if !(name.starts_with("untitled-") && name.ends_with(".json")) {
-            continue;
-        }
-        let p = e.path();
-        // Same unbounded-read class as list_drafts_in, but the fix differs:
-        // this content is the document to be RESTORED, so truncating it would
-        // silently hand back a corrupted buffer. Skip an implausibly large
-        // snapshot instead — losing one recovery beats aborting the process
-        // (and every other window's unsaved work) on the welcome screen.
-        if p.metadata().map(|m| m.len() > MAX_RECOVERY_SNAPSHOT_BYTES).unwrap_or(true) {
-            eprintln!("untitled_recovery: skipping oversized snapshot {}", p.display());
-            continue;
-        }
-        let Some(content) = fs::read_to_string(&p)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v["content"].as_str().map(|c| c.to_string()))
-        else {
-            continue;
-        };
-        if content.trim().is_empty() {
-            continue;
-        }
-        let ts = file_mtime_ms(&p);
-        // Only pre-launch snapshots are recovery; newer ones belong to a live
-        // untitled window in this session (offering those would cross-talk).
-        if ts >= launched_at_ms() {
-            continue;
-        }
-        if best.as_ref().map(|(t, _, _)| ts > *t).unwrap_or(true) {
-            best = Some((ts, name, content));
-        }
-    }
-    best.map(|(_, key, content)| json!({ "key": key, "content": content }))
-}
-
-// Remove one untitled snapshot by the key untitled_recovery returned. The key is
-// re-derived through the same sanitizer + fixed prefix/suffix so a caller can
-// never turn it into a path traversal.
-#[tauri::command]
-fn discard_untitled_recovery(key: String) {
-    let stem = key
-        .strip_prefix("untitled-")
-        .and_then(|s| s.strip_suffix(".json"))
-        .unwrap_or(&key);
-    clear_untitled_recovery(stem);
 }
 
 // Renderer-confirmed close (its Save/Don't-Save/Cancel flow fully resolved):
-// clear the pending-close marker, clear this window's untitled crash slot as a
-// backstop (per-tab path-backed snapshots were cleared by the renderer via
-// discard_recovery as each tab resolved), then destroy. destroy() skips
-// CloseRequested, so this can't re-enter the prompt loop.
+// clear the pending-close marker, then destroy. destroy() skips CloseRequested,
+// so this can't re-enter the prompt loop. Per-tab path-backed snapshots were
+// already cleared by the renderer via discard_recovery as each tab resolved;
+// the untitled-slot backstop that used to run here has no slot to clear.
 #[tauri::command]
 fn close_window_now(app: AppHandle, window: tauri::WebviewWindow) {
     app.state::<AppState>().pending_close.lock_or_recover().remove(window.label());
-    clear_untitled_recovery(window.label());
     let _ = window.destroy();
 }
 
@@ -4436,16 +4333,12 @@ mod tests {
         assert!(!within_any_dir(&root, Path::new("/etc/passwd")));
     }
 
-    #[test]
-    fn untitled_recovery_key_cannot_escape_recovery_dir() {
-        // A hostile key (e.g. via discard_untitled_recovery) must sanitize into a
-        // flat file name inside the recovery dir — never a traversal.
-        for evil in ["../../evil", "..", "a/b/c", "..\\..\\x"] {
-            let f = untitled_recovery_file(evil);
-            assert!(f.starts_with(untitled_recovery_dir()), "escaped: {evil}");
-            assert!(!f.to_string_lossy().contains(".."), "kept dots: {evil}");
-        }
-    }
+    // untitled_recovery_key_cannot_escape_recovery_dir lived here. It guarded a
+    // renderer-supplied key being turned into a recovery filename; with the
+    // untitled-recovery subsystem deleted there is no such key and no such
+    // command, so the traversal surface it defended is gone rather than
+    // untested. discard_draft remains the only renderer-callable unlink and
+    // keeps its own containment tests.
 }
 
 // The renderer reports per-document dirty state so writeDocument can refuse to
@@ -5078,7 +4971,6 @@ fn main() {
             open_external,
             open_dialog,
             save_dialog,
-            materialize_doc,
             create_draft,
             list_drafts,
             discard_draft,
@@ -5109,8 +5001,6 @@ fn main() {
             focus_path,
             bind_doc,
             detach_doc,
-            untitled_recovery,
-            discard_untitled_recovery,
             close_window_now,
             close_prompt_ack,
             cancel_close
@@ -5263,7 +5153,6 @@ fn main() {
             }
         })
         .setup(|app| {
-            launched_at_ms(); // pin the recovery cutoff to actual app start
             let handle = app.handle().clone();
             let args: Vec<String> = std::env::args().collect();
             if let Some(p) = args.iter().skip(1).find(|a| !a.starts_with('-')) {

@@ -112,9 +112,9 @@ checked and the path opened are the same resolve.
 The renderer is a webview displaying untrusted document content, so its filesystem
 commands are contained exactly as the socket's are — not trusted for being "internal".
 `read_path`, `bind_doc`, `list_dir`, `search_files`, `list_context`,
-`load_annotations`/`save_annotations`, `materialize_doc`, `session_read`,
-`resolve_link` and `open_in_new_window` share the scope + deny decision; out-of-scope
-calls fail soft (empty/refused).
+`load_annotations`/`save_annotations`, `session_read`, `resolve_link` and
+`open_in_new_window` share the scope + deny decision; out-of-scope calls fail
+soft (empty/refused).
 
 Two rules that are easy to get wrong:
 - The renderer's registered **tab set is evidence, not a grant**. A tab path widens
