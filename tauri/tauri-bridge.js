@@ -106,6 +106,9 @@ window.plume = {
   discardUntitledRecovery: (key) => { invoke("discard_untitled_recovery", { key }).catch(noop); },
   // Complete a close the native side held for an unsaved untitled buffer.
   confirmClose: () => { invoke("close_window_now").catch(noop); },
+  // The window switched to an untitled tab: unbind the previous file so
+  // snapshot/setDirty/save can't misroute into its slot (per-tab correctness).
+  detachDoc: () => { currentPath = null; invoke("detach_doc").catch(noop); },
 
   // Claude Code sessions + context
   listSessions: (dir) => invoke("list_sessions", { dir }).catch(() => []),

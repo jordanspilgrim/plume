@@ -331,10 +331,9 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
         })
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(SIDECAR_TIMEOUT_SECS);
-    let mut exit_status = None;
-    loop {
+    let exit_status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => { exit_status = Some(status); break; }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
@@ -345,7 +344,7 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
             }
             Err(e) => return json!({ "ok": false, "error": e.to_string() }),
         }
-    }
+    };
     let stdout = reader.and_then(|t| t.join().ok()).unwrap_or_default();
     if let Ok(v) = serde_json::from_slice::<Value>(&stdout) {
         return v;
@@ -358,8 +357,9 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
     let start = msg.char_indices().rev().nth(299).map(|(i, _)| i).unwrap_or(0);
     let tail = &msg[start..];
     let code_txt = exit_status
-        .map(|s| s.code().map(|c| c.to_string()).unwrap_or_else(|| "killed by signal".into()))
-        .unwrap_or_else(|| "?".into());
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "killed by signal".into());
     let error = if tail.is_empty() {
         format!("export helper exited (code {code_txt}) without producing a result")
     } else {
@@ -1540,6 +1540,19 @@ fn close_window_now(app: AppHandle, window: tauri::WebviewWindow) {
     let _ = window.destroy();
 }
 
+// The renderer switched this window to an UNTITLED tab: unbind the previous
+// file so snapshot/set_doc_dirty/save can't misroute into its slot. The path
+// leaves the agent write scope too — matching what the window actually shows.
+// Dirty flags for the old path are the renderer's to manage (it owns per-tab
+// buffers); only the label-keyed state is reset here.
+#[tauri::command]
+fn detach_doc(window: tauri::WebviewWindow, state: tauri::State<AppState>) {
+    let label = window.label().to_string();
+    let old = state.docs.lock().unwrap().remove(&label);
+    state.untitled_dirty.lock().unwrap().remove(&label);
+    drop(old); // watcher drop outside the lock, same as set_current
+}
+
 // ---- Claude Code sessions + context ----
 fn claude_projects() -> PathBuf {
     home_dir().join(".claude/projects")
@@ -2551,7 +2564,8 @@ fn main() {
             set_doc_dirty,
             untitled_recovery,
             discard_untitled_recovery,
-            close_window_now
+            close_window_now,
+            detach_doc
         ])
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();
@@ -2592,14 +2606,24 @@ fn main() {
                 return;
             }
             match event {
-                // Closing an untitled buffer with unsaved edits would destroy the
-                // only copy (#4) — hold the close and let the renderer prompt.
-                // The renderer resolves via save/materialize or close_window_now.
+                // Closing a window with unsaved edits would destroy the only copy
+                // (#4) — untitled OR path-backed (owner UAT decision: prompt over
+                // silent auto-save). Hold the close and let the renderer run its
+                // Save / Don't Save / Cancel prompt; it resolves via save /
+                // materialize or close_window_now.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     let app = window.app_handle();
                     let st = app.state::<AppState>();
-                    let untitled = window_doc_path(app, &label).is_none();
-                    if untitled && st.untitled_dirty.lock().unwrap().contains(&label) {
+                    let dirty = match window_doc_path(app, &label) {
+                        // Path-backed doc: dirty iff the renderer flagged its path.
+                        Some(p) => {
+                            let key = canonical_key(Path::new(&p)).to_string_lossy().to_string();
+                            st.dirty_files.lock().unwrap().contains(&key)
+                        }
+                        // Untitled buffer: dirty iff flagged by window label.
+                        None => st.untitled_dirty.lock().unwrap().contains(&label),
+                    };
+                    if dirty {
                         api.prevent_close();
                         let _ = app.emit_to(&label, "close-requested", json!({}));
                     }
