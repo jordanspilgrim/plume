@@ -45,6 +45,7 @@
         },
         discardDraft: (path) => { window.__stub.calls.push(["discardDraft", path]); delete FS[path]; return true; },
         listDrafts: async () => Object.keys(FS).filter(p => p.includes("/Autosave/")).map(p => ({ path: p, ts: 1, title: p.split("/").pop() })),
+        focusPath: async (p) => { window.__stub.calls.push(["focusPath", p]); return window.__stub.focusPathResult; },
         cancelClose: log("cancelClose"),
         setOpenPaths: (paths) => { window.__stub.calls.push(["setOpenPaths", paths.join(",")]); window.__stub.openPaths = paths; },
         save: async (path, content) => { window.__stub.calls.push(["save", path]); FS[path] = content; return path; },
@@ -102,6 +103,7 @@
       window.__stub.saveAsResult = null; // set to a path to make the Save As dialog "succeed"
       window.__stub.boundPath = null;
       window.__stub.openPaths = [];
+      window.__stub.focusPathResult = false;
     </script>
   </head>
   <body>

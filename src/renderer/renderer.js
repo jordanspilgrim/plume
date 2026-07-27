@@ -20,7 +20,7 @@ import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from 
 import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId, tabDisplayName, isCapturedDirty, isBlankTab,
-  closeDecision, dirtyBackgroundTabs, isDraftTab, isKeepableDraft,
+  closeDecision, dirtyBackgroundTabs, isDraftTab, isKeepableDraft, findTabByPath,
 } from "./tabs-model.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
@@ -2407,6 +2407,14 @@ async function newTab() {
 }
 
 async function openInNewTab(path, line) {
+  // Same-window dedupe (round-2 MED): a path already open in a tab activates
+  // that tab instead of double-binding it in a second one.
+  const existing = findTabByPath(tabs, path);
+  if (existing) { await activateTab(existing.id); return; }
+  // Cross-window (drafts only — regular files keep the cluster-A multi-window
+  // contract; their watcher+banner reconciles, silent draft autosave doesn't):
+  // if another window holds this draft, focus it there rather than double-bind.
+  if (isDraftTab({ path, unbound: false }, draftsDir) && (await window.plume.focusPath?.(path))) return;
   // Reuse a blank scratch surface (e.g. the welcome screen) instead of stacking a tab.
   if (!currentPath && view.state.doc.length === 0) { await openInCurrentTab(path, line); return; }
   await autosave();
@@ -2685,11 +2693,18 @@ updateWelcome();
 pushRecentsToMenu(); // seed the native Open Recent menu from saved recents on launch
 
 // Automation surface (used for scripting / testing the UI).
+// Native asks THIS window to bring the tab holding `path` forward (the other
+// half of focus_path — the source window focused us and routed the open here).
+async function activatePath(path) {
+  const t = findTabByPath(tabs, path);
+  if (t) await activateTab(t.id);
+}
+
 window.__plume = {
   toggleSidebar, openPalette, openSearch, openWorkspace, refreshSidebar, exportAs,
   copyAsRichText, applyFocus, updateWelcome, addAnnotation, htmlToMarkdown,
   openDiffReview, smartOpen, view,
-  newTab, activateTab, closeTabRequest, openInNewTab,
+  newTab, activateTab, closeTabRequest, openInNewTab, activatePath,
   tabsState: () => ({ tabs: tabs.map((t) => ({ ...t })), activeTabId }),
 };
 
