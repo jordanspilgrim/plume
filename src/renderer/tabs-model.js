@@ -29,6 +29,11 @@ export function findTab(tabs, id) {
   return tabs.find((t) => t.id === id) || null;
 }
 
+export function findTabByPath(tabs, path) {
+  if (!path) return null;
+  return tabs.find((t) => t.path === path) || null;
+}
+
 export function addTab(tabs, tab, afterId = null) {
   const i = afterId ? tabs.findIndex((t) => t.id === afterId) : -1;
   if (i < 0) return [...tabs, tab];

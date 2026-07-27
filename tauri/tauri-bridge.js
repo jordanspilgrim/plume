@@ -35,6 +35,11 @@ listen("open-file", (e) => {
   if (path && window.__plume && window.__plume.smartOpen) window.__plume.smartOpen(path, line);
 });
 listen("menu", (e) => { if (onMenuCb) onMenuCb(e.payload.channel, e.payload.arg); });
+// focus_path routed an open HERE: bring the tab holding the path forward.
+listen("activate-path", (e) => {
+  const p = e.payload && e.payload.path;
+  if (p && window.__plume && window.__plume.activatePath) window.__plume.activatePath(p);
+});
 
 // Agent round-trip: the control socket asks the renderer for live state.
 listen("agent-request", (e) => {
@@ -79,6 +84,9 @@ window.plume = {
   listDrafts: () => invoke("list_drafts").catch(() => []),
   // Canonical Autosave dir — the authoritative prefix for is-draft derivation.
   draftsDir: () => invoke("drafts_dir").catch(() => null),
+  // True when another window holds `path` open — that window was focused and
+  // told to activate its tab; the caller must NOT bind (round-2 MED).
+  focusPath: (path) => invoke("focus_path", { path }).catch(() => false),
   // Full tab path-set for this window — feeds the agent write scope and
   // listOpenFiles, so background tabs stay agent-writable/visible.
   setOpenPaths: (paths) => { invoke("set_open_paths", { paths }).catch(noop); },

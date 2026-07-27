@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId,
-  tabDisplayName, isCapturedDirty, isBlankTab, closeDecision, dirtyBackgroundTabs, isDraftTab, isKeepableDraft,
+  tabDisplayName, isCapturedDirty, isBlankTab, closeDecision, dirtyBackgroundTabs, isDraftTab, isKeepableDraft, findTabByPath,
 } from "../src/renderer/tabs-model.js";
 
 test("createTab: unique ids, defaults, partial override", () => {
@@ -193,4 +193,13 @@ test("isKeepableDraft: content-bearing drafts only, dir-authoritative", () => {
   assert.equal(isKeepableDraft(createTab({ path: DIR + "/n.md", text: "  ", savedText: "  " }), DIR), false);
   assert.equal(isKeepableDraft(createTab({ path: "/real/doc.md", text: "body", savedText: "body" }), DIR), false);
   assert.equal(isKeepableDraft(createTab({ path: DIR + "/n.md", text: "body" }), null), false);
+});
+
+// Round-2 MED: same-window dedupe — an open path activates its tab, never a
+// second binding of the same file.
+test("findTabByPath: exact path lookup, null-safe", () => {
+  const a = createTab({ path: "/x/a.md" }), b = createTab();
+  assert.equal(findTabByPath([a, b], "/x/a.md"), a);
+  assert.equal(findTabByPath([a, b], "/x/other.md"), null);
+  assert.equal(findTabByPath([a, b], null), null); // untitled tabs never match
 });
