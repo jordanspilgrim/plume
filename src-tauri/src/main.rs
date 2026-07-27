@@ -205,11 +205,18 @@ struct ReadResult {
 // Cluster B: contained to user-established territory.
 #[tauri::command]
 fn read_path(app: AppHandle, path: String) -> Result<ReadResult, String> {
-    if !fs_scope_allows(&app, &canonical_key(Path::new(&path))) {
+    // Read the CANONICAL path we validated, never the raw argument — the same
+    // rule write_file follows on the write side, applied at the point of use.
+    // Gating on canonical_key(path) and then reading `path` leaves a
+    // check-vs-use gap: a symlink swapped in between means the bytes returned
+    // are not the file that passed the gate. Doing it here closes the gap for
+    // every caller at once, rather than depending on each one to pre-resolve.
+    let target = canonical_key(Path::new(&path));
+    if !fs_scope_allows(&app, &target) {
         return Err("outside the open workspace".to_string());
     }
-    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let recovery = recovery_for(&path);
+    let content = fs::read_to_string(&target).map_err(|e| e.to_string())?;
+    let recovery = recovery_for(&target.to_string_lossy());
     Ok(ReadResult { content, recovery })
 }
 
@@ -222,12 +229,18 @@ fn read_path(app: AppHandle, path: String) -> Result<ReadResult, String> {
 // inside scope, resolved link).
 #[tauri::command]
 fn bind_doc(app: AppHandle, window: tauri::WebviewWindow, path: String) -> Result<ReadResult, String> {
-    if !fs_scope_allows(&app, &canonical_key(Path::new(&path))) {
+    // Read — and BIND — the canonical path we validated, not the raw argument
+    // (see read_path). Binding the canonical also means the window's doc, its
+    // watcher, and everything derived from the binding all refer to the file
+    // that actually passed the gate.
+    let target = canonical_key(Path::new(&path));
+    if !fs_scope_allows(&app, &target) {
         return Err("outside the open workspace".to_string());
     }
-    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let recovery = recovery_for(&path);
-    set_current(&app, window.label(), &path, &content);
+    let content = fs::read_to_string(&target).map_err(|e| e.to_string())?;
+    let p = target.to_string_lossy().to_string();
+    let recovery = recovery_for(&p);
+    set_current(&app, window.label(), &p, &content);
     Ok(ReadResult { content, recovery })
 }
 
@@ -3857,6 +3870,41 @@ mod tests {
     // code execution (a git credential-helper line runs on the next auth).
     // The carve-out's premise is "a HUMAN chose this exact path", so the flag
     // must track that, not merely which function called.
+    // The read side must consume the SAME value the gate approved. A symlink is
+    // the concrete way those diverge: gating on the resolved target and then
+    // reading the raw argument means the bytes returned aren't the file that
+    // passed. canonical_key is the join point, so assert it collapses the two.
+    #[cfg(unix)]
+    #[test]
+    fn a_gated_read_resolves_to_the_same_file_the_gate_saw() {
+        let root = std::env::temp_dir().join(format!("plume-readcanon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let real = root.join("real.md");
+        fs::write(&real, "real contents").unwrap();
+        let link = root.join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Gate and read now derive from one value: the link resolves to the
+        // real file, and that is what a caller passing the link gets.
+        let gated = canonical_key(&link);
+        assert_eq!(gated, canonical_key(&real), "the gate sees through the symlink");
+        assert_eq!(fs::read_to_string(&gated).unwrap(), "real contents");
+
+        // Repointing the link cannot change what a already-resolved target
+        // reads — the previous shape re-resolved at read time and would have.
+        let other = root.join("other.md");
+        fs::write(&other, "swapped contents").unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_eq!(
+            fs::read_to_string(&gated).unwrap(),
+            "real contents",
+            "a resolved target is immune to a later swap of the path used to reach it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn only_a_human_pick_may_approve_a_sensitive_path() {
         for sensitive in [
