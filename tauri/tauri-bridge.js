@@ -71,6 +71,14 @@ window.plume = {
       .catch(() => null),
   // Clear this window's binding (doc map entry, watcher, per-window state).
   detachDoc: () => { invoke("detach_doc").catch(noop); },
+  // ---- SAVEFLOW drafts (native half lands after cluster D; all optional) ----
+  // Atomically create + bind ~/Documents/Plume/Autosave/<uniquified name>.md.
+  createDraft: (suggestedName, content) => invoke("create_draft", { suggestedName, content }).catch(() => null),
+  // Containment-guarded unlink of a draft (strictly inside the Autosave dir).
+  discardDraft: (path) => invoke("discard_draft", { path }).catch(() => false),
+  listDrafts: () => invoke("list_drafts").catch(() => []),
+  // Canonical Autosave dir — the authoritative prefix for is-draft derivation.
+  draftsDir: () => invoke("drafts_dir").catch(() => null),
   // Full tab path-set for this window — feeds the agent write scope and
   // listOpenFiles, so background tabs stay agent-writable/visible.
   setOpenPaths: (paths) => { invoke("set_open_paths", { paths }).catch(noop); },
