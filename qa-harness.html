@@ -69,8 +69,6 @@
         saveAnnotations: async () => true,
         snapshot: log("snapshot"),
         discardRecovery: (path) => { window.__stub.calls.push(["discardRecovery", path ?? null]); },
-        untitledRecovery: async () => null,
-        discardUntitledRecovery: log("discardUntitledRecovery"),
         confirmClose: log("confirmClose"),
         listSessions: async () => [],
         searchSessions: async () => [],

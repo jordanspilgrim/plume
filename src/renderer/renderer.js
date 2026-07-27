@@ -76,7 +76,7 @@ function markdownLang() {
 }
 
 const updateListener = EditorView.updateListener.of((u) => {
-  if (u.docChanged) { scheduleSideEffects(); updateWelcome(); }
+  if (u.docChanged) { scheduleSideEffects(); updateWelcome(); maybeCreateDraft(); }
   if (u.selectionSet) updateStatus();
   if (u.selectionSet || u.docChanged) updateSelBar();
   handleSlash(u);
@@ -157,7 +157,9 @@ function scheduleSideEffects() {
   // slot — benign, user-confirmed banner content only; merge order handles it.)
   if (snapshotTimer) clearTimeout(snapshotTimer);
   snapshotTimer = setTimeout(() => {
-    if (isDraft(activeTab())) return; // the autosaved draft file IS the live copy
+    // Path-backed non-draft docs only: drafts' Autosave file IS the live copy,
+    // and the untitled snapshot subsystem is gone (first-keystroke ruling).
+    if (!currentPath || isDraft(activeTab())) return;
     window.plume.snapshot(view.state.doc.toString());
   }, 700);
 
@@ -168,17 +170,42 @@ function scheduleSideEffects() {
 
 function autosaveEnabled() { return localStorage.getItem("plume-autosave") !== "0"; }
 
-// Derive a draft filename from the first non-empty line (heading/bullet
-// markers stripped, slugified); fall back to a timestamp. (SAVEFLOW: the
-// native side uniquifies against collisions and owns the fs.)
-function deriveDocName(text) {
-  const first = (text.split("\n").find((l) => l.trim()) || "").trim();
-  const cleaned = first.replace(/^#{1,6}\s+/, "").replace(/^[-*+]\s+/, "").replace(/^\d+[.)]\s+/, "").trim();
-  const slug = cleaned.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
-  if (slug) return slug;
+// Draft filename = stable timestamp form (owner ruled FIRST-KEYSTROKE: at
+// creation time the buffer is one character, so a content slug would be junk;
+// the human-readable name is listDrafts' title, derived from content at list
+// time). Native uniquifies against collisions.
+function draftTimestampName() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
   return `note-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+// FIRST-KEYSTROKE draft creation (owner ruling): the moment an untitled
+// markdown buffer becomes non-empty it is backed by an Autosave draft file —
+// no debounce window in which a crash could lose a brand-new note. Untitled
+// crash snapshots are gone (native subsystem deleted); this replaces them.
+let draftCreateInFlight = false;
+async function maybeCreateDraft() {
+  if (draftCreateInFlight || currentPath || currentMode !== "markdown") return;
+  if (!window.plume.createDraft || !autosaveEnabled()) return;
+  const t = activeTab();
+  if (t && t.unbound) return;
+  const text0 = view.state.doc.toString();
+  if (!text0.trim()) return;
+  draftCreateInFlight = true;
+  try {
+    const r = await window.plume.createDraft(draftTimestampName(), text0);
+    if (r && r.path) {
+      savedText = text0;
+      if (!draftsDir) draftsDir = r.path.slice(0, r.path.lastIndexOf("/") + 1); // fallback derivation
+      setTitle(r.path); // native bound it; renderer records
+      const t0 = activeTab();
+      if (t0) { t0.path = r.path; t0.unbound = false; }
+      // The user keeps typing during the round-trip — recompute, never assert clean.
+      setDirty(view.state.doc.toString() !== savedText);
+      pushOpenPaths();
+    }
+  } finally { draftCreateInFlight = false; }
 }
 
 let autosaving = false;
@@ -189,27 +216,9 @@ let autosaving = false;
 // (owner option B: drafts prompt regardless of dirty); a scratch code buffer
 // never becomes a stray .md. Inert until the native create_draft lands.
 async function autosave() {
-  if (!autosaveEnabled() || autosaving) return;
-  if (!currentPath) {
-    const text0 = view.state.doc.toString();
-    if (!text0.trim() || currentMode !== "markdown" || !window.plume.createDraft) return;
-    autosaving = true;
-    try {
-      const r = await window.plume.createDraft(deriveDocName(text0), text0);
-      if (r && r.path) {
-        savedText = text0;
-        if (!draftsDir) draftsDir = r.path.slice(0, r.path.lastIndexOf("/") + 1); // fallback derivation
-        setTitle(r.path); // native bound it; renderer records — tab record follows via setTitle→renderTabbar
-        const t0 = activeTab();
-        if (t0) { t0.path = r.path; t0.unbound = false; }
-        // The user may have typed during the createDraft round-trip — recompute
-        // instead of asserting clean (be-dev review: agent-guard under-report).
-        setDirty(view.state.doc.toString() !== savedText);
-        pushOpenPaths();
-      }
-    } finally { autosaving = false; }
-    return;
-  }
+  // Untitled buffers never reach here: first-keystroke draft creation
+  // (maybeCreateDraft) backs them with a path before any autosave tick.
+  if (!autosaveEnabled() || autosaving || !currentPath) return;
   // A dropped binding (file moved/deleted under this tab) must never autosave —
   // the next save is an explicit Save As so the user picks the destination.
   const t = activeTab();
@@ -2618,35 +2627,9 @@ window.plume.onCloseRequested?.(async () => {
   window.plume.confirmClose?.();
 });
 
-// Offer the newest untitled crash snapshot from a previous run when this window
-// opens blank (be-dev #4 contract: untitledRecovery / discardUntitledRecovery).
-async function maybeOfferUntitledRecovery() {
-  if (!window.plume.untitledRecovery) return;
-  if (currentPath || view.state.doc.length > 0) return;
-  const r = await window.plume.untitledRecovery();
-  if (!r || !r.content || !r.content.trim()) return;
-  if (currentPath || view.state.doc.length > 0) return; // something opened while we fetched
-  bannerEl.className = "";
-  bannerEl.innerHTML = "";
-  const msg = document.createElement("span");
-  msg.textContent = "Plume recovered an unsaved draft from your last session.";
-  const restore = document.createElement("button");
-  restore.textContent = "Restore";
-  restore.onclick = () => {
-    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: r.content } });
-    setDirty(true);
-    window.plume.discardUntitledRecovery?.(r.key);
-    clearBanner();
-    view.focus();
-  };
-  const discard = document.createElement("button");
-  discard.textContent = "Discard";
-  discard.className = "ghost";
-  discard.onclick = () => { window.plume.discardUntitledRecovery?.(r.key); clearBanner(); view.focus(); };
-  bannerEl.append(msg, restore, discard);
-}
-// Give initial_file (async bridge pull) a beat to land before offering.
-setTimeout(maybeOfferUntitledRecovery, 600);
+// (Untitled crash-recovery banner removed: first-keystroke drafts made the
+// per-window untitled snapshot subsystem obsolete — a new note is file-backed
+// from its first character and reachable via the Drafts group.)
 
 window.plume.onMenu((channel, ...args) => {
   switch (channel) {

@@ -123,15 +123,13 @@ window.plume = {
   loadAnnotations: (filePath) => invoke("load_annotations", { path: filePath }).catch(() => []),
   saveAnnotations: (filePath, annotations) =>
     invoke("save_annotations", { path: filePath, annotations }).catch(() => false),
-  // snapshot routes by this window's current binding; unbound/untitled buffers
-  // go to the per-window untitled slot (surfaced via untitledRecovery()).
+  // snapshot routes by this window's current binding (path-backed non-draft
+  // docs only — the renderer gates it; untitled snapshots are gone).
   snapshot: (content) => { invoke("snapshot", { content }).catch(noop); },
   // Optional path (Cluster A): under tabs, the doc being discarded isn't
   // necessarily this window's binding — Don't-Save of a path-backed tab passes
   // its path so the recovery snapshot can't resurrect it. No-arg = current binding.
   discardRecovery: (path) => { invoke("discard_recovery", { path: path ?? null }).catch(noop); },
-  untitledRecovery: () => invoke("untitled_recovery").catch(() => null),
-  discardUntitledRecovery: (key) => { invoke("discard_untitled_recovery", { key }).catch(noop); },
   // Renderer-authoritative close: complete the held close, or abandon it
   // (clears the native pending-close marker so the dead-webview valve doesn't
   // misread a healthy Cancel).
