@@ -63,6 +63,13 @@ struct AppState {
     // ⌘Q in flight: the custom quit item fans the close flow out to every window;
     // cancelClose from any window aborts (clears this), last destroy exits.
     quitting: std::sync::atomic::AtomicBool,
+    // Cluster B: user-established territory beyond the open/bound scope —
+    // files the user explicitly opened (canonical: File▸Open, launch arg,
+    // delivered opens, resolved doc links) and directories they explicitly
+    // picked (canonical scope roots from pick_folder). Renderer FS commands are
+    // contained to this union; nothing here is caller-supplied trust.
+    approved_files: Mutex<HashSet<PathBuf>>,
+    approved_dirs: Mutex<HashSet<PathBuf>>,
     // Per-launch secret written to ~/.plume/token (0600). Socket clients must present
     // it on every request (except ping). Defense-in-depth behind the 0600 socket.
     socket_token: Mutex<String>,
@@ -174,8 +181,12 @@ struct ReadResult {
 // Cluster A: PURE read — no binding side effect. The renderer uses it for
 // disk-freshness compares on background-tab activation; binding a document to
 // a window happens ONLY through bind_doc (and the initial_file bootstrap).
+// Cluster B: contained to user-established territory.
 #[tauri::command]
-fn read_path(path: String) -> Result<ReadResult, String> {
+fn read_path(app: AppHandle, path: String) -> Result<ReadResult, String> {
+    if !fs_scope_allows(&app, &canonical_key(Path::new(&path))) {
+        return Err("outside the open workspace".to_string());
+    }
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let recovery = recovery_for(&path);
     Ok(ReadResult { content, recovery })
@@ -185,8 +196,14 @@ fn read_path(path: String) -> Result<ReadResult, String> {
 // failure NOTHING is bound (the renderer drops the binding and the next save
 // forces Save As), so a moved/deleted file can never leave a stale path behind
 // to be written into (P1-A wrong-file write).
+// Cluster B: contained — every path that legitimately reaches here arrived via
+// a user action that pre-approved it (dialog pick, delivered open, tree click
+// inside scope, resolved link).
 #[tauri::command]
 fn bind_doc(app: AppHandle, window: tauri::WebviewWindow, path: String) -> Result<ReadResult, String> {
+    if !fs_scope_allows(&app, &canonical_key(Path::new(&path))) {
+        return Err("outside the open workspace".to_string());
+    }
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let recovery = recovery_for(&path);
     set_current(&app, window.label(), &path, &content);
@@ -219,10 +236,14 @@ fn write_file(app: AppHandle, window: tauri::WebviewWindow, path: String, conten
         .map(|d| d.path.clone())
         .filter(|p| !p.is_empty())
         .ok_or_else(|| "no document bound to this window".to_string())?;
-    if canonical_key(Path::new(&path)) != canonical_key(Path::new(&bound)) {
+    let target = canonical_key(Path::new(&bound));
+    if canonical_key(Path::new(&path)) != target {
         return Err("refused: not this window's bound document (use Save As)".to_string());
     }
-    fs::write(&bound, &content).map_err(|e| e.to_string())?;
+    // Write the canonicalized target we validated, never the raw path — a
+    // symlink swap between check and write must not diverge (TOCTOU), matching
+    // the socket writeDocument path.
+    fs::write(&target, &content).map_err(|e| e.to_string())?;
     set_current(&app, window.label(), &bound, &content);
     Ok(bound)
 }
@@ -274,6 +295,14 @@ fn spawn_window(app: &AppHandle, file_path: &str) -> Result<(), String> {
 
 #[tauri::command]
 fn open_in_new_window(app: AppHandle, file_path: String) -> Result<(), String> {
+    // Cluster B: this is a RENDERER-supplied path, and spawn_window records it
+    // in window_files, which open_files() unions into the (dir-inclusive)
+    // scope feeding both the renderer read gate and the socket's write_allowed.
+    // Ungated it is the same privilege escalation as an unfiltered tab set —
+    // so the target must already be user-established territory.
+    if !fs_scope_allows(&app, &canonical_key(Path::new(&file_path))) {
+        return Err("outside the open workspace".to_string());
+    }
     // Window creation (and its initial_file content load) must run on the main
     // thread — commands run off it, so dispatch like the socket "open" path does.
     // Calling spawn_window directly built the window but left it empty.
@@ -1020,6 +1049,13 @@ fn materialize_doc(app: AppHandle, window: tauri::WebviewWindow, dir: Option<Str
         Some(d) => PathBuf::from(d),
         None => default_plume_dir(),
     };
+    // Cluster B: a renderer-supplied target folder must be user territory; the
+    // default ~/Documents/Plume is always Plume's own to create into.
+    let base_ok = canonical_key(&base) == canonical_key(&default_plume_dir())
+        || fs_scope_allows(&app, &canonical_key(&base));
+    if !base_ok {
+        return None;
+    }
     fs::create_dir_all(&base).ok()?;
     let path = unique_path(&base, &sanitize_stem(&name), "md");
     fs::write(&path, &content).ok()?;
@@ -1058,7 +1094,11 @@ fn rename_file(app: AppHandle, window: tauri::WebviewWindow, old_path: String, n
 #[tauri::command]
 async fn pick_folder(app: AppHandle) -> Option<String> {
     let picked = app.dialog().file().blocking_pick_folder()?;
-    picked.into_path().ok().map(|p| p.to_string_lossy().to_string())
+    let p = picked.into_path().ok()?;
+    // A user-picked folder becomes a scope root (Cluster B) — the sidebar tree
+    // and folder search over it are user-established territory.
+    app.state::<AppState>().approved_dirs.lock().unwrap().insert(canonical_key(&p));
+    Some(p.to_string_lossy().to_string())
 }
 
 // Stage the current document for a specific project's agent: drop a JSON record
@@ -1387,10 +1427,47 @@ async fn link_preview(url: String) -> Value {
         .unwrap_or(Value::Null)
 }
 
+// Pure link-resolution policy (unit-tested): an in-document relative link may
+// only reach a file inside the SAME directory subtree as the document, and
+// never credential material.
+//
+// SECURITY (Codex P1 on cluster B): the previous version passed `href`
+// straight to Path::join, which REPLACES the base when the href is absolute
+// ("/Users/me/.ssh/id_rsa") and happily walks "../../.ssh/id_rsa" — the
+// home-directory check then passed, because credentials live under home, and
+// the resolved target got permanently approved for a follow-up read. An
+// absolute or escaping href is not a document link; it is a request to leave
+// the document's territory, and is refused.
+fn link_target_allowed(base_dir_canon: &Path, resolved: &Path) -> bool {
+    if is_sensitive_path(resolved) {
+        return false;
+    }
+    base_dir_canon.as_os_str().len() > 1 && resolved.starts_with(base_dir_canon)
+}
+
+fn href_is_relative(href: &str) -> bool {
+    let h = href.trim();
+    !(h.is_empty()
+        || Path::new(h).is_absolute()
+        || h.starts_with('/')
+        || h.starts_with('\\')
+        || h.contains("://")
+        // Windows drive-relative ("C:foo") / UNC forms.
+        || h.as_bytes().get(1) == Some(&b':'))
+}
+
 #[tauri::command]
-fn resolve_link(href: String, base: Option<String>) -> Option<String> {
+fn resolve_link(app: AppHandle, href: String, base: Option<String>) -> Option<String> {
     let base = base?;
+    // Cluster B: links only resolve FROM a doc that is itself in scope.
+    if !fs_scope_allows(&app, &canonical_key(Path::new(&base))) {
+        return None;
+    }
+    if !href_is_relative(&href) {
+        return None;
+    }
     let dir = Path::new(&base).parent()?;
+    let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let target = dir.join(&href);
     for cand in [
         target.clone(),
@@ -1398,13 +1475,15 @@ fn resolve_link(href: String, base: Option<String>) -> Option<String> {
         target.with_extension("markdown"),
     ] {
         if cand.is_file() {
-            // Don't resolve a relative link that escapes the user's home into a system
-            // location (../../../../etc/passwd). Legitimate project links stay under home.
+            // Resolve symlinks/.. BEFORE deciding: the target must still live
+            // inside the document's own directory subtree.
             let resolved = canonical_key(&cand);
-            let home = home_dir();
-            if home.as_os_str().len() > 1 && !resolved.starts_with(&home) {
+            if !link_target_allowed(&dir_canon, &resolved) {
                 return None;
             }
+            // Safe to approve: it is inside territory the open document
+            // already establishes, so this widens nothing.
+            approve_file(&app, &cand);
             return Some(cand.to_string_lossy().to_string());
         }
     }
@@ -1447,7 +1526,12 @@ fn walk(dir: &Path, depth: i32) -> Vec<Value> {
 }
 
 #[tauri::command]
-fn list_dir(dir: String, depth: Option<i32>) -> Vec<Value> {
+fn list_dir(app: AppHandle, dir: String, depth: Option<i32>) -> Vec<Value> {
+    // Cluster B: the sidebar tree may only walk user-established territory
+    // (an open doc's folder or a picked folder). Fail soft — empty tree.
+    if !fs_scope_allows(&app, &canonical_key(Path::new(&dir))) {
+        return vec![];
+    }
     walk(Path::new(&dir), depth.unwrap_or(3))
 }
 
@@ -1494,8 +1578,12 @@ fn search_walk(dir: &Path, q: &str, results: &mut Vec<Value>, scanned: &mut u32,
 }
 
 #[tauri::command]
-fn search_files(dir: String, query: String) -> Vec<Value> {
+fn search_files(app: AppHandle, dir: String, query: String) -> Vec<Value> {
     if query.len() < 2 {
+        return vec![];
+    }
+    // Cluster B: same territory rule as list_dir — no scanning outside it.
+    if !fs_scope_allows(&app, &canonical_key(Path::new(&dir))) {
         return vec![];
     }
     let mut results = vec![];
@@ -1518,11 +1606,15 @@ fn sidecar(path: &str) -> (PathBuf, PathBuf) {
 }
 
 #[tauri::command]
-fn load_annotations(path: Option<String>) -> Value {
+fn load_annotations(app: AppHandle, path: Option<String>) -> Value {
     let p = match path {
         Some(p) => p,
         None => return json!([]),
     };
+    // Cluster B: read scope = write scope, matching the socket's getAnnotations.
+    if !fs_scope_allows(&app, &canonical_key(Path::new(&p))) {
+        return json!([]);
+    }
     let (_, file) = sidecar(&p);
     fs::read_to_string(&file)
         .ok()
@@ -1531,11 +1623,16 @@ fn load_annotations(path: Option<String>) -> Value {
 }
 
 #[tauri::command]
-fn save_annotations(path: Option<String>, annotations: Value) -> bool {
+fn save_annotations(app: AppHandle, path: Option<String>, annotations: Value) -> bool {
     let p = match path {
         Some(p) => p,
         None => return false,
     };
+    // Cluster B: the .plume/<file>.notes.json sidecar write stays inside the
+    // territory of the doc it annotates.
+    if !fs_scope_allows(&app, &canonical_key(Path::new(&p))) {
+        return false;
+    }
     let (dir, file) = sidecar(&p);
     if annotations.as_array().map(|a| a.is_empty()).unwrap_or(true) {
         let _ = fs::remove_file(&file);
@@ -1976,11 +2073,15 @@ fn search_sessions(query: String, dir: Option<String>) -> Vec<Value> {
 const CONTEXT_FILES: [&str; 6] = ["CLAUDE.md", "AGENTS.md", "GEMINI.md", ".cursorrules", "README.md", "TODO.md"];
 
 #[tauri::command]
-fn list_context(dir: Option<String>) -> Vec<Value> {
+fn list_context(app: AppHandle, dir: Option<String>) -> Vec<Value> {
     let dir = match dir {
         Some(d) => d,
         None => return vec![],
     };
+    // Cluster B: context files are probed only inside user territory.
+    if !fs_scope_allows(&app, &canonical_key(Path::new(&dir))) {
+        return vec![];
+    }
     let mut out = vec![];
     for name in CONTEXT_FILES {
         let full = Path::new(&dir).join(name);
@@ -1994,11 +2095,38 @@ fn list_context(dir: Option<String>) -> Vec<Value> {
 // Read a file for inline insertion. Claude Code `.jsonl` transcripts are distilled
 // to readable markdown — user/assistant prose only, most-recent kept. Transcripts
 // run to hundreds of MB, so we tail-read the last ~6 MB rather than load it all.
+// Cluster B: session_read's whole purpose is agent transcripts + workspace
+// context files — constrain it to exactly those roots. Anything else (e.g.
+// ~/.ssh/…) returns empty, same shape as a missing file.
+fn session_read_allowed(app: &AppHandle, target: &Path) -> bool {
+    let canon = canonical_key(target);
+    // The deny applies inside the transcript roots too — those roots are a
+    // read grant for transcripts, not for anything that happens to sit there.
+    if is_sensitive_path(&canon) {
+        return false;
+    }
+    for root in [
+        claude_projects(),
+        home_dir().join(".codex/sessions"),
+        home_dir().join(".gemini/tmp"),
+    ] {
+        if let Ok(r) = root.canonicalize() {
+            if canon.starts_with(&r) {
+                return true;
+            }
+        }
+    }
+    fs_scope_allows(app, &canon)
+}
+
 #[tauri::command]
-fn session_read(path: String) -> String {
+fn session_read(app: AppHandle, path: String) -> String {
     const TAIL: u64 = 6 * 1024 * 1024;
     const CAP: usize = 40000;
     let p = Path::new(&path);
+    if !session_read_allowed(&app, p) {
+        return String::new();
+    }
     let size = match fs::metadata(p) {
         Ok(m) => m.len(),
         Err(_) => return String::new(),
@@ -2142,12 +2270,40 @@ fn open_files(app: &AppHandle) -> HashSet<PathBuf> {
     }
     // Cluster A delta 4: BACKGROUND tabs count as open — the user opened them,
     // so they stay in the agent write scope even while another tab is active.
-    for tabs in st.open_tabs.lock().unwrap().values() {
-        for p in tabs {
-            set.insert(p.clone());
+    //
+    // SECURITY (Codex P1 on cluster B): the tab set is RENDERER-SUPPLIED, so it
+    // is evidence of what's open, never a grant. Unfiltered, a compromised
+    // renderer could set_open_paths(["~/.ssh/anything"]) and — because this set
+    // feeds both the renderer read gate AND the socket's write_allowed, both
+    // dir-inclusive — grant itself reads of that whole directory and widen the
+    // AGENT WRITE scope into it. A tab path therefore counts only if it was
+    // INDEPENDENTLY approved by a real user action (dialog pick, delivered
+    // open, followed doc link, launch arg). Every legitimate open route
+    // approves first, and the tab model is session-only (no cross-launch
+    // restore), so genuine background tabs are unaffected.
+    {
+        let approved_files = st.approved_files.lock().unwrap();
+        let approved_dirs = st.approved_dirs.lock().unwrap();
+        for tabs in st.open_tabs.lock().unwrap().values() {
+            for p in tabs {
+                if tab_counts_as_scope(p, &approved_files, &approved_dirs) {
+                    set.insert(p.clone());
+                }
+            }
         }
     }
     set
+}
+
+// Pure (unit-tested): may a renderer-registered tab path widen the scope?
+// Only when a real user action already approved it — see the security note in
+// open_files. Kept separate so the rule is testable without an AppHandle.
+fn tab_counts_as_scope(
+    tab: &Path,
+    approved_files: &HashSet<PathBuf>,
+    approved_dirs: &HashSet<PathBuf>,
+) -> bool {
+    approved_files.contains(tab) || within_any_dir(approved_dirs, tab)
 }
 
 // Pure containment decision (unit-tested): a target is in scope iff it is one of the
@@ -2173,6 +2329,121 @@ fn path_within_open_scope(opens: &HashSet<PathBuf>, target: &Path) -> bool {
 
 fn write_allowed(app: &AppHandle, target: &Path) -> bool {
     path_within_open_scope(&open_files(app), target)
+}
+
+// Pure: is `target` inside (or equal to) any of the granted directory roots?
+// The len > 1 check rejects "/" as a root, same as path_within_open_scope.
+fn within_any_dir(dirs: &HashSet<PathBuf>, target: &Path) -> bool {
+    dirs.iter().any(|d| d.as_os_str().len() > 1 && target.starts_with(d))
+}
+
+// Pure containment policy (unit-tested), split out so the rule can be checked
+// without an AppHandle.
+//
+// Territory alone is NOT sufficient for a sensitive file. Scope is
+// dir-inclusive, so opening one document in a repo puts the whole repo in
+// scope — which let a compromised renderer read `<repo>/.env`,
+// `<repo>/.git/config` (OAuth tokens), or a committed key, defeating this
+// module's own deny list through the primary read path. The deny now applies
+// to everything EXCEPT a file the user opened explicitly — a path lands in
+// approved_files only via File ▸ Open, a launch argument, the token-gated
+// socket, or a link inside the document's own directory — so deliberately
+// editing your own .env still works, while a renderer-driven read of an
+// un-opened secret sitting in an in-scope directory does not.
+fn scope_decision(
+    target: &Path,
+    explicitly_opened: bool,
+    in_open_scope: bool,
+    in_approved_dir: bool,
+) -> bool {
+    if explicitly_opened {
+        return true;
+    }
+    if is_sensitive_path(target) {
+        return false;
+    }
+    in_open_scope || in_approved_dir
+}
+
+// Cluster B: the single containment gate for renderer-driven FS access.
+// `target` must already be canonicalized (canonical_key). Territory = the
+// socket's proven open-file scope (bound docs + pending spawns + approved
+// registered tabs, dir-inclusive) ∪ files the user explicitly opened ∪ dirs
+// the user explicitly picked, minus the sensitive deny (see scope_decision).
+fn fs_scope_allows(app: &AppHandle, target: &Path) -> bool {
+    let st = app.state::<AppState>();
+    // Scoped so the guard is released before open_files() takes it again.
+    let explicitly_opened = st.approved_files.lock().unwrap().contains(target);
+    if explicitly_opened {
+        return true;
+    }
+    if is_sensitive_path(target) {
+        return false; // cheap and decisive — skip the scope walk entirely
+    }
+    let in_open_scope = path_within_open_scope(&open_files(app), target);
+    let in_approved_dir = {
+        let dirs = st.approved_dirs.lock().unwrap();
+        within_any_dir(&dirs, target)
+    };
+    scope_decision(target, false, in_open_scope, in_approved_dir)
+}
+
+fn approve_file(app: &AppHandle, path: &Path) {
+    app.state::<AppState>().approved_files.lock().unwrap().insert(canonical_key(path));
+}
+
+// Sensitive-path deny for EXTERNALLY-driven opens (plume:// deep links, Finder
+// Opened events, second-instance argv) — mirrors the assetProtocol deny globs
+// in tauri.conf.json. Review #2: an unscoped plume://open?path= bypassed this
+// list entirely. A user who genuinely wants to view such a file still can via
+// File ▸ Open (a fully-trusted, user-driven pick).
+fn is_sensitive_path(p: &Path) -> bool {
+    // Normalize BOTH separators before matching (Codex P1): a Windows path
+    // (C:\Users\x\.ssh\id_rsa) has no '/' at all, so '/'-only matching let it
+    // through the hard refusal. A deny-list must fail closed, so this treats
+    // '\' as a separator on every platform — on Unix the only cost is that a
+    // file literally named with a backslash is judged conservatively.
+    let s = p.to_string_lossy().to_lowercase().replace('\\', "/");
+    let joined = format!("{}/", s); // so a path ENDING in a guarded dir also hits
+    // "/.git/" covers .git/config, which carries OAuth tokens in remote URLs
+    // and credential-helper settings. Nothing in the editor needs to read a
+    // repo's internals — and a `git commit` launch (Plume as $EDITOR opening
+    // .git/COMMIT_EDITMSG) still works, because a launch argument lands in
+    // approved_files and the explicit-open exception wins.
+    const DIR_MARKS: [&str; 11] = [
+        "/.ssh/", "/.aws/", "/.gnupg/", "/.kube/", "/.docker/", "/.config/",
+        "/.password-store/", "/secrets/", "/library/keychains/", "/.git-credentials/",
+        "/.git/",
+    ];
+    if DIR_MARKS.iter().any(|d| joined.contains(d)) {
+        return true;
+    }
+    // Take the final segment from the NORMALIZED string, not Path::file_name:
+    // on Unix, file_name() of "c:\\users\\x\\.ssh\\id_rsa" is the whole
+    // backslash string, which would miss the id_rsa/.env checks below.
+    let name = s.rsplit('/').next().unwrap_or_default().to_string();
+    const NAMES: [&str; 7] = [
+        ".env", ".netrc", ".git-credentials", ".npmrc", ".pypirc",
+        // Shell/REPL history routinely contains pasted tokens and passwords.
+        ".history", ".lesshst",
+    ];
+    if NAMES.contains(&name.as_str()) || name.starts_with(".env.") {
+        return true;
+    }
+    // Covers .bash_history, .zsh_history, .python_history, .node_repl_history,
+    // .psql_history, .mysql_history, … as one rule rather than a stale list.
+    if name.starts_with('.') && name.ends_with("_history") {
+        return true;
+    }
+    if ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"].iter().any(|k| name.starts_with(k)) {
+        return true;
+    }
+    if name.contains(".keychain") {
+        return true;
+    }
+    // Extension from the normalized final segment, for the same reason.
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    ["pem", "key", "p12", "pfx", "ovpn"].contains(&ext)
 }
 
 #[cfg(test)]
@@ -2225,6 +2496,209 @@ mod tests {
         // Acked but never resolved for a long time (hung after ack) → re-prompt
         // instead of leaving the window permanently unclosable.
         assert_eq!(close_action(Some((CLOSE_REPROMPT_AFTER, true))), CloseAction::Emit);
+    }
+
+    #[test]
+    fn sensitive_paths_are_refused_for_external_opens() {
+        for bad in [
+            "/Users/x/.ssh/id_rsa",
+            "/Users/x/.ssh/known_hosts",
+            "/Users/x/.aws/credentials",
+            "/Users/x/project/.env",
+            "/Users/x/project/.env.production",
+            "/Users/x/.netrc",
+            "/Users/x/certs/server.pem",
+            "/Users/x/certs/private.key",
+            "/Users/x/Library/Keychains/login.keychain-db",
+            "/Users/x/work/secrets/api.txt",
+            "/Users/x/.gnupg/pubring.kbx",
+            "/Users/x/vpn/office.ovpn",
+        ] {
+            assert!(is_sensitive_path(Path::new(bad)), "should refuse: {bad}");
+        }
+        for ok in [
+            "/Users/x/notes/todo.md",
+            "/Users/x/project/README.md",
+            "/Users/x/envision.md",   // ".env" prefix in a stem is NOT .env
+            "/Users/x/keynotes.txt",  // contains "key" but not a key file
+        ] {
+            assert!(!is_sensitive_path(Path::new(ok)), "should allow: {ok}");
+        }
+    }
+
+    #[test]
+    fn in_scope_directories_do_not_authorize_the_secrets_inside_them() {
+        // The reported gap: the user opens README.md in a repo, so the whole
+        // repo dir is in scope (scope is dir-inclusive) — and a compromised
+        // renderer could then read the repo's secrets, defeating the deny list
+        // through the primary read path.
+        let repo_secret = Path::new("/Users/x/repo/.env");
+        assert!(
+            !scope_decision(repo_secret, false, true, false),
+            "in-scope dir must NOT authorize a secret inside it"
+        );
+        // …but a file the user deliberately opened (File > Open, launch arg,
+        // token-gated socket) is still allowed — editing your own .env works.
+        assert!(scope_decision(repo_secret, true, false, false));
+        // Ordinary documents in that same scope are unaffected.
+        assert!(scope_decision(Path::new("/Users/x/repo/README.md"), false, true, false));
+        assert!(scope_decision(Path::new("/Users/x/repo/docs/a.md"), false, false, true));
+        // Nothing is authorized without territory at all.
+        assert!(!scope_decision(Path::new("/Users/x/other/a.md"), false, false, false));
+        // Same for the rest of the in-repo secret class.
+        for secret in [
+            "/Users/x/repo/.git/config",
+            "/Users/x/repo/.git-credentials",
+            "/Users/x/repo/deploy/id_rsa",
+            "/Users/x/repo/certs/server.pem",
+            "/Users/x/repo/.env.production",
+            "/Users/x/repo/secrets/token.txt",
+        ] {
+            assert!(
+                !scope_decision(Path::new(secret), false, true, true),
+                "should refuse from scope alone: {secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_and_repl_history_files_are_sensitive() {
+        for h in [
+            "/Users/x/.bash_history",
+            "/Users/x/.zsh_history",
+            "/Users/x/.python_history",
+            "/Users/x/.node_repl_history",
+            "/Users/x/.psql_history",
+            "/Users/x/.history",
+            "/Users/x/.lesshst",
+        ] {
+            assert!(is_sensitive_path(Path::new(h)), "should refuse: {h}");
+        }
+        // Not everything with "history" in the name is a shell history file.
+        for ok in ["/Users/x/notes/history.md", "/Users/x/repo/CHANGE_history.md"] {
+            assert!(!is_sensitive_path(Path::new(ok)), "should allow: {ok}");
+        }
+    }
+
+    #[test]
+    fn renderer_registered_tabs_cannot_self_authorize() {
+        // The Codex P1: a compromised renderer registers a tab it never
+        // legitimately opened. Nothing is approved, so it grants nothing —
+        // neither the read gate nor (critically) the socket write scope.
+        let approved_files: HashSet<PathBuf> = HashSet::new();
+        let approved_dirs: HashSet<PathBuf> = HashSet::new();
+        assert!(!tab_counts_as_scope(
+            Path::new("/Users/x/.ssh/id_rsa"),
+            &approved_files,
+            &approved_dirs
+        ));
+        // A tab the user really opened (dialog/delivered open/link/launch arg
+        // all call approve_file) still counts — the feature is preserved.
+        let mut approved_files = HashSet::new();
+        approved_files.insert(PathBuf::from("/Users/x/notes/todo.md"));
+        assert!(tab_counts_as_scope(
+            Path::new("/Users/x/notes/todo.md"),
+            &approved_files,
+            &approved_dirs
+        ));
+        // …and a tab inside a folder the user picked counts too.
+        let mut approved_dirs = HashSet::new();
+        approved_dirs.insert(PathBuf::from("/Users/x/project"));
+        assert!(tab_counts_as_scope(
+            Path::new("/Users/x/project/sub/a.md"),
+            &approved_files,
+            &approved_dirs
+        ));
+        // But a forged path merely NEAR an approved one does not.
+        assert!(!tab_counts_as_scope(
+            Path::new("/Users/x/project-evil/a.md"),
+            &approved_files,
+            &approved_dirs
+        ));
+        assert!(!tab_counts_as_scope(
+            Path::new("/Users/x/notes/other.md"),
+            &approved_files,
+            &approved_dirs
+        ));
+    }
+
+    #[test]
+    fn windows_style_sensitive_paths_are_refused_too() {
+        // Codex P1: '/'-only matching let backslash paths through the deny.
+        for bad in [
+            r"C:\Users\x\.ssh\id_rsa",
+            r"C:\Users\x\.aws\credentials",
+            r"C:\Users\x\project\.env",
+            r"C:\Users\x\certs\server.pem",
+            r"\\host\share\secrets\api.txt",
+            r"C:\Users\x\.gnupg\pubring.kbx",
+        ] {
+            assert!(is_sensitive_path(Path::new(bad)), "should refuse: {bad}");
+        }
+        for ok in [r"C:\Users\x\notes\todo.md", r"C:\Users\x\envision.md"] {
+            assert!(!is_sensitive_path(Path::new(ok)), "should allow: {ok}");
+        }
+    }
+
+    #[test]
+    fn doc_links_cannot_escape_the_document_directory() {
+        let dir = Path::new("/Users/x/notes");
+        // Inside the doc's own subtree — allowed.
+        assert!(link_target_allowed(dir, Path::new("/Users/x/notes/other.md")));
+        assert!(link_target_allowed(dir, Path::new("/Users/x/notes/sub/deep.md")));
+        // Escaping the subtree — refused even though both are under $HOME,
+        // which is what the old home-only check wrongly permitted.
+        assert!(!link_target_allowed(dir, Path::new("/Users/x/.ssh/id_rsa")));
+        assert!(!link_target_allowed(dir, Path::new("/Users/x/other/secret.md")));
+        // Sibling dir with a shared name prefix is NOT inside.
+        assert!(!link_target_allowed(dir, Path::new("/Users/x/notes-evil/a.md")));
+        // Sensitive material inside the subtree is still refused.
+        assert!(!link_target_allowed(dir, Path::new("/Users/x/notes/.env")));
+        assert!(!link_target_allowed(dir, Path::new("/Users/x/notes/key.pem")));
+        // "/" can never act as the containing dir.
+        assert!(!link_target_allowed(Path::new("/"), Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn only_relative_hrefs_are_resolvable() {
+        for good in ["other.md", "./other.md", "sub/deep.md", "../sibling.md", "a b.md"] {
+            assert!(href_is_relative(good), "should accept: {good}");
+        }
+        // Absolute / scheme / drive-relative hrefs are not document links —
+        // Path::join would REPLACE the base with them (the P1 bypass).
+        for bad in [
+            "/Users/x/.ssh/id_rsa",
+            "//Users/x/.ssh/id_rsa",
+            r"\Users\x\.ssh\id_rsa",
+            r"C:\Users\x\.ssh\id_rsa",
+            "C:notes.md",
+            "file:///Users/x/.ssh/id_rsa",
+            "https://evil.example/x",
+            "",
+        ] {
+            assert!(!href_is_relative(bad), "should reject: {bad}");
+        }
+        // Sanity: the escaping relative href is accepted HERE and stopped by
+        // link_target_allowed after canonicalization (defense in depth).
+        assert!(href_is_relative("../../.ssh/id_rsa"));
+        assert!(!link_target_allowed(
+            Path::new("/Users/x/notes"),
+            Path::new("/Users/x/.ssh/id_rsa")
+        ));
+    }
+
+    #[test]
+    fn approved_dir_roots_are_dir_inclusive_and_reject_root() {
+        let mut dirs = HashSet::new();
+        dirs.insert(PathBuf::from("/Users/x/notes"));
+        assert!(within_any_dir(&dirs, Path::new("/Users/x/notes")));
+        assert!(within_any_dir(&dirs, Path::new("/Users/x/notes/sub/a.md")));
+        assert!(!within_any_dir(&dirs, Path::new("/Users/x/notes-evil/a.md")));
+        assert!(!within_any_dir(&dirs, Path::new("/Users/x/other/a.md")));
+        // "/" must never be a scope root even if it somehow got granted.
+        let mut root = HashSet::new();
+        root.insert(PathBuf::from("/"));
+        assert!(!within_any_dir(&root, Path::new("/etc/passwd")));
     }
 
     #[test]
@@ -2296,6 +2770,11 @@ fn focused_doc(app: &AppHandle) -> Option<String> {
 // then focused "main" regardless of where it went — the cause of both the
 // opens-behind and the intermittent replace-the-foreground-window bugs.
 fn deliver_open(app: &AppHandle, path: &str, line: Option<i64>) {
+    // Every delivery point is a legitimate grant: user dialog picks, the
+    // token-gated socket, and externally-driven opens that already passed the
+    // deliver_external_open gate. Approving here lets the renderer's follow-up
+    // bind_doc through containment.
+    approve_file(app, Path::new(path));
     let payload = json!({ "path": path, "line": line });
     if let Some(win) = focused_or_main(app) {
         let label = win.label().to_string();
@@ -2403,7 +2882,7 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
                     if !write_allowed(app, &canonical_key(Path::new(&p))) {
                         json!({ "ok": false, "error": "refused: path is outside the open workspace" })
                     } else {
-                        json!({ "ok": true, "path": p, "annotations": load_annotations(Some(p.clone())) })
+                        json!({ "ok": true, "path": p, "annotations": load_annotations(app.clone(), Some(p.clone())) })
                     }
                 }
                 None => json!({ "ok": false, "error": "no path" }),
@@ -2715,12 +3194,44 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Open a file path into the running app (used by single-instance + Opened events).
-fn open_external_file(app: &AppHandle, p: &str) {
-    if !Path::new(p).is_file() {
+/// Externally-DRIVEN open (plume:// deep links, macOS Finder `Opened` events,
+/// second-instance argv). Review #2: this path was unscoped — any web page
+/// could open ~/.ssh/id_rsa into the editor via plume://open?path=. Gate:
+/// 1. sensitive credential material → hard refuse (File ▸ Open remains the
+///    trusted route if the user genuinely wants such a file);
+/// 2. inside user-established territory → open directly;
+/// 3. anything else → native Open/Cancel confirm (non-blocking), approve on
+///    Open only. Finder double-clicks of new files land in (3) as a one-click
+///    confirm; scripted plume:// floods can no longer silently exfiltrate.
+fn deliver_external_open(app: &AppHandle, path: &str, line: Option<i64>) {
+    if !Path::new(path).is_file() {
         return;
     }
-    deliver_open(app, p, None);
+    let canon = canonical_key(Path::new(path));
+    if is_sensitive_path(&canon) {
+        eprintln!("plume: refused externally-driven open of sensitive path {}", canon.display());
+        return;
+    }
+    if fs_scope_allows(app, &canon) {
+        deliver_open(app, path, line);
+        return;
+    }
+    let appc = app.clone();
+    let p = path.to_string();
+    app.dialog()
+        .message(format!("Open “{}” in Plume?\n\nThis request came from outside Plume (a link, another app, or Finder).", canon.display()))
+        .title("Open File")
+        .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom("Open".to_string(), "Cancel".to_string()))
+        .show(move |yes| {
+            if yes {
+                deliver_open(&appc, &p, line);
+            }
+        });
+}
+
+/// Open a file path into the running app (used by single-instance + Opened events).
+fn open_external_file(app: &AppHandle, p: &str) {
+    deliver_external_open(app, p, None);
 }
 
 fn main() {
@@ -2792,6 +3303,21 @@ fn main() {
             // ⌘Q / File▸Exit: renderer-authoritative quit via per-window fan-out.
             if id == "quit" {
                 request_quit(app);
+                return;
+            }
+            // Open Recent runs through the external-open gate rather than the
+            // renderer (Codex P2). Two reasons: (a) after a fresh launch a
+            // prior-session path is in no scope yet, so the gated read would
+            // reject it — the regression; (b) the recents list is pushed by
+            // the RENDERER (set_recent_files) and the menu shows only the
+            // basename, so a compromised renderer could label a credential
+            // file "notes.md". Through the gate: sensitive → refused,
+            // in-scope → opens directly, otherwise → one confirm showing the
+            // full path.
+            if let Some(p) = id.strip_prefix("openRecent:") {
+                let appc = app.clone();
+                let path = p.to_string();
+                std::thread::spawn(move || deliver_external_open(&appc, &path, None));
                 return;
             }
             // File > Open with no window alive (macOS after ⌘W): there is no
@@ -2920,6 +3446,9 @@ fn main() {
             let args: Vec<String> = std::env::args().collect();
             if let Some(p) = args.iter().skip(1).find(|a| !a.starts_with('-')) {
                 if Path::new(p).is_file() {
+                    // The user launched Plume with this file — trusted pick;
+                    // approve it so the bootstrap bind passes containment.
+                    approve_file(&handle, Path::new(p));
                     *app.state::<AppState>().initial.lock().unwrap() = Some(p.clone());
                 }
             }
@@ -2945,9 +3474,9 @@ fn main() {
                             }
                         }
                         if let Some(p) = path {
-                            if Path::new(&p).is_file() {
-                                deliver_open(&dl_handle, &p, line);
-                            }
+                            // Cluster B: deep links are attacker-reachable (any
+                            // web page) — always through the external-open gate.
+                            deliver_external_open(&dl_handle, &p, line);
                         }
                     }
                 }
