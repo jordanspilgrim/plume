@@ -1206,24 +1206,52 @@ fn create_draft(app: AppHandle, window: tauri::WebviewWindow, suggested_name: St
     Some(json!({ "path": p }))
 }
 
-// The .md drafts currently in Autosave/ (renderer welcome/palette group). Read-only,
-// newest first.
-#[tauri::command]
-fn list_drafts() -> Vec<Value> {
-    let dir = autosave_dir();
+// A human label for a draft: the first non-empty line (heading/bullet markers
+// stripped), falling back to the filename stem. The stem is the creation-time
+// name and goes stale as the draft is edited, so the live first line wins.
+fn draft_title(content: &str, stem_fallback: &str) -> String {
+    for line in content.lines() {
+        let t = line
+            .trim()
+            .trim_start_matches('#')
+            .trim_start_matches(['-', '*', '+'])
+            .trim();
+        if !t.is_empty() {
+            return t.chars().take(120).collect();
+        }
+    }
+    stem_fallback.to_string()
+}
+
+// Pure (unit-testable against a temp dir): the .md drafts in `dir`, newest first,
+// as { path, ts, title }. Each path is CANONICALIZED so it shares the exact form
+// drafts_dir()/create_draft return — otherwise a draft opened from this list on a
+// Mac with a symlinked ~/Documents (iCloud sync) would carry a divergent prefix
+// and silently stop classifying as a draft (N1).
+fn list_drafts_in(dir: &Path) -> Vec<Value> {
     let mut rows: Vec<(u64, Value)> = vec![];
-    let Ok(entries) = fs::read_dir(&dir) else { return vec![] };
+    let Ok(entries) = fs::read_dir(dir) else { return vec![] };
     for e in entries.flatten() {
         let p = e.path();
         if !p.is_file() || p.extension().and_then(|x| x.to_str()) != Some("md") {
             continue;
         }
-        let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
-        let ts = file_mtime_ms(&p);
-        rows.push((ts, json!({ "path": p.to_string_lossy(), "name": name, "modified": ts })));
+        let path = canonical_key(&p);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        let title = draft_title(&content, stem);
+        let ts = file_mtime_ms(&path);
+        rows.push((ts, json!({ "path": path.to_string_lossy(), "ts": ts, "title": title })));
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
     rows.into_iter().map(|(_, v)| v).collect()
+}
+
+// The .md drafts currently in Autosave/ (renderer welcome/palette group). Read-only,
+// newest first.
+#[tauri::command]
+fn list_drafts() -> Vec<Value> {
+    list_drafts_in(&autosave_dir())
 }
 
 // Delete a draft — the ONLY renderer-callable unlink primitive, so HARD-CONTAINED:
@@ -1245,9 +1273,10 @@ fn discard_draft(path: String) -> bool {
     }
     match fs::remove_file(&target) {
         Ok(()) => {
-            // Recovery snapshot is keyed by the bound path string snapshot() wrote
-            // under (== the canonical path create_draft returned == this arg).
-            let _ = fs::remove_file(recovery_path(&path));
+            // Clear the recovery snapshot keyed by the CANONICAL bound path
+            // snapshot() wrote under (create_draft binds the canonical form) —
+            // not the raw arg, which can diverge under a symlinked ~/Documents (N3).
+            let _ = fs::remove_file(recovery_path(&target.to_string_lossy()));
             true
         }
         Err(e) => {
@@ -1351,6 +1380,50 @@ mod saveflow_tests {
         let ghost = autosave_dir().join(format!("ghost-{}.md", std::process::id()));
         assert!(!discard_draft(ghost.to_string_lossy().to_string()));
         let _ = fs::remove_dir_all(outside.parent().unwrap());
+    }
+
+    // N1 + N4: every list_drafts path is CANONICAL (shares the drafts_dir prefix)
+    // even when reached through a symlinked entry point — the iCloud ~/Documents
+    // symlink case that made drafts silently stop classifying. Also asserts the
+    // { path, ts, title } contract shape and title semantics.
+    #[test]
+    #[cfg(unix)]
+    fn list_drafts_canonicalizes_through_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = tmp("list");
+        let real_av = root.join("real").join("Autosave");
+        // first-line title (markers stripped) vs empty-file → stem fallback
+        write_new_draft(&real_av, "old-stem", "# Live Title\n\nbody").unwrap();
+        write_new_draft(&real_av, "just-stem", "").unwrap();
+        let canon_av = canonical_key(&real_av);
+
+        // A symlinked view of the same tree (mimics iCloud's ~/Documents symlink).
+        let link_root = root.join("link");
+        symlink(root.join("real"), &link_root).unwrap();
+        let link_av = link_root.join("Autosave");
+
+        for rows in [list_drafts_in(&real_av), list_drafts_in(&link_av)] {
+            assert_eq!(rows.len(), 2, "both .md drafts listed");
+            for r in &rows {
+                let path = PathBuf::from(r["path"].as_str().unwrap());
+                assert_eq!(path, canonical_key(&path), "path must be canonical");
+                assert!(
+                    path.starts_with(&canon_av),
+                    "path must share the canonical Autosave prefix regardless of symlink: {path:?}"
+                );
+                assert!(r["ts"].is_u64(), "contract: ts present");
+                assert!(r["title"].is_string(), "contract: title present");
+                assert!(r.get("name").is_none() && r.get("modified").is_none(), "old keys gone");
+            }
+        }
+
+        let titles: Vec<String> = list_drafts_in(&real_av)
+            .iter()
+            .map(|r| r["title"].as_str().unwrap().to_string())
+            .collect();
+        assert!(titles.contains(&"Live Title".to_string()), "first-line title wins: {titles:?}");
+        assert!(titles.contains(&"just-stem".to_string()), "empty draft falls back to stem: {titles:?}");
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
@@ -2763,13 +2836,16 @@ fn fs_scope_allows(app: &AppHandle, target: &Path) -> bool {
     if explicitly_opened {
         return true;
     }
-    // SAVEFLOW: the canonical Autosave draft home is always in scope so draft
-    // reads/writes pass — but ONLY this subdir, never ~/Documents/Plume at large.
-    if is_within_autosave(&autosave_key(), target) {
-        return true;
-    }
     if is_sensitive_path(target) {
         return false; // cheap and decisive — skip the scope walk entirely
+    }
+    // SAVEFLOW: the canonical Autosave draft home is always in scope so draft
+    // reads/writes pass — but ONLY this subdir, never ~/Documents/Plume at large.
+    // BELOW the sensitive deny (N2): a sensitive-NAMED file dropped into Autosave
+    // by something other than Plume must not become readable through this grant.
+    // Zero functional loss — Plume's own drafts are always sanitized .md.
+    if is_within_autosave(&autosave_key(), target) {
+        return true;
     }
     let in_open_scope = path_within_open_scope(&open_files(app), target);
     let in_approved_dir = {
