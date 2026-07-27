@@ -153,6 +153,10 @@ window.plume = {
   // a buffer with unsaved edits (P1-4). Keyed by the window's current file; a
   // null path flags this window's UNTITLED buffer so close can prompt (#4).
   setDirty: (dirty) => { invoke("set_doc_dirty", { path: currentPath, dirty }).catch(noop); },
+  // Arm/disarm the window's close gate for a dirty UNTITLED buffer regardless of
+  // which tab is bound — the renderer pushes the OR of active + background
+  // untitled-dirty here so a backgrounded draft still holds the window on close.
+  setUntitledDirty: (dirty) => { invoke("set_untitled_dirty", { dirty }).catch(noop); },
 };
 
 // Pull the launch file once the renderer has registered its handler.

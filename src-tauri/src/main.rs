@@ -80,8 +80,12 @@ fn set_current(app: &AppHandle, label: &str, path: &str, content: &str) {
         label.to_string(),
         DocState { path: path.to_string(), last_content: content.to_string(), _watcher: watcher },
     );
-    // The window now holds a real file — it is no longer a dirty untitled buffer.
-    state.untitled_dirty.lock().unwrap().remove(label);
+    // NOTE: the untitled-dirty flag is NOT cleared here. The renderer is the
+    // single writer of untitled_dirty (via set_untitled_dirty), because it
+    // reflects ANY tab's dirty-untitled state, not just the active bind — a
+    // background untitled draft must keep the window's close gate armed even
+    // after the active tab switches to a file. A stale hold is benign: the
+    // close-requested prompt fires, finds every doc clean, and confirms close.
     // Drop the replaced watcher OUTSIDE the docs lock: its callback takes the same
     // lock, and some backends join the callback thread on drop (deadlock otherwise).
     drop(old);
@@ -1581,6 +1585,13 @@ fn discard_untitled_recovery(key: String) {
 fn close_window_now(app: AppHandle, window: tauri::WebviewWindow) {
     app.state::<AppState>().untitled_dirty.lock().unwrap().remove(window.label());
     clear_untitled_recovery(window.label());
+    // An explicit discard must not resurrect a PATH-BACKED snapshot either
+    // (P2d): a saved doc dirty long enough for snapshot() to fire would
+    // otherwise re-offer the discarded changes on next open. Mirror the
+    // path-backed branch of discard_recovery.
+    if let Some(path) = window_doc_path(&app, window.label()) {
+        let _ = fs::remove_file(recovery_path(&path));
+    }
     let _ = window.destroy();
 }
 
@@ -2106,6 +2117,22 @@ fn set_doc_dirty(window: tauri::WebviewWindow, state: tauri::State<AppState>, pa
     }
 }
 
+// Arm/disarm this window's close gate for a dirty UNTITLED buffer, independent
+// of which tab is currently bound. set_doc_dirty routes by the active path, so
+// while a saved tab is active the renderer can't reach the untitled flag through
+// it (and pushing a path there would wrongly mark that file dirty). The renderer
+// owns this flag as the OR of "active untitled dirty" and "any background
+// untitled tab dirty", so a backgrounded draft still holds the window on close.
+#[tauri::command]
+fn set_untitled_dirty(window: tauri::WebviewWindow, state: tauri::State<AppState>, dirty: bool) {
+    let mut set = state.untitled_dirty.lock().unwrap();
+    if dirty {
+        set.insert(window.label().to_string());
+    } else {
+        set.remove(window.label());
+    }
+}
+
 // The window that should receive an open request: the focused one, else main.
 fn focused_or_main(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     app.webview_windows()
@@ -2593,6 +2620,7 @@ fn main() {
             agent_reply,
             set_recent_files,
             set_doc_dirty,
+            set_untitled_dirty,
             untitled_recovery,
             discard_untitled_recovery,
             close_window_now

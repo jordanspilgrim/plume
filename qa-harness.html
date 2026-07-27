@@ -64,7 +64,7 @@
         pickImage: async () => null,
         linkPreview: async () => null,
         openInNewWindow: log("openInNewWindow"),
-        exportDoc: async (format, html, name) => { window.__stub.calls.push(["exportDoc", format]); return "/fake/out." + format; },
+        exportDoc: async (format, html, name) => { window.__stub.calls.push(["exportDoc", format]); return { ok: true, path: "/fake/out." + format }; },
         publishGoogle: async () => { window.__stub.calls.push(["publishGoogle"]); return window.__stub.publishResult; },
         setDirty: log("setDirty"),
         // ---- pkg-dev export-runtime contract (PR #2) ----
