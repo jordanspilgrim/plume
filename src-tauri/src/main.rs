@@ -1920,10 +1920,18 @@ fn rename_file(app: AppHandle, window: tauri::WebviewWindow, old_path: String, n
     // Same containment as write_file: only this window's bound document may be
     // renamed from this window.
     let bound = window_doc_path(&app, window.label())?;
-    if canonical_key(Path::new(&old_path)) != canonical_key(Path::new(&bound)) {
+    // Class 1 (round 4): bind the canonical value the guard compares, then
+    // rename THAT. This compared canonical paths and then operated on the raw
+    // `old_path`, so a document opened through a symlink renamed the LINK
+    // instead of the document: `dir` became the symlink's directory (outside
+    // the workspace), unique_path probed there, fs::rename moved the link, the
+    // real file kept its name, and set_current then bound the window to a path
+    // that isn't the document. The guard proved the two paths resolve to the
+    // same file; that resolved file is the one to operate on.
+    let old = canonical_key(Path::new(&old_path));
+    if old != canonical_key(Path::new(&bound)) {
         return None;
     }
-    let old = PathBuf::from(&old_path);
     let dir = old.parent()?.to_path_buf();
     let ext = old.extension().and_then(|e| e.to_str()).unwrap_or("md").to_string();
     let stem = sanitize_stem(&new_name);
@@ -3996,6 +4004,61 @@ mod tests {
     // code execution (a git credential-helper line runs on the next auth).
     // The carve-out's premise is "a HUMAN chose this exact path", so the flag
     // must track that, not merely which function called.
+    // Round-4 class 1, second site: rename must move the document the guard
+    // proved, not the caller's raw string. `rename_file` compared canonical
+    // paths and then built `old`/`dir` from the raw one, so a document reached
+    // through a symlink renamed the LINK — the real file kept its name, the
+    // rename and its unique_path probe happened in the symlink's (unvetted)
+    // directory, and the window was left bound to a path that is not the
+    // document. Equality of canonical paths is exactly the proof that the
+    // resolved path is the right thing to operate on.
+    #[cfg(unix)]
+    #[test]
+    fn rename_moves_the_document_not_the_link_used_to_reach_it() {
+        let root = std::env::temp_dir().join(format!("plume-renamecanon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let inside = root.join("workspace");
+        let outside = root.join("elsewhere");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let doc = inside.join("real.md");
+        fs::write(&doc, "# in scope").unwrap();
+        let alias = outside.join("alias.md");
+        std::os::unix::fs::symlink(&doc, &alias).unwrap();
+
+        // The guard's premise: both paths resolve to the same document, so the
+        // rename is authorized. That is the case that reaches the derivation.
+        assert_eq!(canonical_key(&alias), canonical_key(&doc));
+
+        // The derivation the fix uses: the directory to rename within is the
+        // document's own, not the symlink's.
+        let vetted = canonical_key(&alias);
+        let vetted_dir = vetted.parent().unwrap().to_path_buf();
+        assert_eq!(
+            vetted_dir,
+            canonical_key(&inside),
+            "rename must operate in the document's real directory"
+        );
+
+        // The raw derivation the old shape used pointed at the unvetted dir.
+        let raw_dir = Path::new(&alias).parent().unwrap().canonicalize().unwrap();
+        assert_ne!(
+            raw_dir, vetted_dir,
+            "precondition: raw and canonical derivations must diverge"
+        );
+
+        // And renaming the RAW path moves the link while the document keeps its
+        // name — the concrete data-integrity failure the old shape produced.
+        let moved_link = outside.join("renamed.md");
+        fs::rename(&alias, &moved_link).unwrap();
+        assert!(doc.is_file(), "the real document is untouched by a link rename");
+        assert!(
+            !alias.exists() && moved_link.exists(),
+            "only the link moved, so the app would bind a path that is not the document"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // Round-4 class 1: link resolution must walk the directory of the document
     // the GATE vetted, not the directory of the caller's raw string. A symlink
     // outside the workspace pointing at an in-scope document makes those two
