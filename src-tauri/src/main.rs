@@ -46,15 +46,57 @@ struct AppState {
     window_files: Mutex<HashMap<String, String>>,
     win_counter: AtomicU64,
     recents: Mutex<Vec<String>>, // recent file paths for the File > Open Recent menu
-    // Canonical paths the renderer has flagged as having unsaved edits. writeDocument
-    // refuses to clobber one of these (P1-4). Renderer pushes via set_doc_dirty.
+    // Canonical paths the renderer has flagged as having unsaved edits. Feeds ONLY
+    // the agent writeDocument guard (P1-4). The renderer is the single live writer
+    // (explicit path per set_doc_dirty, cleared per tab transition); the only
+    // native touch is the Destroyed-time GC sweep (cluster A, coord-ratified).
     dirty_files: Mutex<HashSet<String>>,
-    // Labels of windows holding a never-saved (untitled) buffer with unsaved edits.
-    // Close of such a window is intercepted so the renderer can prompt (#4).
-    untitled_dirty: Mutex<HashSet<String>>,
+    // Cluster A delta 4: each window's full open TAB path-set (canonical), pushed
+    // by the renderer via set_open_paths. Feeds the agent write scope +
+    // listOpenFiles (background tabs stay visible/writable) and scopes the
+    // Destroyed-time dirty_files GC.
+    open_tabs: Mutex<HashMap<String, Vec<PathBuf>>>,
+    // Close prompts in flight, keyed by label: (emitted-at, acked). Close is
+    // always-prevent + close-requested (renderer-authoritative); the bridge
+    // auto-ACKs receipt to prove the webview is alive (coord ruling 6068).
+    pending_close: Mutex<HashMap<String, (std::time::Instant, bool)>>,
+    // ⌘Q in flight: the custom quit item fans the close flow out to every window;
+    // cancelClose from any window aborts (clears this), last destroy exits.
+    quitting: std::sync::atomic::AtomicBool,
     // Per-launch secret written to ~/.plume/token (0600). Socket clients must present
     // it on every request (except ping). Defense-in-depth behind the 0600 socket.
     socket_token: Mutex<String>,
+}
+
+// Dead-renderer deadline: the bridge ACKs close-requested in milliseconds when
+// the webview is alive; silence for this long means it is wedged and the window
+// is destroyed natively (crash-recovery snapshots are the data net).
+const CLOSE_ACK_DEADLINE: Duration = Duration::from_millis(1500);
+// A prompt that was ACKed but never resolved (hung after ack — rare) would make
+// the window unclosable under pure swallow; after this age a new OS close
+// re-emits close-requested instead (safe for a live renderer: its flow is
+// loop-guarded).
+const CLOSE_REPROMPT_AFTER: Duration = Duration::from_secs(10);
+
+// Pure close-gate policy for an incoming OS close, given the pending marker
+// (age, acked) if any. Emit = record + emit close-requested + arm ack timer;
+// Swallow = keep preventing, no new emit (a prompt round-trip is in flight).
+#[derive(Debug, PartialEq)]
+enum CloseAction {
+    Emit,
+    Swallow,
+}
+
+fn close_action(entry: Option<(Duration, bool)>) -> CloseAction {
+    match entry {
+        None => CloseAction::Emit,
+        // Acked long ago but never resolved: re-prompt rather than wedge.
+        Some((age, true)) if age >= CLOSE_REPROMPT_AFTER => CloseAction::Emit,
+        // Un-acked past the deadline: the ack timer should have destroyed the
+        // window; if it somehow didn't, re-emitting re-arms the escape hatch.
+        Some((age, false)) if age >= CLOSE_ACK_DEADLINE => CloseAction::Emit,
+        Some(_) => CloseAction::Swallow,
+    }
 }
 
 // Home directory, cross-platform: HOME on unix, USERPROFILE on Windows.
@@ -80,8 +122,6 @@ fn set_current(app: &AppHandle, label: &str, path: &str, content: &str) {
         label.to_string(),
         DocState { path: path.to_string(), last_content: content.to_string(), _watcher: watcher },
     );
-    // The window now holds a real file — it is no longer a dirty untitled buffer.
-    state.untitled_dirty.lock().unwrap().remove(label);
     // Drop the replaced watcher OUTSIDE the docs lock: its callback takes the same
     // lock, and some backends join the callback thread on drop (deadlock otherwise).
     drop(old);
@@ -131,33 +171,60 @@ struct ReadResult {
     recovery: Option<String>,
 }
 
+// Cluster A: PURE read — no binding side effect. The renderer uses it for
+// disk-freshness compares on background-tab activation; binding a document to
+// a window happens ONLY through bind_doc (and the initial_file bootstrap).
 #[tauri::command]
-fn read_path(app: AppHandle, window: tauri::WebviewWindow, path: String) -> Result<ReadResult, String> {
+fn read_path(path: String) -> Result<ReadResult, String> {
+    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let recovery = recovery_for(&path);
+    Ok(ReadResult { content, recovery })
+}
+
+// Cluster A: the sole binding entry point — read + bind atomically. On read
+// failure NOTHING is bound (the renderer drops the binding and the next save
+// forces Save As), so a moved/deleted file can never leave a stale path behind
+// to be written into (P1-A wrong-file write).
+#[tauri::command]
+fn bind_doc(app: AppHandle, window: tauri::WebviewWindow, path: String) -> Result<ReadResult, String> {
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let recovery = recovery_for(&path);
     set_current(&app, window.label(), &path, &content);
     Ok(ReadResult { content, recovery })
 }
 
+// Cluster A: unbind this window (untitled tab activated): drop the docs entry
+// and its watcher. The old path leaves the agent write scope unless another
+// window's binding or registered tab-set still covers it. Per-path dirty flags
+// stay renderer-owned and are NOT touched here.
 #[tauri::command]
-fn write_file(app: AppHandle, window: tauri::WebviewWindow, path: Option<String>, content: String) -> Result<String, String> {
-    // Default target = THIS window's document. Falling back to a global "current"
-    // here is what let an untitled window save over another window's file (#1).
-    let target = match path {
-        Some(p) => p,
-        None => app
-            .state::<AppState>()
-            .docs
-            .lock()
-            .unwrap()
-            .get(window.label())
-            .map(|d| d.path.clone())
-            .filter(|p| !p.is_empty())
-            .ok_or_else(|| "no current file".to_string())?,
-    };
-    fs::write(&target, &content).map_err(|e| e.to_string())?;
-    set_current(&app, window.label(), &target, &content);
-    Ok(target)
+fn detach_doc(window: tauri::WebviewWindow, state: tauri::State<AppState>) {
+    let old = state.docs.lock().unwrap().remove(window.label());
+    drop(old); // watcher drop outside the lock, same as set_current
+}
+
+#[tauri::command]
+fn write_file(app: AppHandle, window: tauri::WebviewWindow, path: String, content: String) -> Result<String, String> {
+    // Cluster A invariant: a plain save may ONLY write this window's bound
+    // document. Any other target is refused — writes to arbitrary paths go
+    // through save_dialog/materialize_doc/rename_file, which rebind atomically.
+    // This makes a wrong-file write structurally impossible even if the
+    // renderer's tab model has a bug.
+    let bound = app
+        .state::<AppState>()
+        .docs
+        .lock()
+        .unwrap()
+        .get(window.label())
+        .map(|d| d.path.clone())
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "no document bound to this window".to_string())?;
+    if canonical_key(Path::new(&path)) != canonical_key(Path::new(&bound)) {
+        return Err("refused: not this window's bound document (use Save As)".to_string());
+    }
+    fs::write(&bound, &content).map_err(|e| e.to_string())?;
+    set_current(&app, window.label(), &bound, &content);
+    Ok(bound)
 }
 
 #[derive(serde::Serialize)]
@@ -390,10 +457,9 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
         std::thread::spawn(move || read_tail(err, 8 * 1024))
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(SIDECAR_TIMEOUT_SECS);
-    let mut exit_status = None;
-    loop {
+    let exit_status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => { exit_status = Some(status); break; }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
@@ -404,7 +470,7 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
             }
             Err(e) => return json!({ "ok": false, "error": e.to_string() }),
         }
-    }
+    };
     let stdout = reader.and_then(|t| t.join().ok()).unwrap_or_default();
     if let Ok(v) = serde_json::from_slice::<Value>(&stdout) {
         return v;
@@ -417,8 +483,9 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
     let start = msg.char_indices().rev().nth(299).map(|(i, _)| i).unwrap_or(0);
     let tail = &msg[start..];
     let code_txt = exit_status
-        .map(|s| s.code().map(|c| c.to_string()).unwrap_or_else(|| "killed by signal".into()))
-        .unwrap_or_else(|| "?".into());
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "killed by signal".into());
     let error = if tail.is_empty() {
         format!("export helper exited (code {code_txt}) without producing a result")
     } else {
@@ -967,6 +1034,12 @@ fn materialize_doc(app: AppHandle, window: tauri::WebviewWindow, dir: Option<Str
 // never overwriting an existing file. Returns the new absolute path.
 #[tauri::command]
 fn rename_file(app: AppHandle, window: tauri::WebviewWindow, old_path: String, new_name: String) -> Option<String> {
+    // Same containment as write_file: only this window's bound document may be
+    // renamed from this window.
+    let bound = window_doc_path(&app, window.label())?;
+    if canonical_key(Path::new(&old_path)) != canonical_key(Path::new(&bound)) {
+        return None;
+    }
     let old = PathBuf::from(&old_path);
     let dir = old.parent()?.to_path_buf();
     let ext = old.extension().and_then(|e| e.to_str()).unwrap_or("md").to_string();
@@ -1531,11 +1604,14 @@ fn snapshot(app: AppHandle, window: tauri::WebviewWindow, content: String) {
     }
 }
 
-// Discard the crash-recovery snapshot for the open file (banner "Discard").
+// Discard the crash-recovery snapshot (banner "Discard", or a Don't-Save close
+// resolution). Cluster A: `path` is explicit when the discarded doc is a TAB
+// that isn't this window's binding; no path falls back to the binding (or the
+// untitled slot). An explicit discard must never resurrect on reopen.
 #[tauri::command]
-fn discard_recovery(app: AppHandle, window: tauri::WebviewWindow) {
-    match window_doc_path(&app, window.label()) {
-        Some(path) => { let _ = fs::remove_file(recovery_path(&path)); }
+fn discard_recovery(app: AppHandle, window: tauri::WebviewWindow, path: Option<String>) {
+    match path.filter(|p| !p.trim().is_empty()).or_else(|| window_doc_path(&app, window.label())) {
+        Some(p) => { let _ = fs::remove_file(recovery_path(&p)); }
         None => clear_untitled_recovery(window.label()),
     }
 }
@@ -1588,15 +1664,59 @@ fn discard_untitled_recovery(key: String) {
     clear_untitled_recovery(stem);
 }
 
-// Renderer-confirmed close of an untitled window (after its unsaved-changes
-// prompt): the user chose to discard, so drop the dirty flag AND the crash
-// snapshot (an explicit discard must not resurrect next launch), then destroy.
-// destroy() skips CloseRequested, so this can't re-enter the prompt loop.
+// Renderer-confirmed close (its Save/Don't-Save/Cancel flow fully resolved):
+// clear the pending-close marker, clear this window's untitled crash slot as a
+// backstop (per-tab path-backed snapshots were cleared by the renderer via
+// discard_recovery as each tab resolved), then destroy. destroy() skips
+// CloseRequested, so this can't re-enter the prompt loop.
 #[tauri::command]
 fn close_window_now(app: AppHandle, window: tauri::WebviewWindow) {
-    app.state::<AppState>().untitled_dirty.lock().unwrap().remove(window.label());
+    app.state::<AppState>().pending_close.lock().unwrap().remove(window.label());
     clear_untitled_recovery(window.label());
     let _ = window.destroy();
+}
+
+// Bridge auto-ACK of close-requested receipt (fires in ms when the webview is
+// alive). After the ack the native side waits INDEFINITELY for the user's
+// confirm/cancel — the deadline only guards against a dead renderer.
+#[tauri::command]
+fn close_prompt_ack(window: tauri::WebviewWindow, state: tauri::State<AppState>) {
+    if let Some(m) = state.pending_close.lock().unwrap().get_mut(window.label()) {
+        m.1 = true;
+    }
+}
+
+// The renderer's prompt flow aborted (any Cancel, failed Save-As, Escape):
+// clear the pending marker so the next close re-prompts cleanly, and abort any
+// in-flight ⌘Q — Cancel in one window stops the whole quit (macOS convention).
+#[tauri::command]
+fn cancel_close(window: tauri::WebviewWindow, state: tauri::State<AppState>) {
+    state.pending_close.lock().unwrap().remove(window.label());
+    state.quitting.store(false, Ordering::SeqCst);
+}
+
+// ⌘Q / File▸Exit: fan the standard per-window close flow out to every doc
+// window (each hits CloseRequested → always-prevent → close-requested; clean
+// windows auto-confirm instantly on the renderer side). The predefined Quit
+// menu item calls `NSApp terminate:` directly and never reaches ExitRequested
+// (verified against muda/tao), so quit MUST be a custom item routed here.
+fn request_quit(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    st.quitting.store(true, Ordering::SeqCst);
+    let wins: Vec<_> = app
+        .webview_windows()
+        .into_values()
+        .filter(|w| !w.label().starts_with("pdf"))
+        .collect();
+    if wins.is_empty() {
+        app.exit(0); // nothing to prompt — quit immediately
+        return;
+    }
+    for w in wins {
+        let _ = w.close();
+    }
+    // When the last window is destroyed with `quitting` set, the runtime's
+    // ExitRequested{code:None} is allowed through and the process exits.
 }
 
 // ---- Claude Code sessions + context ----
@@ -2020,6 +2140,13 @@ fn open_files(app: &AppHandle) -> HashSet<PathBuf> {
             set.insert(canonical_key(Path::new(f)));
         }
     }
+    // Cluster A delta 4: BACKGROUND tabs count as open — the user opened them,
+    // so they stay in the agent write scope even while another tab is active.
+    for tabs in st.open_tabs.lock().unwrap().values() {
+        for p in tabs {
+            set.insert(p.clone());
+        }
+    }
     set
 }
 
@@ -2083,6 +2210,24 @@ mod tests {
     }
 
     #[test]
+    fn close_gate_policy_covers_live_dead_and_hung_renderers() {
+        // Fresh close → prompt.
+        assert_eq!(close_action(None), CloseAction::Emit);
+        // Prompt acked and live (user reading the dialog) → swallow duplicate
+        // closes; native never destroys on its own after an ack, no matter how
+        // long the user deliberates.
+        assert_eq!(close_action(Some((Duration::from_millis(10), true))), CloseAction::Swallow);
+        assert_eq!(close_action(Some((Duration::from_secs(9), true))), CloseAction::Swallow);
+        // Second click within the ack window → swallow (round-trip in flight).
+        assert_eq!(close_action(Some((Duration::from_millis(200), false))), CloseAction::Swallow);
+        // Un-acked past the deadline (ack timer missed somehow) → re-emit.
+        assert_eq!(close_action(Some((Duration::from_secs(2), false))), CloseAction::Emit);
+        // Acked but never resolved for a long time (hung after ack) → re-prompt
+        // instead of leaving the window permanently unclosable.
+        assert_eq!(close_action(Some((CLOSE_REPROMPT_AFTER, true))), CloseAction::Emit);
+    }
+
+    #[test]
     fn untitled_recovery_key_cannot_escape_recovery_dir() {
         // A hostile key (e.g. via discard_untitled_recovery) must sanitize into a
         // flat file name inside the recovery dir — never a traversal.
@@ -2095,30 +2240,33 @@ mod tests {
 }
 
 // The renderer reports per-document dirty state so writeDocument can refuse to
-// clobber a buffer with unsaved edits (P1-4). Keyed by canonical path. A null
-// path means THIS window's untitled buffer — tracked by label so close can
-// intercept and prompt before the content is lost (#4).
+// clobber a buffer with unsaved edits (P1-4). Cluster A contract: explicit
+// path, path-backed docs only, and the renderer is the SINGLE live writer
+// (pushes on every transition, clears on tab close/save). Untitled dirty state
+// is renderer-internal now — the close flow no longer consults native flags.
 #[tauri::command]
-fn set_doc_dirty(window: tauri::WebviewWindow, state: tauri::State<AppState>, path: Option<String>, dirty: bool) {
-    match path {
-        Some(p) => {
-            let key = canonical_key(Path::new(&p)).to_string_lossy().to_string();
-            let mut set = state.dirty_files.lock().unwrap();
-            if dirty {
-                set.insert(key);
-            } else {
-                set.remove(&key);
-            }
-        }
-        None => {
-            let mut set = state.untitled_dirty.lock().unwrap();
-            if dirty {
-                set.insert(window.label().to_string());
-            } else {
-                set.remove(window.label());
-            }
-        }
+fn set_doc_dirty(state: tauri::State<AppState>, path: String, dirty: bool) {
+    let key = canonical_key(Path::new(&path)).to_string_lossy().to_string();
+    let mut set = state.dirty_files.lock().unwrap();
+    if dirty {
+        set.insert(key);
+    } else {
+        set.remove(&key);
     }
+}
+
+// Cluster A delta 4: the renderer registers THIS window's full open tab
+// path-set (canonical) on every tab add/remove/retarget and at startup. Keeps
+// background tabs inside the agent write scope + listOpenFiles, and gives the
+// Destroyed-time dirty_files GC its sweep set.
+#[tauri::command]
+fn set_open_paths(window: tauri::WebviewWindow, state: tauri::State<AppState>, paths: Vec<String>) {
+    let set: Vec<PathBuf> = paths
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| canonical_key(Path::new(p)))
+        .collect();
+    state.open_tabs.lock().unwrap().insert(window.label().to_string(), set);
 }
 
 // The window that should receive an open request: the focused one, else main.
@@ -2262,25 +2410,35 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
             }
         }
         "listOpenFiles" => {
-            // Every window's document, with real dirty + focused flags — the old
-            // single-global answer hid all but one window from agents.
-            let focused = focused_label(app);
+            // Cluster A: every open TAB across every window (renderer-registered
+            // via set_open_paths), deduped, unioned with bound docs so windows
+            // that haven't pushed a tab set yet still report. `focused` marks
+            // the focused window's ACTIVE (bound) document.
+            let focused_path = focused_doc(app).map(|p| canonical_key(Path::new(&p)));
             let st = app.state::<AppState>();
-            let files: Vec<Value> = {
-                let docs = st.docs.lock().unwrap();
-                let dirty = st.dirty_files.lock().unwrap();
-                docs.iter()
-                    .filter(|(_, d)| !d.path.is_empty())
-                    .map(|(label, d)| {
-                        let key = canonical_key(Path::new(&d.path)).to_string_lossy().to_string();
-                        json!({
-                            "path": d.path,
-                            "dirty": dirty.contains(&key),
-                            "focused": focused.as_deref() == Some(label.as_str()),
-                        })
+            let mut all: Vec<PathBuf> = vec![];
+            for tabs in st.open_tabs.lock().unwrap().values() {
+                all.extend(tabs.iter().cloned());
+            }
+            for d in st.docs.lock().unwrap().values() {
+                if !d.path.is_empty() {
+                    all.push(canonical_key(Path::new(&d.path)));
+                }
+            }
+            let dirty = st.dirty_files.lock().unwrap();
+            let mut seen = HashSet::new();
+            let files: Vec<Value> = all
+                .into_iter()
+                .filter(|p| seen.insert(p.clone()))
+                .map(|p| {
+                    let key = p.to_string_lossy().to_string();
+                    json!({
+                        "path": key,
+                        "dirty": dirty.contains(&key),
+                        "focused": focused_path.as_ref() == Some(&p),
                     })
-                    .collect()
-            };
+                })
+                .collect();
             json!({ "ok": true, "files": files })
         }
         "windows" => {
@@ -2446,10 +2604,12 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
         .item(&mi("publishGoogle", "Publish to Google Docs…", None)?)
         .separator()
         .item(&PredefinedMenuItem::close_window(app, Some("Close"))?);
-    // No macOS app menu on Windows/Linux — Quit belongs under File there.
+    // No macOS app menu on Windows/Linux — Quit belongs under File there. It is
+    // a CUSTOM item (not PredefinedMenuItem::quit) so quit routes through the
+    // per-window close-prompt fan-out instead of terminating instantly.
     #[cfg(not(target_os = "macos"))]
     {
-        file_b = file_b.separator().quit();
+        file_b = file_b.separator().item(&mi("quit", "Exit", Some("CmdOrCtrl+Q"))?);
     }
     let file = file_b.build()?;
 
@@ -2526,6 +2686,10 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
     // Quit ⌘Q (#2). Windows/Linux skip it: Quit lives under File there instead.
     #[cfg(target_os = "macos")]
     {
+        // Quit is a CUSTOM item: the predefined one calls NSApp terminate:
+        // directly (never reaching ExitRequested), which would skip the
+        // unsaved-changes fan-out entirely. ⌘Q now runs the same per-window
+        // close-prompt flow as ⌘W (cluster A pillar 3).
         let app_menu = SubmenuBuilder::new(app, "Plume")
             .about(None)
             .separator()
@@ -2535,7 +2699,7 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
             .hide_others()
             .show_all()
             .separator()
-            .quit()
+            .item(&mi("quit", "Quit Plume", Some("CmdOrCtrl+Q"))?)
             .build()?;
         mb = mb.item(&app_menu);
     }
@@ -2608,9 +2772,14 @@ fn main() {
             agent_reply,
             set_recent_files,
             set_doc_dirty,
+            set_open_paths,
+            bind_doc,
+            detach_doc,
             untitled_recovery,
             discard_untitled_recovery,
-            close_window_now
+            close_window_now,
+            close_prompt_ack,
+            cancel_close
         ])
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();
@@ -2618,6 +2787,11 @@ fn main() {
             // path is the sentinel `initial_file` reads as "untitled".
             if id == "new" {
                 let _ = spawn_window(app, "");
+                return;
+            }
+            // ⌘Q / File▸Exit: renderer-authoritative quit via per-window fan-out.
+            if id == "quit" {
+                request_quit(app);
                 return;
             }
             // File > Open with no window alive (macOS after ⌘W): there is no
@@ -2652,41 +2826,89 @@ fn main() {
             }
             match event {
                 // Closing a doc with unsaved edits would lose them — hold the
-                // close and let the renderer prompt Save / Don't Save / Cancel.
-                // Two dirty sources: an untitled buffer (only copy is in memory,
-                // tracked by window label) and a path-backed file with unsaved
-                // edits (tracked by canonical path in dirty_files). Both emit the
-                // same "close-requested" the renderer already resolves via
-                // save / Save As / close_window_now.
+                // Cluster A pillar 3 — close is RENDERER-AUTHORITATIVE: native
+                // always prevents and emits close-requested; the renderer owns
+                // the full tab set + dirty state, prompts every dirty tab, and
+                // resolves via close_window_now (proceed) or cancel_close
+                // (abort). Native consults NO dirty flags here. Liveness: the
+                // bridge auto-ACKs receipt; no ack within CLOSE_ACK_DEADLINE
+                // means the webview is dead → destroy natively (crash-recovery
+                // snapshots are the data net).
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     let app = window.app_handle();
                     let st = app.state::<AppState>();
-                    let dirty = match window_doc_path(app, &label) {
-                        None => st.untitled_dirty.lock().unwrap().contains(&label),
-                        Some(p) => {
-                            let key = canonical_key(Path::new(&p)).to_string_lossy().to_string();
-                            st.dirty_files.lock().unwrap().contains(&key)
+                    api.prevent_close();
+                    let action = {
+                        let mut pend = st.pending_close.lock().unwrap();
+                        let entry = pend.get(&label).map(|(t, a)| (t.elapsed(), *a));
+                        let action = close_action(entry);
+                        if action == CloseAction::Emit {
+                            pend.insert(label.clone(), (std::time::Instant::now(), false));
                         }
+                        action
                     };
-                    if dirty {
-                        api.prevent_close();
-                        let _ = app.emit_to(&label, "close-requested", json!({}));
+                    if action == CloseAction::Swallow {
+                        return; // a prompt round-trip is already in flight
                     }
+                    let _ = app.emit_to(&label, "close-requested", json!({}));
+                    let appc = app.clone();
+                    let lbl = label.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(CLOSE_ACK_DEADLINE);
+                        let st = appc.state::<AppState>();
+                        let dead = matches!(
+                            st.pending_close.lock().unwrap().get(&lbl),
+                            Some((_, false))
+                        );
+                        if dead {
+                            eprintln!(
+                                "plume: window {lbl} never ACKed close-requested within {CLOSE_ACK_DEADLINE:?} — treating renderer as dead, closing"
+                            );
+                            st.pending_close.lock().unwrap().remove(&lbl);
+                            let a2 = appc.clone();
+                            let l2 = lbl.clone();
+                            let _ = appc.run_on_main_thread(move || {
+                                if let Some(w) = a2.get_webview_window(&l2) {
+                                    let _ = w.destroy();
+                                }
+                            });
+                        }
+                    });
                 }
-                // Window gone: retire its doc state so the agent write scope and
-                // dirty set shrink with it (a dead window must not pin either).
+                // Window gone: retire its doc state so the agent write scope
+                // shrinks with it, and GC dirty_files (coord-ratified nuance):
+                // sweep THIS window's registered tab paths — death-cleanup for a
+                // crashed renderer that can't clear its own flags — but never a
+                // path another live window still lists.
                 tauri::WindowEvent::Destroyed => {
                     let app = window.app_handle();
                     let st = app.state::<AppState>();
                     let old = st.docs.lock().unwrap().remove(&label);
+                    let mut swept: Vec<PathBuf> =
+                        st.open_tabs.lock().unwrap().remove(&label).unwrap_or_default();
                     if let Some(d) = &old {
                         if !d.path.is_empty() {
-                            let key = canonical_key(Path::new(&d.path)).to_string_lossy().to_string();
-                            st.dirty_files.lock().unwrap().remove(&key);
+                            swept.push(canonical_key(Path::new(&d.path)));
+                        }
+                    }
+                    let survivors: HashSet<PathBuf> = st
+                        .open_tabs
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .flatten()
+                        .cloned()
+                        .collect();
+                    {
+                        let mut dirty = st.dirty_files.lock().unwrap();
+                        for p in swept {
+                            if !survivors.contains(&p) {
+                                dirty.remove(&p.to_string_lossy().to_string());
+                            }
                         }
                     }
                     st.window_files.lock().unwrap().remove(&label);
-                    st.untitled_dirty.lock().unwrap().remove(&label);
+                    st.pending_close.lock().unwrap().remove(&label);
                     drop(old); // watcher dropped outside any state lock
                 }
                 _ => {}
@@ -2749,11 +2971,13 @@ fn main() {
                     }
                 }
                 // macOS convention (#2): closing the last window (⌘W) keeps the
-                // app alive in the Dock; only an explicit quit (⌘Q → exit code)
-                // ends the process. exit(0) arrives with code Some(0), so only
-                // the implicit all-windows-closed request (code None) is held.
+                // app alive in the Dock; only an explicit quit ends the process.
+                // exit(0) arrives with code Some(0). The implicit request (code
+                // None, all windows closed) is held UNLESS a ⌘Q fan-out is in
+                // flight — then the last confirmed close completes the quit.
                 tauri::RunEvent::ExitRequested { api, code, .. } => {
-                    if code.is_none() {
+                    let quitting = _app.state::<AppState>().quitting.load(Ordering::SeqCst);
+                    if code.is_none() && !quitting {
                         api.prevent_exit();
                     }
                 }
