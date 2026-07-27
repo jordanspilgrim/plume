@@ -65,3 +65,20 @@ export function isCapturedDirty(tab) {
 export function isBlankTab(tab) {
   return !tab.path && !(tab.text && tab.text.length);
 }
+
+// The user-initiated close decision (owner UAT decision 2026-07-27): a dirty
+// doc always prompts Save / Don't Save / Cancel — never a silent write.
+//   closeDecision({dirty, hasPath})            → "close" | "prompt"
+//   closeDecision({dirty, hasPath}, choice)    → the action for that choice:
+//     "save"    → "save-then-close" (has a path) | "saveas-then-close" (untitled)
+//     "discard" → "close" (drop the buffer; nothing is written)
+//     anything else (cancel / Escape / backdrop) → "stay"
+// Both the window close-requested handler and the tab-close path route through
+// this so the two prompts can never drift apart.
+export function closeDecision({ dirty, hasPath }, choice) {
+  if (!dirty) return "close";
+  if (choice == null) return "prompt";
+  if (choice === "save") return hasPath ? "save-then-close" : "saveas-then-close";
+  if (choice === "discard") return "close";
+  return "stay";
+}

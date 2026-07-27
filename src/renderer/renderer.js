@@ -20,6 +20,7 @@ import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from 
 import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId, tabDisplayName, isCapturedDirty, isBlankTab,
+  closeDecision,
 } from "./tabs-model.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
@@ -168,38 +169,21 @@ function scheduleSideEffects() {
 }
 
 function autosaveEnabled() { return localStorage.getItem("plume-autosave") !== "0"; }
-function autosaveDir() { return localStorage.getItem("plume-autosave-dir") || ""; }
-
-// Derive a filename from the first non-empty line (heading/bullet markers
-// stripped, slugified); fall back to a timestamp.
-function deriveDocName(text) {
-  const first = (text.split("\n").find((l) => l.trim()) || "").trim();
-  const cleaned = first.replace(/^#{1,6}\s+/, "").replace(/^[-*+]\s+/, "").replace(/^\d+[.)]\s+/, "").trim();
-  const slug = cleaned.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
-  if (slug) return slug;
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, "0");
-  return `note-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
-}
 
 let autosaving = false;
+// Autosave writes an OPEN (path-backed) file back to its own path. Untitled
+// buffers are deliberately NOT materialized here — owner decision from UAT:
+// closing must prompt Save / Don't Save / Cancel, never silently create a file
+// in ~/Documents/Plume. Untitled stays untitled until an explicit save (⌘S,
+// Save As, or the close prompt); crash recovery still snapshots it separately.
 async function autosave() {
-  if (!autosaveEnabled() || autosaving) return;
+  if (!autosaveEnabled() || autosaving || !currentPath) return;
   const text = view.state.doc.toString();
+  if (text === savedText) return;
   autosaving = true;
   try {
-    if (currentPath) {
-      if (text === savedText) return;
-      const result = await window.plume.save(text);
-      if (result) { savedText = text; setDirty(false); }
-      return;
-    }
-    // Untitled: auto-place into the configured folder once it has real content
-    // (markdown docs only — a code/config buffer shouldn't become a stray .md).
-    if (!text.trim() || currentMode !== "markdown") return;
-    const name = pendingName || deriveDocName(text);
-    const p = await window.plume.materializeDoc(autosaveDir(), name, text);
-    if (p) { pendingName = null; setTitle(p); savedText = text; setDirty(false); }
+    const result = await window.plume.save(text);
+    if (result) { savedText = text; setDirty(false); }
   } finally {
     autosaving = false;
   }
@@ -1502,17 +1486,12 @@ function shareMenuItems() {
   ];
 }
 function applyAutosave(on) { localStorage.setItem("plume-autosave", on ? "1" : "0"); }
-async function pickAutosaveFolder() {
-  const dir = await window.plume.pickFolder();
-  if (dir) { localStorage.setItem("plume-autosave-dir", dir); flashMessage("New documents will save to " + dir); }
-}
 function settingsMenuItems() {
   const theme = localStorage.getItem("plume-theme") || "system";
   const reveal = localStorage.getItem("plume-reveal") === "1";
   const focus = localStorage.getItem("plume-focus") === "1";
   const curFont = localStorage.getItem("plume-font") || "inter";
   const autosaveOn = localStorage.getItem("plume-autosave") !== "0";
-  const saveDir = localStorage.getItem("plume-autosave-dir") || "";
   const wide = localStorage.getItem("plume-wide") === "1";
   return [
     { label: "Appearance: System", fn: () => applyTheme("system"), checked: theme === "system" },
@@ -1521,8 +1500,9 @@ function settingsMenuItems() {
     { sep: true },
     { label: "Formatting toolbar", fn: () => applyToolbarSetting(!toolbarEnabled()), checked: toolbarEnabled() },
     { label: "Wide mode (full width — for tables)", fn: () => applyWide(!wide), checked: wide },
-    { label: "Autosave (new docs auto-save to a folder)", fn: () => applyAutosave(!autosaveOn), checked: autosaveOn },
-    { label: saveDir ? `New docs folder · ${saveDir.split("/").pop()}…` : "New docs folder · Documents/Plume…", fn: () => pickAutosaveFolder() },
+    // Autosave covers open (saved) documents only — new/untitled docs are never
+    // silently placed on disk; they prompt on close instead (owner decision).
+    { label: "Autosave open documents", fn: () => applyAutosave(!autosaveOn), checked: autosaveOn },
     { sep: true },
     { label: "Reveal markdown marks", fn: () => applyReveal(!reveal), checked: reveal },
     { label: "Focus mode", fn: () => applyFocus(!focus), checked: focus },
@@ -2317,25 +2297,41 @@ async function closeTabRequest(id) {
   return closeActiveTab();
 }
 
-async function closeActiveTab() {
-  if (titlebar.classList.contains("dirty")) {
-    const name = currentPath ? currentPath.split("/").pop() : (pendingName || "Untitled");
-    const choice = await askConfirm({
-      message: `Save changes to “${name}”?`,
-      detail: "Your changes will be lost if you close this tab without saving.",
-      buttons: [
-        { label: "Save", kind: "primary", value: "save" },
-        { label: "Don't Save", kind: "danger", value: "discard" },
-        { label: "Cancel", kind: "ghost", value: "cancel" },
-      ],
-    });
-    if (choice !== "save" && choice !== "discard") return;
-    if (choice === "save") {
-      if (currentPath) await save();
-      else if (!(await saveAs())) return; // dialog cancelled — keep the tab
-      if (titlebar.classList.contains("dirty")) return; // save failed — don't drop edits
-    }
+// Ask Save / Don't Save / Cancel for the active doc; shared by tab close and
+// window close so the two prompts stay identical.
+function promptSaveChoice(detail) {
+  const name = currentPath ? currentPath.split("/").pop() : (pendingName || "Untitled");
+  return askConfirm({
+    message: `Save changes to “${name}”?`,
+    detail,
+    buttons: [
+      { label: "Save", kind: "primary", value: "save" },
+      { label: "Don't Save", kind: "danger", value: "discard" },
+      { label: "Cancel", kind: "ghost", value: "cancel" },
+    ],
+  });
+}
+
+// Resolve the close decision for the ACTIVE doc, running the prompt and any
+// requested save. Returns true when the close may proceed.
+async function resolveCloseOfActiveDoc(detail) {
+  const state = () => ({ dirty: titlebar.classList.contains("dirty"), hasPath: !!currentPath });
+  let action = closeDecision(state());
+  if (action === "prompt") action = closeDecision(state(), (await promptSaveChoice(detail)) ?? "cancel");
+  if (action === "stay") return false;
+  if (action === "save-then-close") {
+    await save();
+    return !titlebar.classList.contains("dirty"); // save failed → keep the doc open
   }
+  if (action === "saveas-then-close") {
+    if (!(await saveAs())) return false; // dialog cancelled — keep the doc open
+    return !titlebar.classList.contains("dirty");
+  }
+  return true; // "close": clean doc, or an explicit Don't Save (buffer is dropped, nothing written)
+}
+
+async function closeActiveTab() {
+  if (!(await resolveCloseOfActiveDoc("Your changes will be lost if you close this tab without saving."))) return;
   const r = closeTab(tabs, activeTabId);
   tabs = r.tabs;
   activeTabId = r.nextActiveId;
@@ -2377,23 +2373,11 @@ window.plume.onFolderOpen(({ dir }) => {
 });
 
 // #4 (renderer side): the native side held this window's close because its
-// untitled buffer has unsaved edits. Prompt, then save or confirm the close.
+// doc has unsaved edits (untitled today; dirty saved docs once be-dev extends
+// the gate). Same decision path as tab close: prompt, save if asked, then
+// complete or abandon the close. Don't Save never writes anything.
 window.plume.onCloseRequested?.(async () => {
-  const name = currentPath ? currentPath.split("/").pop() : (pendingName || "Untitled");
-  const choice = await askConfirm({
-    message: `Save changes to “${name}”?`,
-    detail: "Your changes will be lost if you don't save them.",
-    buttons: [
-      { label: "Save", kind: "primary", value: "save" },
-      { label: "Don't Save", kind: "danger", value: "discard" },
-      { label: "Cancel", kind: "ghost", value: "cancel" },
-    ],
-  });
-  if (choice === "save") {
-    if (currentPath) await save();
-    else await saveAs(); // Save As dialog; cancelling it keeps the window open
-    if (!titlebar.classList.contains("dirty")) window.plume.confirmClose?.();
-  } else if (choice === "discard") {
+  if (await resolveCloseOfActiveDoc("Your changes will be lost if you don't save them.")) {
     window.plume.confirmClose?.();
   }
 });
