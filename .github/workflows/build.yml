@@ -13,7 +13,44 @@ permissions:
   contents: read
 
 jobs:
+  # The gate. Until this existed, CI compiled the app and shipped a green check
+  # without ever running a single test — so a regression that reintroduced the
+  # export SSRF, a socket-write escape, or a lock/hang bug would have passed CI
+  # clean. `build` depends on this job, so no bundle is produced from a tree
+  # whose tests fail.
+  test:
+    name: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # Also a gate in its own right: the renderer/bridge/sidecar bundle must
+      # build, and the sidecar tests exercise what this produces.
+      - name: Build frontend (renderer + bridge + sidecar)
+        run: npm run tauri:frontend
+
+      - name: JS tests (sidecar, export SSRF, OAuth, MCP)
+        run: npm test
+
+      - name: Rust tests (node probe, containment, parsing)
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:

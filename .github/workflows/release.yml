@@ -19,7 +19,36 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Runs BEFORE the signing job, and holds no secrets and no write permission.
+  # Two reasons it's a separate job rather than steps inside `macos`: a broken
+  # tree can't reach code signing + notarization at all, and the Apple cert and
+  # updater key are never injected into a run that was going to fail anyway.
+  test:
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Deliberately the SAME node-version as the signing job below (20), not
+      # build.yml's 22: a gate that tests a different runtime than the one the
+      # release is built with isn't gating the release. Keep the two in lockstep
+      # if either moves. (The 20-vs-22 split between this workflow and build.yml
+      # is pre-existing and worth resolving separately.)
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: { node-version: 20, cache: npm }
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: "./src-tauri -> target" }
+
+      - run: npm ci
+      - run: npm run tauri:frontend
+      - name: JS tests (sidecar, export SSRF, OAuth, MCP)
+        run: npm test
+      - name: Rust tests (node probe, containment, parsing)
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
   macos:
+    needs: test
     runs-on: macos-14
     permissions:
       contents: write
