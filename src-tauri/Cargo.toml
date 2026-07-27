@@ -42,7 +42,7 @@ glib = "0.18"
 [target.'cfg(windows)'.dependencies]
 interprocess = "2"
 webview2-com = "0.38"
-windows = { version = "0.61", features = ["Win32_Foundation"] }
+windows = { version = "0.62", features = ["Win32_Foundation"] }
 
 [profile.release]
 opt-level = "s"
