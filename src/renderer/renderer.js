@@ -721,7 +721,12 @@ async function exportAs(format) {
   if (format === "docx" && !(await ensureExportRuntime())) return;
   const html = fullHtmlDocument(mdToHtml(view.state.doc.toString()), docBaseName());
   const result = await window.plume.exportDoc(format, html, docBaseName());
-  if (result) flashMessage("Exported " + result.split("/").pop());
+  if (result?.ok && result.path) {
+    flashMessage("Exported " + result.path.split("/").pop());
+  } else if (result && !result.ok && !result.cancelled) {
+    // F2: a failed export must say so — silence reads as "nothing happened".
+    flashMessage("Export failed: " + (result.error || "unknown error"));
+  }
 }
 async function publishGoogle(retried = false) {
   if (currentMode !== "markdown") { flashMessage("Publish to Google Docs works on Markdown documents."); return; }
@@ -732,6 +737,17 @@ async function publishGoogle(retried = false) {
   // run the enable flow once, then retry the publish.
   if (!retried && r && r.ok === false && r.code === "NODE_MISSING") {
     if (await ensureExportRuntime()) return publishGoogle(true);
+    return;
+  }
+  if (r?.ok) {
+    flashMessage("Published — opening the Google Doc…");
+  } else if (r?.code === "NO_CREDS") {
+    flashMessage("Google publish needs a one-time OAuth client (~/.plume/google.json) — see docs/agent-setup.md.");
+  } else if (r?.code === "OAUTH_TIMEOUT" || r?.code === "OAUTH_DENIED") {
+    flashMessage("Google sign-in wasn't completed — publish cancelled. Try again when ready.");
+  } else {
+    // F2: covers helper crashes (r.error carries the reason) and null results.
+    flashMessage("Publish failed: " + (r?.error || "no response from the export helper"));
   }
 }
 

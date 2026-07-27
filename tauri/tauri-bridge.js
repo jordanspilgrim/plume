@@ -122,11 +122,19 @@ window.plume = {
   linkPreview: (url) => invoke("link_preview", { url }).catch(() => null),
 
   openInNewWindow: (filePath) => invoke("open_in_new_window", { filePath }).catch(() => null),
-  exportDoc: (format, html, defaultName) =>
-    (format === "pdf"
-      ? invoke("export_pdf", { html, defaultName })
-      : invoke("export_doc", { format, html, defaultName })
-    ).catch(() => null),
+  // Normalized export result (F2): { ok, path?, error?, cancelled? }.
+  // pdf/html stay native; export_pdf still returns a bare path where null means
+  // cancelled-or-failed (indistinguishable), so it maps to a silent cancel —
+  // same visible behavior as before, no false error flashes on dialog cancel.
+  exportDoc: async (format, html, defaultName) => {
+    if (format === "pdf") {
+      const p = await invoke("export_pdf", { html, defaultName }).catch(() => null);
+      return p ? { ok: true, path: p } : { ok: false, cancelled: true };
+    }
+    const r = await invoke("export_doc", { format, html, defaultName })
+      .catch((e) => ({ ok: false, error: String(e) }));
+    return r && typeof r === "object" ? r : { ok: false, error: "no result from export" };
+  },
 
   publishGoogle: async (content, defaultName) => {
     const r = await invoke("publish_google", { markdown: content, defaultName }).catch(() => null);
