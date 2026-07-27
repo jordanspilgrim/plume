@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "identifier": "ai.plume.desktop",
   "build": {
-    "frontendDist": "../build-tauri"
+    "frontendDist": "../build-tauri",
+    "beforeBuildCommand": "npm run tauri:frontend",
+    "beforeDevCommand": "npm run tauri:frontend"
   },
   "plugins": {
     "deep-link": {
@@ -39,7 +41,14 @@
             "**/.npmrc", "**/.pypirc", "**/secrets/**",
             "**/Library/Keychains/**", "**/*.keychain*",
             "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx", "**/*.ovpn",
-            "**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*", "**/id_dsa*"
+            "**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*", "**/id_dsa*",
+
+            "**/.git/**", "**/.gitconfig",
+            "**/.pgpass", "**/.my.cnf", "**/.dockercfg",
+            "**/.history", "**/.lesshst", "**/.*_history",
+
+            "**/.envrc", "**/.htpasswd",
+            "**/*.p8", "**/*.jks", "**/*.keystore"
           ]
         }
       }
