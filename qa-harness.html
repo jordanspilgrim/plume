@@ -37,7 +37,7 @@
         },
         save: async (content) => { window.__stub.calls.push(["save", content.length]); return "/fake/a.md"; },
         saveAs: async () => null,
-        materializeDoc: async () => null,
+        materializeDoc: async (dir, name) => { window.__stub.calls.push(["materializeDoc", name]); return "/fake/materialized/" + name + ".md"; },
         renameFile: async () => null,
         pickFolder: async () => null,
         defaultDocsDir: async () => null,

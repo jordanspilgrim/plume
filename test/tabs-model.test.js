@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId,
-  tabDisplayName, isCapturedDirty, isBlankTab,
+  tabDisplayName, isCapturedDirty, isBlankTab, closeDecision,
 } from "../src/renderer/tabs-model.js";
 
 test("createTab: unique ids, defaults, partial override", () => {
@@ -81,4 +81,35 @@ test("isBlankTab: no path and no captured content", () => {
   assert.equal(isBlankTab(createTab({ text: "" })), true);
   assert.equal(isBlankTab(createTab({ text: "hi" })), false);
   assert.equal(isBlankTab(createTab({ path: "/x.md" })), false);
+});
+
+// Owner UAT decision (2026-07-27): closing a dirty doc PROMPTS — never a
+// silent write. Matrix: {clean, dirty-untitled, dirty-saved} × {save, discard,
+// cancel/escape}.
+test("closeDecision: clean docs close immediately, no prompt", () => {
+  assert.equal(closeDecision({ dirty: false, hasPath: false }), "close");
+  assert.equal(closeDecision({ dirty: false, hasPath: true }), "close");
+  // Even with a stray choice supplied, clean stays a plain close.
+  assert.equal(closeDecision({ dirty: false, hasPath: true }, "save"), "close");
+});
+
+test("closeDecision: dirty docs prompt before anything happens", () => {
+  assert.equal(closeDecision({ dirty: true, hasPath: false }), "prompt");
+  assert.equal(closeDecision({ dirty: true, hasPath: true }), "prompt");
+});
+
+test("closeDecision: Save routes by path — Save As for untitled, in-place for saved", () => {
+  assert.equal(closeDecision({ dirty: true, hasPath: false }, "save"), "saveas-then-close");
+  assert.equal(closeDecision({ dirty: true, hasPath: true }, "save"), "save-then-close");
+});
+
+test("closeDecision: Don't Save closes without writing", () => {
+  assert.equal(closeDecision({ dirty: true, hasPath: false }, "discard"), "close");
+  assert.equal(closeDecision({ dirty: true, hasPath: true }, "discard"), "close");
+});
+
+test("closeDecision: Cancel / Escape / unknown keep the doc open", () => {
+  assert.equal(closeDecision({ dirty: true, hasPath: false }, "cancel"), "stay");
+  assert.equal(closeDecision({ dirty: true, hasPath: true }, "cancel"), "stay");
+  assert.equal(closeDecision({ dirty: true, hasPath: true }, "bogus"), "stay");
 });
