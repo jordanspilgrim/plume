@@ -79,11 +79,16 @@ export function isBlankTab(tab) {
 //     anything else (cancel / Escape / backdrop) → "stay"
 // Both the window close-requested handler and the tab-close path route through
 // this so the two prompts can never drift apart.
-export function closeDecision({ dirty, hasPath }, choice) {
-  if (!dirty) return "close";
+// SAVEFLOW: `isDraft` marks an Autosave-backed draft. A NON-EMPTY draft
+// prompts on close REGARDLESS of dirty — it is autosaved-clean by then; the
+// prompt is about it never having been deliberately saved (owner option B).
+// Draft choices: save → graduate via Save As; discard → DELETE the draft file
+// (deferred to confirmClose by the caller); cancel → stay.
+export function closeDecision({ dirty, hasPath, isDraft = false, empty = false }, choice) {
+  if (isDraft ? empty : !dirty) return "close";
   if (choice == null) return "prompt";
-  if (choice === "save") return hasPath ? "save-then-close" : "saveas-then-close";
-  if (choice === "discard") return "close";
+  if (choice === "save") return (hasPath && !isDraft) ? "save-then-close" : "saveas-then-close";
+  if (choice === "discard") return isDraft ? "delete-draft-then-close" : "close";
   return "stay";
 }
 
@@ -91,6 +96,16 @@ export function closeDecision({ dirty, hasPath }, choice) {
 // every captured-dirty tab except the active one (the active doc is resolved
 // live, first). Renderer-authoritative close: each of these gets its own
 // Save / Don't Save / Cancel; none may be dropped silently.
+// SAVEFLOW: "is a draft" is DERIVED from the path, never stored — the same
+// anti-desync rule the native side follows (coord ruling, cluster-A lesson).
+const DRAFT_DIR_RE = /\/Plume\/Autosave\//;
+export function isDraftTab(tab) {
+  return !!(tab && tab.path && DRAFT_DIR_RE.test(tab.path) && !tab.unbound);
+}
+
 export function dirtyBackgroundTabs(tabs, activeId) {
-  return tabs.filter((t) => t.id !== activeId && isCapturedDirty(t));
+  // A background DRAFT with content also needs a decision even when captured
+  // clean — drafts prompt on close regardless of dirty (SAVEFLOW option B).
+  return tabs.filter((t) => t.id !== activeId &&
+    (isCapturedDirty(t) || (isDraftTab(t) && t.text != null && t.text.trim().length > 0)));
 }

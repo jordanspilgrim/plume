@@ -20,7 +20,7 @@ import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from 
 import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId, tabDisplayName, isCapturedDirty, isBlankTab,
-  closeDecision, dirtyBackgroundTabs,
+  closeDecision, dirtyBackgroundTabs, isDraftTab,
 } from "./tabs-model.js";
 import { mdToHtml, fullHtmlDocument } from "./editor/export.js";
 import "katex/dist/katex.min.css";
@@ -156,7 +156,10 @@ function scheduleSideEffects() {
   // file-backed window can misfile its snapshot into that file's recovery
   // slot — benign, user-confirmed banner content only; merge order handles it.)
   if (snapshotTimer) clearTimeout(snapshotTimer);
-  snapshotTimer = setTimeout(() => window.plume.snapshot(view.state.doc.toString()), 700);
+  snapshotTimer = setTimeout(() => {
+    if (isDraftTab(activeTab())) return; // the autosaved draft file IS the live copy
+    window.plume.snapshot(view.state.doc.toString());
+  }, 700);
 
   // Autosave the open file after a short idle.
   if (autosaveTimer) clearTimeout(autosaveTimer);
@@ -165,14 +168,46 @@ function scheduleSideEffects() {
 
 function autosaveEnabled() { return localStorage.getItem("plume-autosave") !== "0"; }
 
+// Derive a draft filename from the first non-empty line (heading/bullet
+// markers stripped, slugified); fall back to a timestamp. (SAVEFLOW: the
+// native side uniquifies against collisions and owns the fs.)
+function deriveDocName(text) {
+  const first = (text.split("\n").find((l) => l.trim()) || "").trim();
+  const cleaned = first.replace(/^#{1,6}\s+/, "").replace(/^[-*+]\s+/, "").replace(/^\d+[.)]\s+/, "").trim();
+  const slug = cleaned.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+  if (slug) return slug;
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `note-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
 let autosaving = false;
-// Autosave writes an OPEN (path-backed) file back to its own path. Untitled
-// buffers are deliberately NOT materialized here — owner decision from UAT:
-// closing must prompt Save / Don't Save / Cancel, never silently create a file
-// in ~/Documents/Plume. Untitled stays untitled until an explicit save (⌘S,
-// Save As, or the close prompt); crash recovery still snapshots it separately.
+// Autosave writes an OPEN (path-backed) file back to its own path. SAVEFLOW:
+// an untitled MARKDOWN buffer becomes a DRAFT on its first dirty tick — the
+// native side creates + binds ~/Documents/Plume/Autosave/<derived>.md and
+// autosave then rides the normal explicit-path write. The close prompt stays
+// (owner option B: drafts prompt regardless of dirty); a scratch code buffer
+// never becomes a stray .md. Inert until the native create_draft lands.
 async function autosave() {
-  if (!autosaveEnabled() || autosaving || !currentPath) return;
+  if (!autosaveEnabled() || autosaving) return;
+  if (!currentPath) {
+    const text0 = view.state.doc.toString();
+    if (!text0.trim() || currentMode !== "markdown" || !window.plume.createDraft) return;
+    autosaving = true;
+    try {
+      const r = await window.plume.createDraft(deriveDocName(text0), text0);
+      if (r && r.path) {
+        savedText = text0;
+        setTitle(r.path); // native bound it; renderer records — tab record follows via setTitle→renderTabbar
+        const t0 = activeTab();
+        if (t0) { t0.path = r.path; t0.unbound = false; }
+        setDirty(false);
+        pushOpenPaths();
+      }
+    } finally { autosaving = false; }
+    return;
+  }
+  if (autosaving) return;
   // A dropped binding (file moved/deleted under this tab) must never autosave —
   // the next save is an explicit Save As so the user picks the destination.
   const t = activeTab();
@@ -961,7 +996,10 @@ async function save(thenClose = false) {
   // No path (untitled) or a dropped binding (file moved/deleted) → Save As so
   // the user picks the destination; a stale path must never be written blindly.
   const t = activeTab();
-  if (!currentPath || (t && t.unbound)) {
+  // No path, dropped binding, or a DRAFT (⌘S on a draft = graduation: native
+  // writes the current buffer to the chosen path, deletes the Autosave source,
+  // rebinds) → route through Save As.
+  if (!currentPath || (t && t.unbound) || isDraftTab(t)) {
     const saved = await saveAs();
     if (saved && thenClose) window.close();
     return;
@@ -2388,9 +2426,28 @@ function activeDocDirtySync() { return view.state.doc.toString() !== savedText; 
 // a closing window can't clean up post-mortem), and an explicit Don't Save
 // also clears the crash-recovery snapshot so the discard can't resurrect.
 async function resolveCloseOfActiveDoc(detail, deferredCleanups = null) {
-  const state = () => ({ dirty: activeDocDirtySync(), hasPath: !!currentPath });
+  const state = () => ({
+    dirty: activeDocDirtySync(),
+    hasPath: !!currentPath,
+    isDraft: isDraftTab(activeTab()),
+    empty: view.state.doc.toString().trim().length === 0,
+  });
   let action = closeDecision(state());
-  if (action === "prompt") action = closeDecision(state(), (await promptSaveChoice(detail)) ?? "cancel");
+  if (action === "prompt") {
+    const draft = state().isDraft;
+    const choice = draft
+      ? await askConfirm({
+          message: "Keep this draft?",
+          detail: "It's saved as a draft. Save it somewhere permanent, or delete it.",
+          buttons: [
+            { label: "Save…", kind: "primary", value: "save" },
+            { label: "Delete Draft", kind: "danger", value: "discard" },
+            { label: "Cancel", kind: "ghost", value: "cancel" },
+          ],
+        })
+      : await promptSaveChoice(detail);
+    action = closeDecision(state(), choice ?? "cancel");
+  }
   if (action === "stay") return false;
   const path = currentPath;
   const t = activeTab();
@@ -2402,6 +2459,11 @@ async function resolveCloseOfActiveDoc(detail, deferredCleanups = null) {
   } else if (action === "saveas-then-close") {
     if (!(await saveAs())) return false; // dialog cancelled — keep the doc open
     if (activeDocDirtySync()) return false;
+  } else if (action === "delete-draft-then-close") {
+    // Irreversible unlink — DEFERRED to confirmClose in a window close (a
+    // later tab's Cancel must find the draft intact); immediate on tab close.
+    if (deferredCleanups) deferredCleanups.push({ path, deleteDraft: true });
+    else window.plume.discardDraft?.(path);
   } else if (path && !(t && t.unbound) && activeDocDirtySync()) {
     // Explicit Don't Save of a path-backed doc: drop its recovery snapshot so
     // a later launch can't offer the discarded edits back. In a window close
@@ -2484,6 +2546,7 @@ window.plume.onCloseRequested?.(async () => {
     resolvedIds.add(t.id);
   }
   for (const c of cleanups) {
+    if (c.deleteDraft) window.plume.discardDraft?.(c.path);
     if (c.discardRecovery) window.plume.discardRecovery?.(c.path);
     window.plume.setDocDirty(c.path, false);
   }

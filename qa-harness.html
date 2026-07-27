@@ -38,6 +38,13 @@
           return { content: FS[p], recovery: null };
         },
         detachDoc: () => { window.__stub.calls.push(["detachDoc"]); window.__stub.boundPath = null; },
+        createDraft: async (name, content) => {
+          const path = "/Users/x/Documents/Plume/Autosave/" + name + ".md";
+          window.__stub.calls.push(["createDraft", path]); FS[path] = content; window.__stub.boundPath = path;
+          return { path };
+        },
+        discardDraft: (path) => { window.__stub.calls.push(["discardDraft", path]); delete FS[path]; return true; },
+        listDrafts: async () => Object.keys(FS).filter(p => p.includes("/Autosave/")).map(p => ({ path: p, ts: 1, title: p.split("/").pop() })),
         cancelClose: log("cancelClose"),
         setOpenPaths: (paths) => { window.__stub.calls.push(["setOpenPaths", paths.join(",")]); window.__stub.openPaths = paths; },
         save: async (path, content) => { window.__stub.calls.push(["save", path]); FS[path] = content; return path; },

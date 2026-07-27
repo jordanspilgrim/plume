@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId,
-  tabDisplayName, isCapturedDirty, isBlankTab, closeDecision, dirtyBackgroundTabs,
+  tabDisplayName, isCapturedDirty, isBlankTab, closeDecision, dirtyBackgroundTabs, isDraftTab,
 } from "../src/renderer/tabs-model.js";
 
 test("createTab: unique ids, defaults, partial override", () => {
@@ -142,4 +142,37 @@ test("isCapturedDirty is the restore-eligibility rule (clean tabs never restore)
   const dirty = createTab({ path: "/a.md", text: "edited", savedText: "orig" });
   assert.equal(isCapturedDirty(clean), false); // → present disk content
   assert.equal(isCapturedDirty(dirty), true);  // → restore the buffer
+});
+
+// SAVEFLOW (owner option B): drafts prompt on close regardless of dirty.
+test("closeDecision: non-empty draft prompts even when clean; empty draft closes", () => {
+  assert.equal(closeDecision({ dirty: false, hasPath: true, isDraft: true }), "prompt");
+  assert.equal(closeDecision({ dirty: true, hasPath: true, isDraft: true }), "prompt");
+  assert.equal(closeDecision({ dirty: false, hasPath: true, isDraft: true, empty: true }), "close");
+});
+
+test("closeDecision: draft Save graduates (Save As); Don't Save deletes the draft", () => {
+  assert.equal(closeDecision({ dirty: false, hasPath: true, isDraft: true }, "save"), "saveas-then-close");
+  assert.equal(closeDecision({ dirty: false, hasPath: true, isDraft: true }, "discard"), "delete-draft-then-close");
+  assert.equal(closeDecision({ dirty: false, hasPath: true, isDraft: true }, "cancel"), "stay");
+  // Non-drafts are unchanged by the new axis.
+  assert.equal(closeDecision({ dirty: true, hasPath: true }, "save"), "save-then-close");
+  assert.equal(closeDecision({ dirty: true, hasPath: true }, "discard"), "close");
+});
+
+test("isDraftTab: derived from the Autosave path prefix, never stored", () => {
+  assert.equal(isDraftTab(createTab({ path: "/Users/x/Documents/Plume/Autosave/note.md" })), true);
+  assert.equal(isDraftTab(createTab({ path: "/Users/x/Documents/Plume/real.md" })), false);
+  assert.equal(isDraftTab(createTab()), false);
+  // An unbound draft (file vanished) falls back to normal dirty semantics.
+  assert.equal(isDraftTab(createTab({ path: "/Users/x/Documents/Plume/Autosave/note.md", unbound: true })), false);
+});
+
+test("dirtyBackgroundTabs: clean background DRAFT with content still needs a decision", () => {
+  const A = "/Users/x/Documents/Plume/Autosave/";
+  const active = createTab({ path: "/notes/a.md" });
+  const cleanDraft = createTab({ path: A + "note.md", text: "draft body", savedText: "draft body" });
+  const emptyDraft = createTab({ path: A + "empty.md", text: "  ", savedText: "  " });
+  const cleanDoc = createTab({ path: "/notes/b.md", text: "x", savedText: "x" });
+  assert.deepEqual(dirtyBackgroundTabs([active, cleanDraft, emptyDraft, cleanDoc], active.id).map((x) => x.id), [cleanDraft.id]);
 });
