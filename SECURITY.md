@@ -6,17 +6,36 @@ agent connection is the security surface this document is about.
 
 ## Threat model
 
-The adversary we design against is **a prompt-injected agent**, not a remote
-attacker. Coding agents routinely ingest untrusted input — web pages, repo files,
-pasted documents — so an attacker who lands text in front of the agent may try to
-steer its tool calls. That's the "lethal trifecta": untrusted content + tool access
-+ a way to act. The agent runs as the user and is semi-trusted; our job is to keep a
-*manipulated* agent from escalating "edit my document" into something worse.
+We design against three adversaries.
+
+**1. A prompt-injected agent.** Coding agents routinely ingest untrusted input — web
+pages, repo files, pasted documents — so an attacker who lands text in front of the
+agent may try to steer its tool calls. That's the "lethal trifecta": untrusted content
++ tool access + a way to act. The agent runs as the user and is semi-trusted; our job
+is to keep a *manipulated* agent from escalating "edit my document" into something
+worse.
+
+This adversary **holds a valid socket token** — it is the legitimate client.
+Authentication therefore never stands in for user intent anywhere in this document:
+where a control needs a human decision it keys on a human *action* (a native dialog,
+a launch argument), never on the caller being authenticated. A token holder is the
+threat, so a token cannot be the proof.
+
+**2. A hostile document.** A `.md` file is untrusted input, not merely content.
+Opening or exporting one must not let it reach the network, read the filesystem, or
+crash the process — that is what export image-vetting, the link-preview SSRF guard,
+renderer sanitization, and the crash bounds below are for.
+
+**3. A remote web page, via the `plume://` URL handler.** Registering a URL scheme
+puts a control surface on the open internet: any page the user visits can ask the OS
+to hand Plume a `plume://open?path=…`. This adversary is neither authenticated nor
+local, so externally-driven opens get their own gate (below). Finder "Open With" and
+a second-instance `argv` arrive through the same path and are treated the same way.
 
 We do **not** try to defend against a separate hostile process already running as the
 user — on a single-user machine that process can do anything the user can. The socket
 permissions below raise the bar on multi-user boxes, but the primary control is
-scoping what the agent path itself can do.
+scoping what each entry path can do.
 
 ## Controls
 
@@ -69,16 +88,103 @@ overwrite `~/.ssh/...`, a sibling repo, or `.git/hooks/*`, or to read a `.notes.
 outside the open workspace. (Reading a file the user themselves opens is inherent editor
 behavior and is user-visible — `open` brings the file to the front.)
 
+### External-open containment (`plume://`, Finder, second-instance argv, Open Recent)
+Registering the `plume://` scheme means any web page can ask the OS to hand Plume a
+path, so every externally-driven open routes through one gate
+(`deliver_external_open`), which:
+
+1. **refuses sensitive paths outright** — credential material never opens from an
+   external trigger, and deliberately without an "are you sure?", because a confirm
+   raised by an attacker-driven request is one mis-click from disclosure;
+2. **opens directly** when the target is already inside user-established territory;
+3. **otherwise requires a native Open/Cancel confirm** showing the **full path**, so a
+   scripted flood of `plume://` links cannot silently pull files into the editor.
+
+The same gate covers File ▸ Open **Recent**: that list is renderer-supplied and the
+menu shows only the basename, so a compromised renderer could otherwise label a
+credential file `notes.md`.
+
+An externally-opened path is **not** a user pick and never earns the deny-list
+carve-out. The vetted canonical path is threaded through to the read, so the path
+checked and the path opened are the same resolve.
+
+### Renderer command containment
+The renderer is a webview displaying untrusted document content, so its filesystem
+commands are contained exactly as the socket's are — not trusted for being "internal".
+`read_path`, `bind_doc`, `list_dir`, `search_files`, `list_context`,
+`load_annotations`/`save_annotations`, `materialize_doc`, `session_read`,
+`resolve_link` and `open_in_new_window` share the scope + deny decision; out-of-scope
+calls fail soft (empty/refused).
+
+Two rules that are easy to get wrong:
+- The renderer's registered **tab set is evidence, not a grant**. A tab path widens
+  scope only if a user action independently approved it — otherwise a compromised
+  renderer could name a path and thereby authorize itself, and because that set also
+  feeds the socket's write scope, escalate into the agent's authority.
+- `resolve_link` follows only links that stay **inside the document's own directory**;
+  absolute, scheme-bearing and `../`-escaping hrefs are refused.
+
+### Draft autosave (`~/Documents/Plume/Autosave`)
+Untitled buffers autosave as real files, so the draft file *is* the persistence. That
+directory — and only that directory, not its parent — is always in scope, so drafts
+read and write without widening anything else. `discard_draft` is the one
+renderer-callable unlink: it canonicalizes, requires a regular file **strictly inside**
+the canonical Autosave directory, and refuses (with a log) anything else. Graduating a
+draft writes the current buffer to the chosen path, then deletes the source — never a
+rename, which would move the file as of the last autosave tick and lose newer edits.
+
+### Crash and resource bounds
+`panic = "abort"` is deliberately **not** set: Plume holds unsaved text and parses
+hostile input in several places, so a missed edge case should surface as an error
+rather than take every unsaved buffer with it. Because unwinding makes a poisoned
+`Mutex` possible, all `AppState` lock sites recover from poisoning instead of
+panicking again — otherwise one contained panic would cascade into a permanent
+failure of that lock.
+
+Every read of an untrusted or agent-written file is bounded: draft titles, agent
+session transcripts and indexes read a bounded head; crash snapshots above a generous
+ceiling are **skipped rather than truncated**, because that content is what would be
+*restored* and a truncated read would hand back a corrupted document. Response and
+URL parsing is char-boundary-safe, and offsets are never derived from a lowercased
+copy (case-mapping changes byte length, so such offsets can land mid-codepoint).
+
+### Dependency supply chain
+Two CI checks, deliberately in different tiers:
+
+- **`cargo clippy --all-targets -- -D warnings`** runs in the *gating* chain. This
+  codebase hand-rolls parsers and sanitizers over hostile input, so a lint that
+  suggests a subtly different behaviour is worth failing a build over. (Not every
+  suggestion is taken: where a lint would change semantics, the suppression carries a
+  comment explaining why — a mechanical `--fix` across this file has already been
+  shown to introduce a real bug.)
+- **`npm audit` + `cargo audit`** run on PRs, pushes, and weekly, but are **not**
+  gating. A gate must be deterministic; advisory databases are not. A new CVE against
+  an unchanged dependency would turn every build red overnight and block unrelated
+  work — which is the pressure that teaches people to route around gates. A red audit
+  is still loud and must be triaged.
+
+The audit earned its place on the first run by finding a real one that review had not:
+`linkify-it` ≤ 5.0.1 has a quadratic-complexity DoS in the `mailto:` validator scan
+loop over attacker-controlled text. Plume enables `linkify: true` in **all three**
+markdown paths, so a hostile document hung the app on **open**, not merely on export —
+adversary 2 above, exactly. Resolved lockfile-only. Worth recording that tooling found
+it and human review did not: the two are not substitutes.
+
 ### Socket permissions (P0-2)
 `~/.plume` is `chmod 700` and `~/.plume/plume.sock` is `chmod 600` after bind, so no
-other local user can drive the control protocol. On Windows the named pipe lives in
-the per-session namespace (no cross-user access by default).
+other local user can drive the control protocol.
+
+On **Windows** the named pipe is created in the per-session namespace, which is not
+the same guarantee: a pipe there has a default DACL and no explicit ACL of our own, so
+treat the **handshake token** — not the namespace — as the access control on that
+platform. Hardening the DACL is the correct fix if Plume ever runs as a service or in
+a shared session.
 
 ### Probe-before-bind (P0-3)
 The Rust socket server never blindly removes and rebinds the socket. It probes first:
-a live Plume answering → leave it alone; a stale socket → reclaim it. This mirrors the
-Electron `control.js` ownership logic and prevents two shells from hijacking each
-other's socket.
+a live Plume answering → leave it alone; a stale socket → reclaim it. This prevents two
+shells from hijacking each other's socket. (The rule predates the Tauri port; the
+Electron shell it came from is no longer in this tree.)
 
 ### Dirty-buffer guard (P1-4)
 The renderer reports per-document dirty state (`set_doc_dirty`). `write_document`
@@ -90,7 +196,8 @@ edits; the agent is told to ask the user to save or discard first.
 `<meta>` CSP and defers to the config). `script-src 'self'` with **no `'unsafe-eval'`**
 (verified: the bundle uses zero `eval`/`new Function`, and mermaid/katex/CodeMirror
 render fine without it), `object-src 'none'`, `base-uri 'self'`, `frame-ancestors 'none'`,
-no remote script. `connect-src` allows only `'self' ipc: blob: data:` — **no `https:`**,
+no remote script. `connect-src` allows only `'self' ipc: http://ipc.localhost blob: data:` (the
+`ipc.localhost` origin is Tauri's own IPC transport) — **no `https:`**,
 so even if an XSS ever slipped past the sanitizer it has no `fetch()` exfil channel (the
 only browser fetch is `blob:`/`data:` image inlining). Defense-in-depth behind the
 sanitizer. Note: `img-src https:` remains (for remote images, a feature) and is an
@@ -150,25 +257,60 @@ If maintaining the hand-rolled server becomes burdensome, adopt
 - `test/mcp-socket-contract.test.js` — MCP ↔ fake-Plume wire contract, `root` field,
   containment + `dirty_conflict` end-to-end.
 - `test/mcp-attachments.test.js` — quarantine behavior.
+- `test/sidecar-export-ssrf.test.js` — spawns the real sidecar against a local
+  listener and asserts **zero** requests for remote/protocol-relative/redirecting srcs.
+- `test/gdocs-oauth.test.js` — PKCE + `state` on the loopback callback.
+- `test/tabs-model.test.js` — tab/close/draft decisions incl. the is-draft prefix rule.
+
+`cargo test` covers the Rust decision functions directly: containment
+(`scope_decision`, `path_within_open_scope`, tab-set trust), the sensitive deny list,
+close-gate policy, draft/Autosave containment, the export tag rewriter's parser
+differentials, char-boundary handling, and poisoned-lock recovery. Where a fix closes
+a specific attack, **the attack input is the test input** — several were reproduced
+against the pre-fix code first, so the tests are regressions rather than decoration.
 
 ## Additional controls (from the adversarial review)
 
-- **SSRF guard** — `link_preview` (Rust + Electron) resolves the host and refuses any
-  non-public address (loopback, RFC-1918, `169.254/16` incl. cloud metadata, ULA,
-  link-local, CGNAT), and does **not** follow redirects (a public→internal redirect is
-  the classic bypass).
+- **SSRF guard (link previews)** — `link_preview` resolves the host **once**, refuses
+  any non-public address (loopback, RFC-1918, `169.254/16` incl. cloud metadata, ULA,
+  link-local, CGNAT), and connects through a **pinned resolver** so the request cannot
+  be re-resolved to a different address at connect time (DNS rebinding). It does
+  **not** follow redirects (a public→internal redirect is the classic bypass). The
+  check returns the vetted addresses rather than a boolean — a check that discards
+  what it vetted invites exactly that re-resolve gap.
+- **SSRF guard (export)** — a document's `![](url)` images used to be fetched by the
+  export renderers themselves (html-to-docx in the sidecar, WKWebView for PDF),
+  reaching internal hosts on export and embedding the result in a file the user may
+  share. Every export now passes through one Rust choke point: each remote `<img src>`
+  is fetched through the same vetted-address path and inlined as `data:`, or dropped
+  to alt text, so the renderers receive no remote URLs and need no network.
+  Deliberately **not** a "is this host safe?" helper for the sidecar — a check in one
+  process followed by a fetch in another rebuilds the rebinding window. The tag
+  rewriting walks attributes like a parser rather than pattern-matching (a `src=`
+  hidden inside another attribute's value was measured fetching), `file:` sources are
+  dropped like remote ones, and the HTML export is vetted too — otherwise the saved
+  file keeps live remote `<img>` that the user's browser fetches later. Backed by a
+  `default-src 'none'; img-src data:` CSP on the PDF export document and an in-process
+  network kill-switch in the docx sidecar.
+- **Node runtime authenticity** — the optional Node download verifies a **build-pinned**
+  SHA-256. Fetching the digest at runtime from the same host as the tarball only
+  proved the server was self-consistent; a pinned digest is not something that channel
+  can influence. An unpinned platform fails closed.
 - **DoS bounds** — the socket readers cap a single message at 32 MiB (no unbounded
   no-newline flood), `sidecar()` no longer `unwrap()`s on a path with no filename, and
   `search_sessions` reuses one scratch buffer instead of allocating 4 MiB per candidate.
+  Draft titles, agent transcripts and the Codex index read bounded heads; oversized
+  crash snapshots are skipped rather than truncated; export image fetching is bounded
+  per image, in total time, and in count.
 - **Token fails closed** — an empty/unset socket token now denies every command.
 - **`open_external`** only launches `http(s)`/`mailto` (never `file:`/custom schemes).
-- **`resolve_link`** refuses relative links that escape the user's home into `/etc` etc.
+- **`resolve_link`** accepts only relative hrefs resolving **inside the open document's
+  own directory** (absolute, scheme-bearing and `../`-escaping hrefs refused), and
+  never resolves to credential material.
 - **`push_attachment`** project keys are flattened to one safe path segment.
 - **Export/clipboard** markdown uses `html:false` — raw `<script>` in a doc can't ride
   into exported HTML.
 - **Google refresh token** is written `0600` under a `0700` dir.
-- **Electron control socket** runs only in dev (unpackaged); a shipped build never
-  exposes it, and its `writeDocument` is containment-checked.
 - **CI actions** are pinned to full commit SHAs; the `allow-dyld-environment-variables`
   entitlement is removed; the unwired auto-updater feed is no longer emitted.
 
@@ -189,5 +331,5 @@ If maintaining the hand-rolled server becomes burdensome, adopt
 - Client-supplied `root` no longer trusted; write targets the canonical path (TOCTOU).
 - Read containment on `getAnnotations`; SSRF guard; DoS bounds; token fail-closed;
   `open_external` scheme allowlist; export `html:false`; menu XSS → `textContent`;
-  gdocs token `0600`; Electron socket dev-gated + contained; CI SHAs; dyld entitlement
+  gdocs token `0600`; CI SHAs; dyld entitlement
   dropped; updater feed removed. Earlier: asset deny-list, annotation chip, handshake token.
