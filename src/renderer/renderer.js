@@ -194,7 +194,7 @@ async function maybeCreateDraft() {
   if (!text0.trim()) return;
   draftCreateInFlight = true;
   try {
-    const r = await window.plume.createDraft(draftTimestampName(), text0);
+    const r = await window.plume.createDraft(pendingName || draftTimestampName(), text0);
     if (r && r.path) {
       savedText = text0;
       if (!draftsDir) draftsDir = r.path.slice(0, r.path.lastIndexOf("/") + 1); // fallback derivation
@@ -289,7 +289,7 @@ async function commitTitleRename(cancel) {
     setTitle(p || currentPath);
     if (p) setDocPath(view, p); // same relative-base desync class as saveAs
   } else {
-    pendingName = raw; // applied when the untitled doc materializes
+    pendingName = raw; // becomes the draft filename when the first keystroke creates it
     setTitle(null);
   }
 }
