@@ -106,6 +106,27 @@ fn close_action(entry: Option<(Duration, bool)>) -> CloseAction {
     }
 }
 
+// Poison-tolerant locking (cluster C follow-on). With panic = "unwind" — which
+// this crate deliberately uses so a stray panic can't take unsaved buffers down
+// with it — a panic while a Mutex is held POISONS that Mutex, and every later
+// `lock().unwrap()` panics in turn. One contained panic would become a
+// permanent cascade on that lock. We cannot prove no panic ever occurs under a
+// lock (the watcher callback and socket threads do fallible work, and a
+// dependency panic is exactly what unwind exists to survive), so recover
+// instead: take the guard anyway and carry on with the state as it stands.
+// AppState holds plain collections — a half-finished insert leaves a stale or
+// missing entry, never memory unsafety — so continuing is strictly better than
+// bricking the lock.
+trait LockExt<'a, T> {
+    fn lock_or_recover(&'a self) -> std::sync::MutexGuard<'a, T>;
+}
+
+impl<'a, T> LockExt<'a, T> for Mutex<T> {
+    fn lock_or_recover(&'a self) -> std::sync::MutexGuard<'a, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 // Home directory, cross-platform: HOME on unix, USERPROFILE on Windows.
 fn home_dir() -> PathBuf {
     let h = std::env::var("HOME")
@@ -125,7 +146,7 @@ fn plume_dir() -> PathBuf {
 fn set_current(app: &AppHandle, label: &str, path: &str, content: &str) {
     let state = app.state::<AppState>();
     let watcher = start_watcher(app, label, path);
-    let old = state.docs.lock().unwrap().insert(
+    let old = state.docs.lock_or_recover().insert(
         label.to_string(),
         DocState { path: path.to_string(), last_content: content.to_string(), _watcher: watcher },
     );
@@ -150,7 +171,7 @@ fn start_watcher(app: &AppHandle, label: &str, path: &str) -> Option<Recommended
             let st = app2.state::<AppState>();
             let mut changed = false;
             {
-                let mut docs = st.docs.lock().unwrap();
+                let mut docs = st.docs.lock_or_recover();
                 if let Some(doc) = docs.get_mut(&lbl) {
                     // Stale-watcher guard: this window may have moved to another file.
                     if doc.path == file && doc.last_content != content {
@@ -216,7 +237,7 @@ fn bind_doc(app: AppHandle, window: tauri::WebviewWindow, path: String) -> Resul
 // stay renderer-owned and are NOT touched here.
 #[tauri::command]
 fn detach_doc(window: tauri::WebviewWindow, state: tauri::State<AppState>) {
-    let old = state.docs.lock().unwrap().remove(window.label());
+    let old = state.docs.lock_or_recover().remove(window.label());
     drop(old); // watcher drop outside the lock, same as set_current
 }
 
@@ -262,11 +283,11 @@ fn initial_file(app: AppHandle, window: tauri::WebviewWindow) -> Option<InitialF
     // An empty per-window entry is the sentinel for a blank, untitled window:
     // resolve to None so the renderer starts empty instead of inheriting the
     // launch file held in `initial`.
-    let per_window = st.window_files.lock().unwrap().remove(window.label());
+    let per_window = st.window_files.lock_or_recover().remove(window.label());
     let p = match per_window {
         Some(p) if p.is_empty() => return None,
         Some(p) => Some(p),
-        None => st.initial.lock().unwrap().clone(),
+        None => st.initial.lock_or_recover().clone(),
     }?;
     let content = fs::read_to_string(&p).ok()?;
     let recovery = recovery_for(&p);
@@ -278,7 +299,7 @@ fn initial_file(app: AppHandle, window: tauri::WebviewWindow) -> Option<InitialF
 fn spawn_window(app: &AppHandle, file_path: &str) -> Result<(), String> {
     let st = app.state::<AppState>();
     let label = format!("w{}", st.win_counter.fetch_add(1, Ordering::SeqCst));
-    st.window_files.lock().unwrap().insert(label.clone(), file_path.to_string());
+    st.window_files.lock_or_recover().insert(label.clone(), file_path.to_string());
     let builder = tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("index.html".into()))
         .title("Plume")
         .focused(true) // a newly opened doc window comes to the front, not behind
@@ -1097,7 +1118,7 @@ async fn pick_folder(app: AppHandle) -> Option<String> {
     let p = picked.into_path().ok()?;
     // A user-picked folder becomes a scope root (Cluster B) — the sidebar tree
     // and folder search over it are user-established territory.
-    app.state::<AppState>().approved_dirs.lock().unwrap().insert(canonical_key(&p));
+    app.state::<AppState>().approved_dirs.lock_or_recover().insert(canonical_key(&p));
     Some(p.to_string_lossy().to_string())
 }
 
@@ -1244,36 +1265,107 @@ async fn pick_image(app: AppHandle, window: tauri::WebviewWindow) -> Value {
 }
 
 // ---- link preview unfurl ----
+// Cluster C (review #3): every byte-offset slice on RESPONSE-derived text must
+// be char-boundary safe. The old code computed offsets on `to_lowercase()`d
+// copies and applied them to the originals — Unicode case-mapping can change
+// byte lengths ('İ' 2B → "i̇" 3B, 'K' 3B → 'k' 1B), so a crafted page produced
+// mid-codepoint slices → panic. Under panic=abort that killed the whole app
+// (all unsaved buffers) just by opening a document with a hostile URL.
+
+// Largest index ≤ i that sits on a char boundary of s (clamped to s.len()).
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+// Case-insensitive search that returns an offset into the ORIGINAL string.
+//
+// Offsets from a `to_lowercase()` copy must NEVER be applied to the original.
+// The first cut of this fix bailed out when the two differed in TOTAL length,
+// which is not sufficient: an expansion and a contraction cancel. In
+// "İİ<title>Hello</title>K" the copy is the same total length, yet `<title>`
+// sits 2 bytes later in it — so the old code sliced from the wrong place and
+// returned "llo</" as the page title. (It also threw away the preview for any
+// page merely CONTAINING such a character.) Searching the original directly
+// removes the whole class: the returned index is always a real boundary of
+// `haystack`, whatever the case-mapping does.
+//
+// `needle_lower` must already be lowercase. Comparison flattens each side's
+// full Unicode lowercase mapping, so multi-char expansions match correctly.
+fn find_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
+    if needle_lower.is_empty() {
+        return None;
+    }
+    for (i, _) in haystack.char_indices() {
+        let mut hs = haystack[i..].chars().flat_map(char::to_lowercase);
+        let mut matched = true;
+        for nc in needle_lower.chars() {
+            if hs.next() != Some(nc) {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// Panic-proof slice: both ends clamped to char boundaries, start ≤ end.
+fn slice_clamped(s: &str, start: usize, end: usize) -> &str {
+    let e = floor_boundary(s, end);
+    let st = floor_boundary(s, start.min(e));
+    &s[st..e]
+}
+
+// Case-insensitive `contains`, used only for presence checks (no offsets).
+fn contains_ci(haystack: &str, needle_lower: &str) -> bool {
+    find_ci(haystack, needle_lower).is_some()
+}
+
 fn extract_attr(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let key = format!("{}=", attr);
-    let pos = lower.find(&key)? + key.len();
-    let rest = &tag[pos..];
+    // Search the ORIGINAL tag: the returned index is a real boundary of `tag`,
+    // so no case-mapping length change can misalign the slice.
+    let key = format!("{}=", attr.to_lowercase());
+    let pos = find_ci(tag, &key)? + key.len();
+    let rest = slice_clamped(tag, pos, tag.len());
     let quote = rest.chars().next()?;
     if quote == '"' || quote == '\'' {
         let end = rest[1..].find(quote)? + 1;
-        Some(rest[1..end].to_string())
+        Some(slice_clamped(rest, 1, end).to_string())
     } else {
         None
     }
 }
 
 fn extract_meta(html: &str, prop: &str) -> Option<String> {
-    let lower = html.to_lowercase();
     let p = prop.to_lowercase();
     let mut i = 0;
-    while let Some(rel) = lower[i..].find("<meta") {
+    // All offsets below index the ORIGINAL html (see find_ci).
+    while let Some(rel) = html.get(i..).and_then(|s| find_ci(s, "<meta")) {
         let start = i + rel;
-        let end = lower[start..].find('>').map(|e| start + e + 1).unwrap_or(html.len());
-        let tag = &html[start..end];
-        let tl = tag.to_lowercase();
+        let end = html
+            .get(start..)
+            .and_then(|s| s.find('>'))
+            .map(|e| start + e + 1)
+            .unwrap_or(html.len());
+        let tag = slice_clamped(html, start, end);
         let hit = ["property", "name"].iter().any(|k| {
-            tl.contains(&format!("{}=\"{}\"", k, p)) || tl.contains(&format!("{}='{}'", k, p))
+            contains_ci(tag, &format!("{}=\"{}\"", k, p)) || contains_ci(tag, &format!("{}='{}'", k, p))
         });
         if hit {
             if let Some(c) = extract_attr(tag, "content") {
                 return Some(c);
             }
+        }
+        if end <= start {
+            break; // defensive: never spin on a zero-width step
         }
         i = end;
     }
@@ -1393,14 +1485,17 @@ fn fetch_preview(url: &str) -> Value {
         return json!({ "title": host, "description": "", "image": "", "site": host });
     }
     let body = resp.into_string().unwrap_or_default();
-    let body = &body[..body.len().min(600_000)];
+    // Truncate on a char boundary — a multibyte char straddling the 600k mark
+    // must not panic the slice (Cluster C).
+    let body = slice_clamped(&body, 0, 600_000);
     let title = extract_meta(body, "og:title")
         .or_else(|| {
-            let l = body.to_lowercase();
-            let s = l.find("<title")?;
-            let s = l[s..].find('>').map(|e| s + e + 1)?;
-            let e = l[s..].find("</title>").map(|e| s + e)?;
-            Some(body[s..e].trim().to_string())
+            // Offsets index the ORIGINAL body — see find_ci for why a
+            // lowercased copy cannot be used here.
+            let s = find_ci(body, "<title")?;
+            let s = body.get(s..)?.find('>').map(|e| s + e + 1)?;
+            let e = find_ci(body.get(s..)?, "</title>").map(|e| s + e)?;
+            Some(slice_clamped(body, s, e).trim().to_string())
         })
         .unwrap_or_else(|| host.clone());
     let mut image = extract_meta(body, "og:image").or_else(|| extract_meta(body, "twitter:image")).unwrap_or_default();
@@ -1768,7 +1863,7 @@ fn discard_untitled_recovery(key: String) {
 // CloseRequested, so this can't re-enter the prompt loop.
 #[tauri::command]
 fn close_window_now(app: AppHandle, window: tauri::WebviewWindow) {
-    app.state::<AppState>().pending_close.lock().unwrap().remove(window.label());
+    app.state::<AppState>().pending_close.lock_or_recover().remove(window.label());
     clear_untitled_recovery(window.label());
     let _ = window.destroy();
 }
@@ -1778,7 +1873,7 @@ fn close_window_now(app: AppHandle, window: tauri::WebviewWindow) {
 // confirm/cancel — the deadline only guards against a dead renderer.
 #[tauri::command]
 fn close_prompt_ack(window: tauri::WebviewWindow, state: tauri::State<AppState>) {
-    if let Some(m) = state.pending_close.lock().unwrap().get_mut(window.label()) {
+    if let Some(m) = state.pending_close.lock_or_recover().get_mut(window.label()) {
         m.1 = true;
     }
 }
@@ -1788,7 +1883,7 @@ fn close_prompt_ack(window: tauri::WebviewWindow, state: tauri::State<AppState>)
 // in-flight ⌘Q — Cancel in one window stops the whole quit (macOS convention).
 #[tauri::command]
 fn cancel_close(window: tauri::WebviewWindow, state: tauri::State<AppState>) {
-    state.pending_close.lock().unwrap().remove(window.label());
+    state.pending_close.lock_or_recover().remove(window.label());
     state.quitting.store(false, Ordering::SeqCst);
 }
 
@@ -2054,11 +2149,17 @@ fn search_sessions(query: String, dir: Option<String>) -> Vec<Value> {
         if let Ok(mut f) = fs::File::open(&path) {
             if let Ok(n) = f.read(&mut buf) {
                 let text = String::from_utf8_lossy(&buf[..n]);
-                let lower = text.to_lowercase();
-                if let Some(idx) = lower.find(&q) {
-                    let start = idx.saturating_sub(40);
-                    let snippet: String =
-                        text[start..(idx + 90).min(text.len())].split_whitespace().collect::<Vec<_>>().join(" ");
+                // Two-stage on purpose: the lowercased copy is only a FAST
+                // REJECT (memchr-backed find over up to 4 MiB). Its offset is
+                // never used — case-mapping shifts interior positions even when
+                // total lengths match, which drifted the snippet off the match.
+                // Once a file is known to match, locate the hit in the ORIGINAL.
+                if text.to_lowercase().contains(&q) {
+                    let idx = find_ci(&text, &q).unwrap_or(0);
+                    let snippet: String = slice_clamped(&text, idx.saturating_sub(40), idx + 90)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     let mut meta = if c["agent"] == "claude" { session_meta(Path::new(&path)) } else { c.clone() };
                     meta["snippet"] = json!(snippet);
                     results.push(meta);
@@ -2201,7 +2302,7 @@ fn session_read(app: AppHandle, path: String) -> String {
 // ---- agent round-trip (socket → webview → reply) ----
 #[tauri::command]
 fn agent_reply(app: AppHandle, id: u64, data: Value) {
-    if let Some(tx) = app.state::<AppState>().pending.lock().unwrap().remove(&id) {
+    if let Some(tx) = app.state::<AppState>().pending.lock_or_recover().remove(&id) {
         let _ = tx.send(data);
     }
 }
@@ -2210,7 +2311,7 @@ fn agent_query(app: &AppHandle, kind: &str) -> Value {
     let state = app.state::<AppState>();
     let id = state.next_id.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = std::sync::mpsc::channel();
-    state.pending.lock().unwrap().insert(id, tx);
+    state.pending.lock_or_recover().insert(id, tx);
     let payload = json!({ "id": id, "kind": kind });
     // Target the focused window (correct with multiple windows open).
     match app.webview_windows().into_values().find(|w| w.is_focused().unwrap_or(false)) {
@@ -2228,7 +2329,7 @@ fn agent_query(app: &AppHandle, kind: &str) -> Value {
         Err(_) => {
             // Reap the abandoned sender — otherwise every renderer timeout leaks
             // a pending-map entry (and its channel) for the life of the process.
-            state.pending.lock().unwrap().remove(&id);
+            state.pending.lock_or_recover().remove(&id);
             json!({ "ok": false, "error": "renderer timeout" })
         }
     }
@@ -2258,12 +2359,12 @@ fn canonical_key(p: &Path) -> PathBuf {
 fn open_files(app: &AppHandle) -> HashSet<PathBuf> {
     let st = app.state::<AppState>();
     let mut set = HashSet::new();
-    for d in st.docs.lock().unwrap().values() {
+    for d in st.docs.lock_or_recover().values() {
         if !d.path.is_empty() {
             set.insert(canonical_key(Path::new(&d.path)));
         }
     }
-    for f in st.window_files.lock().unwrap().values() {
+    for f in st.window_files.lock_or_recover().values() {
         if !f.is_empty() {
             set.insert(canonical_key(Path::new(f)));
         }
@@ -2282,9 +2383,9 @@ fn open_files(app: &AppHandle) -> HashSet<PathBuf> {
     // approves first, and the tab model is session-only (no cross-launch
     // restore), so genuine background tabs are unaffected.
     {
-        let approved_files = st.approved_files.lock().unwrap();
-        let approved_dirs = st.approved_dirs.lock().unwrap();
-        for tabs in st.open_tabs.lock().unwrap().values() {
+        let approved_files = st.approved_files.lock_or_recover();
+        let approved_dirs = st.approved_dirs.lock_or_recover();
+        for tabs in st.open_tabs.lock_or_recover().values() {
             for p in tabs {
                 if tab_counts_as_scope(p, &approved_files, &approved_dirs) {
                     set.insert(p.clone());
@@ -2373,7 +2474,7 @@ fn scope_decision(
 fn fs_scope_allows(app: &AppHandle, target: &Path) -> bool {
     let st = app.state::<AppState>();
     // Scoped so the guard is released before open_files() takes it again.
-    let explicitly_opened = st.approved_files.lock().unwrap().contains(target);
+    let explicitly_opened = st.approved_files.lock_or_recover().contains(target);
     if explicitly_opened {
         return true;
     }
@@ -2382,14 +2483,14 @@ fn fs_scope_allows(app: &AppHandle, target: &Path) -> bool {
     }
     let in_open_scope = path_within_open_scope(&open_files(app), target);
     let in_approved_dir = {
-        let dirs = st.approved_dirs.lock().unwrap();
+        let dirs = st.approved_dirs.lock_or_recover();
         within_any_dir(&dirs, target)
     };
     scope_decision(target, false, in_open_scope, in_approved_dir)
 }
 
 fn approve_file(app: &AppHandle, path: &Path) {
-    app.state::<AppState>().approved_files.lock().unwrap().insert(canonical_key(path));
+    app.state::<AppState>().approved_files.lock_or_recover().insert(canonical_key(path));
 }
 
 // Sensitive-path deny for EXTERNALLY-driven opens (plume:// deep links, Finder
@@ -2496,6 +2597,153 @@ mod tests {
         // Acked but never resolved for a long time (hung after ack) → re-prompt
         // instead of leaving the window permanently unclosable.
         assert_eq!(close_action(Some((CLOSE_REPROMPT_AFTER, true))), CloseAction::Emit);
+    }
+
+    // ---- cluster C: hostile-input slicing (review #3 remote DoS, #8 decoder) ----
+
+    // A string whose lowercase form has a DIFFERENT byte length than the
+    // original — the exact condition that made lowercase-derived offsets
+    // invalid on the original and produced mid-codepoint slices.
+    // Written as escapes ON PURPOSE: typing these literally is unreliable —
+    // U+212A silently normalizes to ASCII 'K' in some editors/toolchains, which
+    // would make the "shrinking" case not shrink and quietly weaken every test
+    // that depends on it.
+    const CASE_GROWS: &str = "\u{0130}"; // İ — 2 bytes, lowercases to 3 (+1)
+    const CASE_SHRINKS: &str = "\u{212A}"; // KELVIN SIGN — 3 bytes, lowercases to 1 (−2)
+
+    #[test]
+    fn a_poisoned_lock_recovers_instead_of_cascading() {
+        // Under panic = "unwind", a panic while a lock is held poisons it and
+        // every later lock().unwrap() panics too — one contained panic would
+        // become a permanent failure of that lock. lock_or_recover keeps the
+        // app usable with the state as it stood.
+        let m: Mutex<Vec<&str>> = Mutex::new(vec!["a"]);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = m.lock_or_recover();
+            g.push("b");
+            panic!("boom while holding the lock");
+        }));
+        assert!(m.lock().is_err(), "precondition: the mutex is poisoned");
+        // The plain path would panic here; ours returns the guard.
+        let g = m.lock_or_recover();
+        assert_eq!(*g, vec!["a", "b"]); // state as it stood, no data loss
+        drop(g);
+        assert_eq!(m.lock_or_recover().len(), 2); // still usable afterwards
+    }
+
+    #[test]
+    fn slice_clamped_never_splits_a_codepoint() {
+        let s = "aé漢🎉z"; // 1 + 2 + 3 + 4 + 1 bytes
+        for start in 0..=s.len() + 3 {
+            for end in 0..=s.len() + 3 {
+                let out = slice_clamped(s, start, end);
+                assert!(s.contains(out) || out.is_empty());
+            }
+        }
+        assert_eq!(slice_clamped(s, 0, 0), "");
+        assert_eq!(slice_clamped(s, 99, 3), ""); // start past end → empty, no panic
+        assert_eq!(slice_clamped(s, 0, usize::MAX), s);
+        assert_eq!(slice_clamped(s, 1, 2), ""); // both land inside 'é' → empty
+    }
+
+    #[test]
+    fn extract_meta_is_correct_under_case_mapping_length_changes() {
+        // Well-formed input still parses.
+        let html = r#"<html><meta property="og:title" content="Hello"></html>"#;
+        assert_eq!(extract_meta(html, "og:title").as_deref(), Some("Hello"));
+        // Case-INSENSITIVE tag/attribute matching (real pages use <META>).
+        assert_eq!(
+            extract_meta(r#"<META PROPERTY="og:title" CONTENT="Hi">"#, "og:title").as_deref(),
+            Some("Hi")
+        );
+        // Length-changing chars must not break extraction — the first fix
+        // bailed out here and silently lost the preview for such pages.
+        for (input, want) in [
+            (format!(r#"{CASE_GROWS}<meta property="og:title" content="Hello">"#), "Hello"),
+            (format!(r#"{CASE_SHRINKS}<meta property="og:title" content="Hello">"#), "Hello"),
+            // Expansion + contraction CANCEL: equal total length, misaligned
+            // interior — the exact case that defeated the length guard.
+            (
+                format!(r#"{CASE_GROWS}{CASE_GROWS}<meta property="og:title" content="Hello">{CASE_SHRINKS}"#),
+                "Hello",
+            ),
+        ] {
+            assert_eq!(extract_meta(&input, "og:title").as_deref(), Some(want), "input: {input}");
+        }
+        // Truncated/garbage tags must not panic or hang.
+        for junk in ["<meta", "<meta property=", "<meta property=\"og:title\" content=", "<<<>>>", "<meta><meta><meta"] {
+            let _ = extract_meta(junk, "og:title");
+        }
+    }
+
+    #[test]
+    fn title_fallback_survives_the_cancellation_case() {
+        // Codex's case: İİ (+1 byte each when lowercased) before the title and
+        // KELVIN (−2) after it ⇒ identical TOTAL length, but <title> sits 2
+        // bytes later in the lowercased copy. Slicing the original at the
+        // copy's offset returned "llo</" as the page title.
+        let body = format!("{CASE_GROWS}{CASE_GROWS}<title>Hello</title>{CASE_SHRINKS}");
+        // Preconditions that make this a real regression test, not decoration:
+        // the copy is the SAME total length (so a length guard passes) yet the
+        // interior offset of <title> has drifted.
+        assert_eq!(body.to_lowercase().len(), body.len(), "precondition: lengths cancel");
+        assert_ne!(
+            body.to_lowercase().find("<title").unwrap(),
+            find_ci(&body, "<title").unwrap(),
+            "precondition: the lowercased copy's offset is misaligned"
+        );
+        let s = find_ci(&body, "<title").unwrap();
+        let s = body[s..].find('>').map(|e| s + e + 1).unwrap();
+        let e = find_ci(&body[s..], "</title>").map(|e| s + e).unwrap();
+        assert_eq!(slice_clamped(&body, s, e).trim(), "Hello");
+    }
+
+    #[test]
+    fn find_ci_returns_offsets_into_the_original() {
+        // Offset is a real boundary of the ORIGINAL, whatever case-mapping does.
+        let s = format!("{CASE_GROWS}abc<TITLE>x");
+        let i = find_ci(&s, "<title>").unwrap();
+        assert!(s.is_char_boundary(i));
+        assert!(s[i..].starts_with("<TITLE>"));
+        // Unicode case-insensitivity, not just ASCII.
+        assert_eq!(find_ci("ÉCOLE", "école"), Some(0));
+        // Misses and edge cases.
+        assert_eq!(find_ci("abc", "zzz"), None);
+        assert_eq!(find_ci("", "x"), None);
+        assert_eq!(find_ci("abc", ""), None);
+        assert_eq!(find_ci("aXbc", "xb"), Some(1));
+    }
+
+    #[test]
+    fn extract_attr_handles_unterminated_and_multibyte_values() {
+        assert_eq!(extract_attr(r#"<meta content="v">"#, "content").as_deref(), Some("v"));
+        assert_eq!(extract_attr(r#"<meta content='v'>"#, "content").as_deref(), Some("v"));
+        assert_eq!(extract_attr(r#"<meta CONTENT="v">"#, "content").as_deref(), Some("v"));
+        assert_eq!(extract_attr(r#"<meta content=v>"#, "content"), None); // unquoted
+        assert_eq!(extract_attr(r#"<meta content="#, "content"), None); // truncated
+        assert_eq!(extract_attr(r#"<meta content="漢字">"#, "content").as_deref(), Some("漢字"));
+        // Length-changing prefix no longer discards the value.
+        assert_eq!(
+            extract_attr(&format!(r#"<meta alt="{CASE_GROWS}" content="v">"#), "content").as_deref(),
+            Some("v")
+        );
+    }
+
+    #[test]
+    fn urlencoding_decode_never_panics_on_hostile_input() {
+        assert_eq!(urlencoding_decode("/tmp/a%20b.md"), "/tmp/a b.md");
+        assert_eq!(urlencoding_decode("/tmp/%C3%A9.md"), "/tmp/é.md");
+        // '%' immediately followed by multibyte text — the old &s[i+1..i+3]
+        // str-slice panicked here (review #8).
+        assert_eq!(urlencoding_decode("/tmp/%é.md"), "/tmp/%é.md");
+        assert_eq!(urlencoding_decode("%漢%%🎉"), "%漢%%🎉");
+        // Truncated / invalid escapes pass through untouched.
+        assert_eq!(urlencoding_decode("%"), "%");
+        assert_eq!(urlencoding_decode("%2"), "%2");
+        assert_eq!(urlencoding_decode("%zz"), "%zz");
+        assert_eq!(urlencoding_decode("%2G"), "%2G");
+        // Uppercase and lowercase hex both decode.
+        assert_eq!(urlencoding_decode("%2f%2F"), "//");
     }
 
     #[test]
@@ -2721,7 +2969,7 @@ mod tests {
 #[tauri::command]
 fn set_doc_dirty(state: tauri::State<AppState>, path: String, dirty: bool) {
     let key = canonical_key(Path::new(&path)).to_string_lossy().to_string();
-    let mut set = state.dirty_files.lock().unwrap();
+    let mut set = state.dirty_files.lock_or_recover();
     if dirty {
         set.insert(key);
     } else {
@@ -2740,7 +2988,7 @@ fn set_open_paths(window: tauri::WebviewWindow, state: tauri::State<AppState>, p
         .filter(|p| !p.trim().is_empty())
         .map(|p| canonical_key(Path::new(p)))
         .collect();
-    state.open_tabs.lock().unwrap().insert(window.label().to_string(), set);
+    state.open_tabs.lock_or_recover().insert(window.label().to_string(), set);
 }
 
 // The window that should receive an open request: the focused one, else main.
@@ -2819,7 +3067,7 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
     // 0600 token file. ping stays open so probe-before-bind / `plume --version`
     // can check liveness without the secret.
     if cmd != "ping" {
-        let expected = app.state::<AppState>().socket_token.lock().unwrap().clone();
+        let expected = app.state::<AppState>().socket_token.lock_or_recover().clone();
         // Fail CLOSED: an empty/unset token denies every command rather than opening
         // the gate. The token is written before bind, so this never blocks a live app.
         if expected.is_empty() || req["token"].as_str() != Some(expected.as_str()) {
@@ -2857,7 +3105,7 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
                 if !write_allowed(app, &target) {
                     json!({ "ok": false, "code": "outside_workspace",
                         "error": "refused: target is outside the open workspace (open the file or its folder in Plume first)" })
-                } else if app.state::<AppState>().dirty_files.lock().unwrap()
+                } else if app.state::<AppState>().dirty_files.lock_or_recover()
                     .contains(&target.to_string_lossy().to_string())
                 {
                     json!({ "ok": false, "code": "dirty_conflict",
@@ -2896,15 +3144,15 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
             let focused_path = focused_doc(app).map(|p| canonical_key(Path::new(&p)));
             let st = app.state::<AppState>();
             let mut all: Vec<PathBuf> = vec![];
-            for tabs in st.open_tabs.lock().unwrap().values() {
+            for tabs in st.open_tabs.lock_or_recover().values() {
                 all.extend(tabs.iter().cloned());
             }
-            for d in st.docs.lock().unwrap().values() {
+            for d in st.docs.lock_or_recover().values() {
                 if !d.path.is_empty() {
                     all.push(canonical_key(Path::new(&d.path)));
                 }
             }
-            let dirty = st.dirty_files.lock().unwrap();
+            let dirty = st.dirty_files.lock_or_recover();
             let mut seen = HashSet::new();
             let files: Vec<Value> = all
                 .into_iter()
@@ -2974,7 +3222,7 @@ fn run_socket_server(app: AppHandle) {
     // Write the handshake token (0600) BEFORE binding, so by the time a client can
     // connect the secret is already on disk for it to read.
     let token = random_token();
-    *app.state::<AppState>().socket_token.lock().unwrap() = token.clone();
+    *app.state::<AppState>().socket_token.lock_or_recover() = token.clone();
     let tokfile = dir.join("token");
     let _ = fs::write(&tokfile, &token);
     let _ = fs::set_permissions(&tokfile, fs::Permissions::from_mode(0o600));
@@ -3010,7 +3258,7 @@ fn run_socket_server(app: AppHandle) {
     // as a service. Maps to \\.\pipe\plume.sock — the Node clients connect to the same name.
     let _ = fs::create_dir_all(plume_dir());
     let token = random_token();
-    *app.state::<AppState>().socket_token.lock().unwrap() = token.clone();
+    *app.state::<AppState>().socket_token.lock_or_recover() = token.clone();
     let _ = fs::write(plume_dir().join("token"), &token);
     let name = match "plume.sock".to_ns_name::<GenericNamespaced>() {
         Ok(n) => n,
@@ -3039,7 +3287,7 @@ fn start_socket(app: AppHandle) {
 // File > Open Recent reflects it.
 #[tauri::command]
 fn set_recent_files(app: AppHandle, state: tauri::State<AppState>, paths: Vec<String>) {
-    *state.recents.lock().unwrap() = paths;
+    *state.recents.lock_or_recover() = paths;
     let _ = build_and_set_menu(&app);
 }
 
@@ -3054,7 +3302,7 @@ fn build_and_set_menu(app: &AppHandle) -> tauri::Result<()> {
     };
 
     // Open Recent submenu, populated from the recents the renderer pushes up.
-    let recents: Vec<String> = app.state::<AppState>().recents.lock().unwrap().clone();
+    let recents: Vec<String> = app.state::<AppState>().recents.lock_or_recover().clone();
     let mut recent_b = SubmenuBuilder::new(app, "Open Recent");
     if recents.is_empty() {
         recent_b = recent_b.item(
@@ -3365,7 +3613,7 @@ fn main() {
                     let st = app.state::<AppState>();
                     api.prevent_close();
                     let action = {
-                        let mut pend = st.pending_close.lock().unwrap();
+                        let mut pend = st.pending_close.lock_or_recover();
                         let entry = pend.get(&label).map(|(t, a)| (t.elapsed(), *a));
                         let action = close_action(entry);
                         if action == CloseAction::Emit {
@@ -3383,14 +3631,14 @@ fn main() {
                         std::thread::sleep(CLOSE_ACK_DEADLINE);
                         let st = appc.state::<AppState>();
                         let dead = matches!(
-                            st.pending_close.lock().unwrap().get(&lbl),
+                            st.pending_close.lock_or_recover().get(&lbl),
                             Some((_, false))
                         );
                         if dead {
                             eprintln!(
                                 "plume: window {lbl} never ACKed close-requested within {CLOSE_ACK_DEADLINE:?} — treating renderer as dead, closing"
                             );
-                            st.pending_close.lock().unwrap().remove(&lbl);
+                            st.pending_close.lock_or_recover().remove(&lbl);
                             let a2 = appc.clone();
                             let l2 = lbl.clone();
                             let _ = appc.run_on_main_thread(move || {
@@ -3409,9 +3657,9 @@ fn main() {
                 tauri::WindowEvent::Destroyed => {
                     let app = window.app_handle();
                     let st = app.state::<AppState>();
-                    let old = st.docs.lock().unwrap().remove(&label);
+                    let old = st.docs.lock_or_recover().remove(&label);
                     let mut swept: Vec<PathBuf> =
-                        st.open_tabs.lock().unwrap().remove(&label).unwrap_or_default();
+                        st.open_tabs.lock_or_recover().remove(&label).unwrap_or_default();
                     if let Some(d) = &old {
                         if !d.path.is_empty() {
                             swept.push(canonical_key(Path::new(&d.path)));
@@ -3426,15 +3674,15 @@ fn main() {
                         .cloned()
                         .collect();
                     {
-                        let mut dirty = st.dirty_files.lock().unwrap();
+                        let mut dirty = st.dirty_files.lock_or_recover();
                         for p in swept {
                             if !survivors.contains(&p) {
                                 dirty.remove(&p.to_string_lossy().to_string());
                             }
                         }
                     }
-                    st.window_files.lock().unwrap().remove(&label);
-                    st.pending_close.lock().unwrap().remove(&label);
+                    st.window_files.lock_or_recover().remove(&label);
+                    st.pending_close.lock_or_recover().remove(&label);
                     drop(old); // watcher dropped outside any state lock
                 }
                 _ => {}
@@ -3449,7 +3697,7 @@ fn main() {
                     // The user launched Plume with this file — trusted pick;
                     // approve it so the bootstrap bind passes containment.
                     approve_file(&handle, Path::new(p));
-                    *app.state::<AppState>().initial.lock().unwrap() = Some(p.clone());
+                    *app.state::<AppState>().initial.lock_or_recover() = Some(p.clone());
                 }
             }
             let _ = build_and_set_menu(&handle);
@@ -3522,14 +3770,20 @@ fn main() {
 }
 
 /// Minimal percent-decode for file:// paths delivered by RunEvent::Opened.
+/// Fully byte-based (Cluster C / review #8): the old `&s[i+1..i+3]` str-slice
+/// panicked when a multibyte char sat right after a '%' in a crafted plume://
+/// URL — under panic=abort that was a remote crash of the whole app.
 fn urlencoding_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
                 i += 3;
                 continue;
             }
