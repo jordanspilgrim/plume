@@ -241,6 +241,7 @@ async function commitTitleRename(cancel) {
   if (currentPath) {
     const p = await window.plume.renameFile(currentPath, raw);
     setTitle(p || currentPath);
+    if (p) setDocPath(view, p); // same relative-base desync class as saveAs
   } else {
     pendingName = raw; // applied when the untitled doc materializes
     setTitle(null);
@@ -990,6 +991,7 @@ async function saveAs() {
     const t = activeTab();
     if (t) { t.path = result; t.unbound = false; }
     setTitle(result);
+    setDocPath(view, result); // relative links/images resolve against the NEW location (Codex P2)
     setDirty(false);
     pushOpenPaths();
   }
@@ -2278,19 +2280,24 @@ async function presentTab(t) {
       // is never written blindly.
       pendingTabRestore = null;
       window.plume.detachDoc?.();
+      // Capture BEFORE loadDocument: its tab-record cleanup nulls t.text and
+      // t.savedText, which silently erased the dirty baseline (Codex P1 —
+      // the vanished-file tab then read as clean and close dropped it).
       const text = t.text ?? "";
+      const baseline = t.savedText;
       loadDocument(text, t.path);
       t.unbound = true;
-      if (t.savedText != null && t.savedText !== text) { savedText = t.savedText; setDirty(true); }
+      if (baseline != null && baseline !== text) { savedText = baseline; setDirty(true); }
       flashMessage(`${tabDisplayName(t)} can't be read from disk — showing the buffer; saving will ask where.`);
     }
   } else if (t.path && t.unbound) {
     // Known-unbound tab: present the buffer, no native binding.
     window.plume.detachDoc?.();
     const text = t.text ?? "";
+    const baseline = t.savedText; // before loadDocument nulls it (see above)
     loadDocument(text, t.path);
     t.unbound = true; // loadDocument resets the flag on the tab record
-    if (t.savedText != null && t.savedText !== text) { savedText = t.savedText; setDirty(true); }
+    if (baseline != null && baseline !== text) { savedText = baseline; setDirty(true); }
   } else {
     presentUntitledTab(t);
   }
@@ -2380,7 +2387,7 @@ function activeDocDirtySync() { return view.state.doc.toString() !== savedText; 
 // doc's agent-guard dirty flag is cleared (the renderer is its single writer;
 // a closing window can't clean up post-mortem), and an explicit Don't Save
 // also clears the crash-recovery snapshot so the discard can't resurrect.
-async function resolveCloseOfActiveDoc(detail) {
+async function resolveCloseOfActiveDoc(detail, deferredCleanups = null) {
   const state = () => ({ dirty: activeDocDirtySync(), hasPath: !!currentPath });
   let action = closeDecision(state());
   if (action === "prompt") action = closeDecision(state(), (await promptSaveChoice(detail)) ?? "cancel");
@@ -2396,11 +2403,17 @@ async function resolveCloseOfActiveDoc(detail) {
     if (!(await saveAs())) return false; // dialog cancelled — keep the doc open
     if (activeDocDirtySync()) return false;
   } else if (path && !(t && t.unbound) && activeDocDirtySync()) {
-    // Explicit Don't Save of a path-backed doc: final — drop its recovery
-    // snapshot so a later launch can't offer the discarded edits back.
-    window.plume.discardRecovery?.(path);
+    // Explicit Don't Save of a path-backed doc: drop its recovery snapshot so
+    // a later launch can't offer the discarded edits back. In a window close
+    // this is DEFERRED (Codex P2): a later tab's Cancel aborts the close and
+    // the still-open doc must keep its snapshot + agent-write guard.
+    if (deferredCleanups) deferredCleanups.push({ path, discardRecovery: true });
+    else window.plume.discardRecovery?.(path);
   }
-  if (path) window.plume.setDocDirty(path, false); // resolved either way
+  if (path) {
+    if (deferredCleanups) deferredCleanups.push({ path });
+    else window.plume.setDocDirty(path, false); // resolved either way
+  }
   return true;
 }
 
@@ -2455,7 +2468,11 @@ window.plume.onFolderOpen(({ dir }) => {
 // explicitly discarded. Don't Save never writes anything.
 window.plume.onCloseRequested?.(async () => {
   const detail = "Your changes will be lost if you don't save them.";
-  if (!(await resolveCloseOfActiveDoc(detail))) { window.plume.cancelClose?.(); return; }
+  // Irreversible per-doc cleanups (recovery discard + agent-guard clear) are
+  // COLLECTED here and committed only once the whole close is confirmed — a
+  // later tab's Cancel aborts the close with every protection intact.
+  const cleanups = [];
+  if (!(await resolveCloseOfActiveDoc(detail, cleanups))) { window.plume.cancelClose?.(); return; }
   // Track resolved tabs by id: a tab discarded via Don't Save keeps its dirty
   // captured buffer when we move on, and must not be prompted again.
   const resolvedIds = new Set([activeTabId]);
@@ -2463,8 +2480,12 @@ window.plume.onCloseRequested?.(async () => {
     const t = dirtyBackgroundTabs(tabs, activeTabId).find((x) => !resolvedIds.has(x.id));
     if (!t) break;
     await activateTab(t.id, { flush: false }); // no autosave flush: outgoing tab may be freshly discarded
-    if (!(await resolveCloseOfActiveDoc(detail))) { window.plume.cancelClose?.(); return; }
+    if (!(await resolveCloseOfActiveDoc(detail, cleanups))) { window.plume.cancelClose?.(); return; }
     resolvedIds.add(t.id);
+  }
+  for (const c of cleanups) {
+    if (c.discardRecovery) window.plume.discardRecovery?.(c.path);
+    window.plume.setDocDirty(c.path, false);
   }
   window.plume.confirmClose?.();
 });
