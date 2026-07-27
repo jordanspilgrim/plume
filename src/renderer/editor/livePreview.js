@@ -769,10 +769,11 @@ function linkAt(view, pos) {
   return null;
 }
 
-async function followLink(url) {
+async function followLink(url, base) {
   if (/^https?:\/\//i.test(url)) window.plume.openExternal(url);
   else {
-    const resolved = await window.plume.resolveLink(url);
+    // Base is explicit now — the bridge is stateless and holds no doc path.
+    const resolved = await window.plume.resolveLink(url, base || null);
     if (resolved) window.plume.openInNewWindow(resolved);
   }
 }
@@ -783,7 +784,7 @@ const linkClicker = EditorView.domEventHandlers({
     const pos = view.posAtCoords({ x: e.clientX, y: e.clientY });
     if (pos == null) return false;
     const url = linkAt(view, pos);
-    if (url) { e.preventDefault(); followLink(url); return true; }
+    if (url) { e.preventDefault(); followLink(url, view.state.field(docPathField, false) || null); return true; }
     return false;
   },
 });

@@ -30,14 +30,23 @@
         onMenu: (cb) => { menuCb = cb; },
         setRecentFiles: log("setRecentFiles"),
         openDialog: async () => null,
-        openInThisWindow: async (p, line) => {
-          window.__stub.calls.push(["openInThisWindow", p, line]);
-          if (!(p in FS)) return; // simulate a failed disk read
-          openCb && openCb({ filePath: p, content: FS[p], recovery: null, gotoLine: line });
+        // ---- Cluster A stateless-bridge contract ----
+        bindDoc: async (p) => {
+          window.__stub.calls.push(["bindDoc", p]);
+          if (!(p in FS)) return null; // failed disk read → renderer drops the binding
+          window.__stub.boundPath = p;
+          return { content: FS[p], recovery: null };
         },
-        save: async (content) => { window.__stub.calls.push(["save", content.length]); return "/fake/a.md"; },
-        saveAs: async () => null,
-        materializeDoc: async (dir, name) => { window.__stub.calls.push(["materializeDoc", name]); return "/fake/materialized/" + name + ".md"; },
+        detachDoc: () => { window.__stub.calls.push(["detachDoc"]); window.__stub.boundPath = null; },
+        cancelClose: log("cancelClose"),
+        setOpenPaths: (paths) => { window.__stub.calls.push(["setOpenPaths", paths.join(",")]); window.__stub.openPaths = paths; },
+        save: async (path, content) => { window.__stub.calls.push(["save", path]); FS[path] = content; return path; },
+        saveAs: async (content) => {
+          const p = window.__stub.saveAsResult;
+          window.__stub.calls.push(["saveAs", p]);
+          if (p) { FS[p] = content; window.__stub.boundPath = p; }
+          return p || null;
+        },
         renameFile: async () => null,
         pickFolder: async () => null,
         defaultDocsDir: async () => null,
@@ -51,7 +60,7 @@
         loadAnnotations: async () => [],
         saveAnnotations: async () => true,
         snapshot: log("snapshot"),
-        discardRecovery: () => {},
+        discardRecovery: (path) => { window.__stub.calls.push(["discardRecovery", path ?? null]); },
         untitledRecovery: async () => null,
         discardUntitledRecovery: log("discardUntitledRecovery"),
         confirmClose: log("confirmClose"),
@@ -64,9 +73,10 @@
         pickImage: async () => null,
         linkPreview: async () => null,
         openInNewWindow: log("openInNewWindow"),
-        exportDoc: async (format, html, name) => { window.__stub.calls.push(["exportDoc", format]); return "/fake/out." + format; },
+        // Stub fidelity (Codex P2 #5): mirror the real bridge's normalized shape.
+        exportDoc: async (format, html, name) => { window.__stub.calls.push(["exportDoc", format]); return { ok: true, path: "/fake/out." + format }; },
         publishGoogle: async () => { window.__stub.calls.push(["publishGoogle"]); return window.__stub.publishResult; },
-        setDirty: log("setDirty"),
+        setDocDirty: (path, dirty) => { window.__stub.calls.push(["setDocDirty", path, dirty]); },
         // ---- pkg-dev export-runtime contract (PR #2) ----
         nodeStatus: async () => ({ available: window.__stub.nodeAvailable, managed: true }),
         installNode: async () => {
@@ -82,6 +92,9 @@
       };
       window.__stub.nodeAvailable = false;
       window.__stub.publishResult = { ok: true, url: null };
+      window.__stub.saveAsResult = null; // set to a path to make the Save As dialog "succeed"
+      window.__stub.boundPath = null;
+      window.__stub.openPaths = [];
     </script>
   </head>
   <body>

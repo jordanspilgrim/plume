@@ -1,6 +1,12 @@
-// Tauri implementation of the `window.plume` API. Lets the existing renderer
-// (built for Electron's contextBridge) run unchanged in WKWebView. See
-// src-tauri/MIGRATION.md for what's ported vs remaining.
+// Tauri implementation of the `window.plume` API.
+//
+// STATELESS since the Cluster A remediation (adversarial review P1-A): the
+// bridge holds NO document path of its own. The renderer's tab model is the
+// single source of truth for what this window is showing; every call that
+// needs a path receives it explicitly, and the native binding (watcher, doc
+// map, agent scope) is managed only through bindDoc()/detachDoc(). The old
+// private `currentPath` here could desync from the active tab and route a
+// save into the wrong file — that whole class is gone by construction.
 
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -10,18 +16,20 @@ let onOpenFile = null;
 let onExternalChange = null;
 let onCloseRequested = null;
 let onMenuCb = null;
-let currentPath = null;
 
 // file-changed is per-window: the native side emits { path, content } only to
-// the window whose document changed on disk. (The legacy "file-opened" /
-// "folder-opened" channels were never emitted by the Tauri side — removed.)
+// the window whose document changed on disk.
 listen("file-changed", (e) => { if (onExternalChange) onExternalChange(e.payload); });
-// Native side held a close because this window's untitled buffer has unsaved
-// edits — the renderer prompts, then saves/materializes or calls confirmClose().
-listen("close-requested", () => { if (onCloseRequested) onCloseRequested(); });
+// Native side ALWAYS holds a close and emits this (renderer-authoritative
+// close): the renderer prompts per dirty tab, then confirmClose() or
+// cancelClose(). The immediate close_prompt_ack is the liveness signal — if it
+// doesn't arrive within 1.5s the native side treats the webview as dead and
+// destroys the window; after the ack it waits indefinitely for the user.
+listen("close-requested", () => {
+  invoke("close_prompt_ack").catch(noop);
+  if (onCloseRequested) onCloseRequested();
+});
 // Native side (CLI / double-click / File>Open) asks THIS window to open a path.
-// Route through smartOpen so an empty window is reused and anything else opens a new
-// window on top — instead of the old global broadcast that hit every window.
 listen("open-file", (e) => {
   const { path, line } = e.payload || {};
   if (path && window.__plume && window.__plume.smartOpen) window.__plume.smartOpen(path, line);
@@ -50,37 +58,38 @@ window.plume = {
   onCloseRequested: (cb) => { onCloseRequested = cb; },
   onMenu: (cb) => { onMenuCb = cb; },
 
+  // ---- document binding (Cluster A contract) ----
+  // Atomically read + bind `path` as this window's document (doc map, watcher,
+  // agent scope). Returns { content, recovery } or null on a failed read — the
+  // renderer then DROPS the binding and the next save forces Save As.
+  // Fallback: until the native bind_doc command lands, read_path provides the
+  // same read+bind semantics (its binding side effect is removed in A-native).
+  bindDoc: (path) =>
+    invoke("bind_doc", { path })
+      .catch(() => invoke("read_path", { path }))
+      .then((r) => (r && typeof r.content === "string" ? { content: r.content, recovery: r.recovery ?? null } : null))
+      .catch(() => null),
+  // Clear this window's binding (doc map entry, watcher, per-window state).
+  detachDoc: () => { invoke("detach_doc").catch(noop); },
+  // Full tab path-set for this window — feeds the agent write scope and
+  // listOpenFiles, so background tabs stay agent-writable/visible.
+  setOpenPaths: (paths) => { invoke("set_open_paths", { paths }).catch(noop); },
+
   // Push the renderer's recents list so the native File > Open Recent menu reflects it.
   setRecentFiles: (paths) => invoke("set_recent_files", { paths }).catch(() => {}),
 
-  // files
+  // files — every path is explicit; native write_file additionally refuses a
+  // path that isn't this window's current binding (wrong-file-write guard).
   openDialog: () => invoke("open_dialog").catch(() => null),
-  openInThisWindow: async (filePath, gotoLine) => {
-    try {
-      const r = await invoke("read_path", { path: filePath });
-      currentPath = filePath;
-      if (onOpenFile) onOpenFile({ filePath, content: r.content, recovery: r.recovery, gotoLine });
-    } catch { /* ignore */ }
-  },
-  save: async (content) => {
-    try { return await invoke("write_file", { path: currentPath, content }); }
+  save: async (path, content) => {
+    try { return await invoke("write_file", { path, content }); }
     catch { return null; }
   },
-  saveAs: async (content) => {
-    const p = await invoke("save_dialog", { content }).catch(() => null);
-    if (p) currentPath = p;
-    return p;
-  },
-  materializeDoc: async (dir, name, content) => {
-    const p = await invoke("materialize_doc", { dir, name, content }).catch(() => null);
-    if (p) currentPath = p;
-    return p;
-  },
-  renameFile: async (newName) => {
-    if (!currentPath) return null;
-    const p = await invoke("rename_file", { oldPath: currentPath, newName }).catch(() => null);
-    if (p) currentPath = p;
-    return p;
+  // save_dialog / rename_file write AND rebind atomically on the native side.
+  saveAs: (content) => invoke("save_dialog", { content }).catch(() => null),
+  renameFile: (oldPath, newName) => {
+    if (!oldPath) return Promise.resolve(null);
+    return invoke("rename_file", { oldPath, newName }).catch(() => null);
   },
   pickFolder: () => invoke("pick_folder").catch(() => null),
   defaultDocsDir: () => invoke("default_docs_dir").catch(() => null),
@@ -89,7 +98,7 @@ window.plume = {
   // Begin an OS window drag (used for click-or-drag on the title name, which is
   // no-drag so it can be clicked to rename). Needs core:window:allow-start-dragging.
   startWindowDrag: () => getCurrentWindow().startDragging().catch(() => {}),
-  resolveLink: (href) => invoke("resolve_link", { href, base: currentPath }).catch(() => null),
+  resolveLink: (href, base) => invoke("resolve_link", { href, base: base ?? null }).catch(() => null),
   listDir: (dir, depth) => invoke("list_dir", { dir, depth: depth || 3 }).catch(() => []),
   searchFiles: (dir, query) => invoke("search_files", { dir, query }).catch(() => []),
   openExternal: (url) => { invoke("open_external", { url }).catch(noop); },
@@ -98,14 +107,20 @@ window.plume = {
   loadAnnotations: (filePath) => invoke("load_annotations", { path: filePath }).catch(() => []),
   saveAnnotations: (filePath, annotations) =>
     invoke("save_annotations", { path: filePath, annotations }).catch(() => false),
-  // snapshot works for untitled buffers too — the native side files those under
-  // a per-window untitled slot, surfaced at next launch via untitledRecovery().
+  // snapshot routes by this window's current binding; unbound/untitled buffers
+  // go to the per-window untitled slot (surfaced via untitledRecovery()).
   snapshot: (content) => { invoke("snapshot", { content }).catch(noop); },
-  discardRecovery: () => { invoke("discard_recovery").catch(noop); },
+  // Optional path (Cluster A): under tabs, the doc being discarded isn't
+  // necessarily this window's binding — Don't-Save of a path-backed tab passes
+  // its path so the recovery snapshot can't resurrect it. No-arg = current binding.
+  discardRecovery: (path) => { invoke("discard_recovery", { path: path ?? null }).catch(noop); },
   untitledRecovery: () => invoke("untitled_recovery").catch(() => null),
   discardUntitledRecovery: (key) => { invoke("discard_untitled_recovery", { key }).catch(noop); },
-  // Complete a close the native side held for an unsaved untitled buffer.
+  // Renderer-authoritative close: complete the held close, or abandon it
+  // (clears the native pending-close marker so the dead-webview valve doesn't
+  // misread a healthy Cancel).
   confirmClose: () => { invoke("close_window_now").catch(noop); },
+  cancelClose: () => { invoke("cancel_close").catch(noop); },
 
   // Claude Code sessions + context
   listSessions: (dir) => invoke("list_sessions", { dir }).catch(() => []),
@@ -113,7 +128,7 @@ window.plume = {
   listContext: (dir) => invoke("list_context", { dir }).catch(() => []),
   readSession: (filePath) => invoke("session_read", { path: filePath }).catch(() => ""),
 
-  // images + link unfurl (ported)
+  // images + link unfurl
   saveImage: (bytes, ext) => invoke("save_image", { bytes: Array.from(bytes), ext }).catch(() => null),
   // Local images can't load via file:// from the tauri://localhost origin — route
   // them through Tauri's asset protocol so WKWebView/WebView2/WebKitGTK can render them.
@@ -149,17 +164,18 @@ window.plume = {
   installNode: () =>
     invoke("install_node").catch((e) => ({ ok: false, error: String(e), code: "DOWNLOAD_FAILED" })),
   onNodeInstallProgress: (cb) => { listen("node-install-progress", (e) => cb(e.payload)); },
-  // Report dirty state up to the native side so write_document refuses to clobber
-  // a buffer with unsaved edits (P1-4). Keyed by the window's current file; a
-  // null path flags this window's UNTITLED buffer so close can prompt (#4).
-  setDirty: (dirty) => { invoke("set_doc_dirty", { path: currentPath, dirty }).catch(noop); },
+  // Per-PATH dirty flag; feeds ONLY the agent write_document guard (refuse to
+  // clobber unsaved edits). The renderer is the single writer, pushing per tab
+  // on every transition and clearing on save / tab close / close resolution.
+  setDocDirty: (path, dirty) => { if (path) invoke("set_doc_dirty", { path, dirty }).catch(noop); },
 };
 
-// Pull the launch file once the renderer has registered its handler.
+// Pull the launch file once the renderer has registered its handler. The
+// native side binds the launch file itself (initial_file IS the bootstrap
+// bindDoc); the renderer records the path in its tab model.
 invoke("initial_file")
   .then((f) => {
     if (f && f.path) {
-      currentPath = f.path;
       const fire = () => { if (onOpenFile) onOpenFile({ filePath: f.path, content: f.content, recovery: f.recovery }); };
       if (onOpenFile) fire(); else setTimeout(fire, 0);
     }
