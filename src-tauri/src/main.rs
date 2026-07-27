@@ -238,16 +238,42 @@ fn managed_node_path(app: &AppHandle) -> Option<PathBuf> {
 // install (missing dylibs), a wrong-arch binary, or an nvm shim all pass
 // is_file() and then die at spawn — and a working node one probe later never
 // gets tried (F3). Only offer nodes that prove they run.
+// Bounded (P1): a wedged shim that hangs on --version must cost at most this
+// long before we move to the next candidate — an unbounded .status() here
+// blocked resolve_node/node_status (and export's UI promise) forever.
+const NODE_PROBE_TIMEOUT_SECS: u64 = 3;
+
 fn node_runs(p: &Path) -> bool {
     use std::process::{Command, Stdio};
-    Command::new(p)
+    let mut child = match Command::new(p)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(NODE_PROBE_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 fn first_working_node(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
@@ -277,6 +303,25 @@ fn resolve_node(app: &AppHandle) -> Option<PathBuf> {
         if p.is_file() && node_runs(&p) { return Some(p); }
     }
     system_node()
+}
+
+// Drain a stream to EOF keeping only the last `cap` bytes.
+fn read_tail(mut r: impl Read, cap: usize) -> Vec<u8> {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > cap {
+                    let cut = tail.len() - cap;
+                    tail.drain(..cut);
+                }
+            }
+        }
+    }
+    tail
 }
 
 // Hard deadline on any sidecar run (#8): a hung Node process (stuck OAuth flow,
@@ -323,12 +368,11 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
             buf
         })
     });
-    let err_reader = child.stderr.take().map(|mut err| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = err.read_to_end(&mut buf);
-            buf
-        })
+    let err_reader = child.stderr.take().map(|err| {
+        // Bounded (P2): only the last ~300 chars ever reach the UI, so keep a
+        // rolling tail — a helper that floods stderr for the full 180s window
+        // must not be able to exhaust memory.
+        std::thread::spawn(move || read_tail(err, 8 * 1024))
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(SIDECAR_TIMEOUT_SECS);
     let mut exit_status = None;
@@ -2752,6 +2796,52 @@ abc123DEF  node-v22.22.0-darwin-arm64.tar.gz
     #[test]
     fn node_arch_is_a_known_value() {
         assert!(matches!(node_arch(), "arm64" | "x64"));
+    }
+
+    // P1: a candidate that HANGS on --version must be killed at the probe
+    // deadline and skipped — not block resolution forever.
+    #[test]
+    #[cfg(unix)]
+    fn node_runs_kills_hung_probe_at_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("plume-probe-hang-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hung = dir.join("node-hung");
+        fs::write(&hung, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&hung, fs::Permissions::from_mode(0o755)).unwrap();
+        let working = dir.join("node-working");
+        fs::write(&working, "#!/bin/sh\necho v22.22.0\nexit 0\n").unwrap();
+        fs::set_permissions(&working, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let picked = first_working_node([hung, working.clone()]);
+        let elapsed = started.elapsed();
+        assert_eq!(picked.as_deref(), Some(working.as_path()), "hung probe skipped, next candidate wins");
+        assert!(
+            elapsed < Duration::from_secs(NODE_PROBE_TIMEOUT_SECS + 5),
+            "probe must give up at ~{NODE_PROBE_TIMEOUT_SECS}s, took {elapsed:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // P2: the stderr drain keeps only a bounded tail no matter how much the
+    // helper floods.
+    #[test]
+    fn read_tail_is_bounded_and_keeps_the_end() {
+        let mb = 3 * 1024 * 1024;
+        let mut input = vec![b'x'; mb];
+        let marker = b"THE-ACTUAL-ERROR";
+        let start = mb - marker.len();
+        input[start..].copy_from_slice(marker);
+
+        let tail = read_tail(std::io::Cursor::new(&input), 8 * 1024);
+        assert_eq!(tail.len(), 8 * 1024, "capped at exactly the tail size");
+        assert_eq!(&tail[..], &input[mb - 8 * 1024..], "keeps the END of the stream");
+        assert!(tail.ends_with(marker), "the actual error survives");
+
+        let short = read_tail(std::io::Cursor::new(b"tiny".to_vec()), 8 * 1024);
+        assert_eq!(short, b"tiny", "short streams pass through untouched");
     }
 
     // F3: a candidate that exists but can't run (broken Homebrew node with a
