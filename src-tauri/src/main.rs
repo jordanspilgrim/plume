@@ -1296,7 +1296,10 @@ fn open_via_dialog(app: &AppHandle) -> Option<String> {
     let path = picked.into_path().ok()?;
     let p = path.to_string_lossy().to_string();
     if Path::new(&p).is_file() {
-        deliver_open(app, &p, None);
+        // A native file dialog IS the human picking this exact path, so this is
+        // the one source allowed to approve a sensitive file — File ▸ Open of
+        // your own .env must keep working.
+        deliver_open(app, &p, None, true);
     }
     Some(p)
 }
@@ -1329,6 +1332,13 @@ async fn save_dialog(app: AppHandle, window: tauri::WebviewWindow, content: Stri
     // original in place); never delete the very file we just wrote.
     if let Some(prev) = prev {
         if graduate_should_delete_source(&autosave_key(), Path::new(&prev), &path) {
+            // Move the annotations sidecar BEFORE deleting the draft. The
+            // notes live at <parent>/.plume/<filename>.notes.json, so a
+            // graduation left them stranded in Autosave/.plume/ and reopening
+            // the saved file loaded zero annotations — silently losing steer
+            // directives the user wrote. Migrate first: if this fails, the
+            // draft (and its notes) are still on disk to recover from.
+            migrate_annotations(Path::new(&prev), &path);
             let _ = fs::remove_file(&prev);
             let _ = fs::remove_file(recovery_path(&prev)); // orphaned draft snapshot
         }
@@ -1447,6 +1457,30 @@ fn write_new_draft(autosave: &Path, suggested: &str, content: &str) -> std::io::
     let path = unique_path(autosave, &sanitize_stem(suggested), "md");
     fs::write(&path, content)?;
     Ok(path)
+}
+
+// Move a document's annotations sidecar when the document itself moves.
+// Best-effort and non-destructive: rename first (same volume), fall back to
+// copy+remove, and NEVER clobber notes that already exist at the destination —
+// the user's directives there are worth more than a stale draft's.
+fn migrate_annotations(from: &Path, to: &Path) {
+    let (_, src) = sidecar(&from.to_string_lossy());
+    if !src.is_file() {
+        return;
+    }
+    let (dst_dir, dst) = sidecar(&to.to_string_lossy());
+    if dst.exists() {
+        return;
+    }
+    if fs::create_dir_all(&dst_dir).is_err() {
+        return;
+    }
+    if fs::rename(&src, &dst).is_ok() {
+        return;
+    }
+    if fs::copy(&src, &dst).is_ok() {
+        let _ = fs::remove_file(&src); // copied across volumes; drop the original
+    }
 }
 
 // The canonical Autosave dir — the authoritative prefix the renderer uses for
@@ -1637,6 +1671,45 @@ mod saveflow_tests {
         assert!(chosen.exists());
         assert_eq!(fs::read_to_string(&chosen).unwrap(), "current-buffer");
         assert_eq!(fs::read_dir(&av).unwrap().count(), 0, "Autosave left empty after graduation");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // HIGH-2: graduating a draft moved the .md but stranded its annotations in
+    // Autosave/.plume/, so reopening the saved file showed zero steer
+    // directives — silent loss of user-authored content on a normal ⌘S.
+    #[test]
+    fn graduating_a_draft_carries_its_annotations_across() {
+        let root = tmp("notes");
+        let av = root.join("Autosave");
+        let draft = write_new_draft(&av, "with-notes", "body").unwrap();
+        let (src_dir, src_notes) = sidecar(&draft.to_string_lossy());
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(&src_notes, r#"[{"quote":"body","note":"tighten this"}]"#).unwrap();
+
+        let chosen = root.join("final.md");
+        fs::write(&chosen, "body").unwrap();
+        migrate_annotations(&draft, &chosen);
+
+        let (_, dst_notes) = sidecar(&chosen.to_string_lossy());
+        assert!(dst_notes.is_file(), "annotations must land beside the saved file");
+        assert!(fs::read_to_string(&dst_notes).unwrap().contains("tighten this"));
+        assert!(!src_notes.exists(), "and must not be left stranded in Autosave");
+
+        // Never clobber directives that already exist at the destination.
+        let other = root.join("other.md");
+        let (od, on) = sidecar(&other.to_string_lossy());
+        fs::create_dir_all(&od).unwrap();
+        fs::write(&on, "KEEP").unwrap();
+        let d2 = write_new_draft(&av, "second", "x").unwrap();
+        let (sd2, sn2) = sidecar(&d2.to_string_lossy());
+        fs::create_dir_all(&sd2).unwrap();
+        fs::write(&sn2, "INCOMING").unwrap();
+        migrate_annotations(&d2, &other);
+        assert_eq!(fs::read_to_string(&on).unwrap(), "KEEP", "existing notes win");
+
+        // A draft with no notes is a no-op, not an error.
+        let d3 = write_new_draft(&av, "third", "y").unwrap();
+        migrate_annotations(&d3, &root.join("third-final.md"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2219,7 +2292,7 @@ fn resolve_link(app: AppHandle, href: String, base: Option<String>) -> Option<St
             }
             // Safe to approve: it is inside territory the open document
             // already establishes, so this widens nothing.
-            approve_file(&app, &cand);
+            approve_file(&app, &cand, false);
             return Some(cand.to_string_lossy().to_string());
         }
     }
@@ -3173,8 +3246,25 @@ fn fs_scope_allows(app: &AppHandle, target: &Path) -> bool {
     scope_decision(target, false, in_open_scope, in_approved_dir)
 }
 
-fn approve_file(app: &AppHandle, path: &Path) {
-    app.state::<AppState>().approved_files.lock_or_recover().insert(canonical_key(path));
+// Record a file as explicitly opened. That set is a CARVE-OUT from the
+// sensitive deny (so you can edit your own .env), which makes every writer of
+// it security-relevant: whatever lands here can later be read and written no
+// matter what its name is.
+//
+// `user_picked` is therefore the real question — not which function is calling,
+// but whether a HUMAN chose this exact path: a native file dialog, or the
+// argument they launched Plume with. A path named by a socket client, a deep
+// link, or a document's own markup is not user-picked, and a sensitive one from
+// those sources is refused rather than approved. (The socket `open` handler
+// refuses sensitive paths outright as well; this is the backstop that keeps a
+// future caller from quietly re-opening the same door.)
+fn approve_file(app: &AppHandle, path: &Path, user_picked: bool) {
+    let key = canonical_key(path);
+    if !user_picked && is_sensitive_path(&key) {
+        eprintln!("refused to mark {} explicitly-opened: sensitive, and not a user pick", key.display());
+        return;
+    }
+    app.state::<AppState>().approved_files.lock_or_recover().insert(key);
 }
 
 // Sensitive-path deny for EXTERNALLY-driven opens (plume:// deep links, Finder
@@ -3207,8 +3297,8 @@ fn is_sensitive_path(p: &Path) -> bool {
     // on Unix, file_name() of "c:\\users\\x\\.ssh\\id_rsa" is the whole
     // backslash string, which would miss the id_rsa/.env checks below.
     let name = s.rsplit('/').next().unwrap_or_default().to_string();
-    const NAMES: [&str; 7] = [
-        ".env", ".netrc", ".git-credentials", ".npmrc", ".pypirc",
+    const NAMES: [&str; 8] = [
+        ".env", ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".pgpass",
         // Shell/REPL history routinely contains pasted tokens and passwords.
         ".history", ".lesshst",
     ];
@@ -3693,6 +3783,43 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // HIGH-1: the explicit-open carve-out was launderable. A token-holding
+    // socket client could `open` a sensitive path — which marked it
+    // explicitly-opened — and then write it, because the carve-out
+    // short-circuits the deny. That turned a document editor into arbitrary
+    // code execution (a git credential-helper line runs on the next auth).
+    // The carve-out's premise is "a HUMAN chose this exact path", so the flag
+    // must track that, not merely which function called.
+    #[test]
+    fn only_a_human_pick_may_approve_a_sensitive_path() {
+        for sensitive in [
+            "/Users/x/repo/.git/config",
+            "/Users/x/.ssh/id_rsa",
+            "/Users/x/repo/.env",
+            "/Users/x/.pgpass",
+        ] {
+            let p = Path::new(sensitive);
+            // A socket client, a deep link, or a document's own markup naming
+            // the path is NOT a user pick — refuse to approve it.
+            assert!(is_sensitive_path(p), "precondition: {sensitive} is sensitive");
+            // …and with it unapproved, the write gate refuses even in scope.
+            assert!(
+                !scope_decision(p, false, true, true),
+                "unapproved sensitive path must stay unwritable: {sensitive}"
+            );
+            // A genuine File > Open (user_picked) still authorizes it.
+            assert!(scope_decision(p, true, false, false), "user pick must still work: {sensitive}");
+        }
+    }
+
+    #[test]
+    fn pgpass_and_netrc_are_denied() {
+        assert!(is_sensitive_path(Path::new("/Users/x/.pgpass")));
+        assert!(is_sensitive_path(Path::new("/Users/x/.netrc"))); // already covered before this batch
+        assert!(is_sensitive_path(Path::new("/Users/x/.ssh/config"))); // via the /.ssh/ dir mark
+        assert!(!is_sensitive_path(Path::new("/Users/x/notes/pgpass-notes.md")));
+    }
+
     #[test]
     fn socket_writes_cannot_reach_code_execution_or_secrets_from_scope_alone() {
         // H2: the socket write gate shares scope_decision with reads, so an
@@ -3962,12 +4089,12 @@ fn focused_doc(app: &AppHandle) -> Option<String> {
 // global `emit("file-opened")` broadcast, which loaded the doc into every window and
 // then focused "main" regardless of where it went — the cause of both the
 // opens-behind and the intermittent replace-the-foreground-window bugs.
-fn deliver_open(app: &AppHandle, path: &str, line: Option<i64>) {
+fn deliver_open(app: &AppHandle, path: &str, line: Option<i64>, user_picked: bool) {
     // Every delivery point is a legitimate grant: user dialog picks, the
     // token-gated socket, and externally-driven opens that already passed the
     // deliver_external_open gate. Approving here lets the renderer's follow-up
     // bind_doc through containment.
-    approve_file(app, Path::new(path));
+    approve_file(app, Path::new(path), user_picked);
     let payload = json!({ "path": path, "line": line });
     if let Some(win) = focused_or_main(app) {
         let label = win.label().to_string();
@@ -4026,22 +4153,39 @@ fn dispatch(app: &AppHandle, req: &Value) -> Value {
             json!({ "ok": true })
         }
         "open" => {
-            if req["newWindow"].as_bool().unwrap_or(false) {
-                if let Some(p) = req["path"].as_str() {
-                    let appc = app.clone();
-                    let path = p.to_string();
-                    let _ = app.run_on_main_thread(move || { let _ = spawn_window(&appc, &path); });
-                    return json!({ "ok": true });
-                }
+            let Some(p) = req["path"].as_str() else {
+                return json!({ "ok": false, "error": "no path" });
+            };
+            // A token-holding client is exactly the threat the write deny
+            // exists for, so `open` must not be able to launder a path into
+            // approved_files and out the other side. Without this, an agent
+            // could: open <repo>/.git/config → it becomes "explicitly opened" →
+            // writeDocument short-circuits the deny via that carve-out → a
+            // credential-helper line runs on the next git auth. The same
+            // laundering also disclosed arbitrary files: the newWindow branch
+            // reaches initial_file, which reads the target and hands it to the
+            // renderer. Refusing here covers BOTH branches at the door.
+            //
+            // File ▸ Open of your own .env is deliberately untouched — that
+            // path is a human picking a file in a native dialog, not a caller
+            // naming one over a socket.
+            let canon = canonical_key(Path::new(p));
+            if is_sensitive_path(&canon) {
+                eprintln!("socket open refused: {p} is sensitive (open it from File ▸ Open if you mean to edit it)");
+                return json!({ "ok": false, "code": "sensitive_path",
+                    "error": "refused: sensitive path — open it from File ▸ Open if you mean to edit it" });
             }
-            if let Some(p) = req["path"].as_str() {
-                if !Path::new(p).is_file() {
-                    return json!({ "ok": false, "error": "cannot read file" });
-                }
-                deliver_open(app, p, req["line"].as_i64());
+            if req["newWindow"].as_bool().unwrap_or(false) {
+                let appc = app.clone();
+                let path = p.to_string();
+                let _ = app.run_on_main_thread(move || { let _ = spawn_window(&appc, &path); });
                 return json!({ "ok": true });
             }
-            json!({ "ok": false, "error": "no path" })
+            if !Path::new(p).is_file() {
+                return json!({ "ok": false, "error": "cannot read file" });
+            }
+            deliver_open(app, p, req["line"].as_i64(), false);
+            json!({ "ok": true })
         }
         "writeDocument" => match req["content"].as_str() {
             Some(content) if req["path"].is_string() => {
@@ -4406,7 +4550,7 @@ fn deliver_external_open(app: &AppHandle, path: &str, line: Option<i64>) {
         return;
     }
     if fs_scope_allows(app, &canon) {
-        deliver_open(app, path, line);
+        deliver_open(app, path, line, false);
         return;
     }
     let appc = app.clone();
@@ -4417,7 +4561,7 @@ fn deliver_external_open(app: &AppHandle, path: &str, line: Option<i64>) {
         .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom("Open".to_string(), "Cancel".to_string()))
         .show(move |yes| {
             if yes {
-                deliver_open(&appc, &p, line);
+                deliver_open(&appc, &p, line, false);
             }
         });
 }
@@ -4644,7 +4788,7 @@ fn main() {
                 if Path::new(p).is_file() {
                     // The user launched Plume with this file — trusted pick;
                     // approve it so the bootstrap bind passes containment.
-                    approve_file(&handle, Path::new(p));
+                    approve_file(&handle, Path::new(p), true); // user launched Plume with this file
                     *app.state::<AppState>().initial.lock_or_recover() = Some(p.clone());
                 }
             }

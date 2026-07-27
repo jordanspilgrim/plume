@@ -30,10 +30,19 @@ supplied by the caller.
 **Scope alone is not sufficient.** Because scope is directory-inclusive, opening one
 file in a repository would otherwise put the whole repository within reach. A deny list
 (credential material, `.env*`, `.git` internals, shell/REPL history, keys) therefore
-overrides scope for both reads and writes, with one carve-out: a file the user opened
-**explicitly** — via File ▸ Open, a launch argument, the token-gated socket's `open`, or
-a link inside the open document's own directory — remains readable and writable, so
-deliberately editing your own `.env` still works.
+overrides scope for both reads and writes, with one carve-out: a file **a human picked**
+— a native File ▸ Open dialog, or the argument Plume was launched with — remains readable
+and writable, so deliberately editing your own `.env` still works.
+
+The carve-out is deliberately narrow, because it is the one way past the deny list. A
+path merely *named* by a caller does not qualify: the socket's `open`, `plume://` deep
+links, Finder "Open With", and links inside a document all refuse sensitive targets
+rather than marking them opened. An earlier version treated the token-gated socket's
+`open` as equivalent to a user pick; a re-verification showed that let a token-holding
+agent launder a path — `open` `<repo>/.git/config`, then write it through the carve-out,
+landing a credential-helper line that executes on the next git authentication. A token
+holder is precisely the threat this gate exists for, so authentication does not stand in
+for human intent.
 
 This was tightened after an adversarial review: the write gate was previously scope-only,
 on the reasoning that the socket is authenticated and an agent editing a `.env` the user
