@@ -167,9 +167,14 @@ body { display: flex; flex-direction: column; }
 }
 #titlebar-brand .brand-name { font-weight: 650; font-size: 12.5px; letter-spacing: 0.01em; }
 #titlebar-name {
+  /* Centered WITHOUT a transform: WKWebView mispositions the caret inside a
+     transformed contenteditable, which offset the cursor while renaming
+     (owner bug). left/right + auto margins center identically, transform-free. */
   position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 0;
+  right: 0;
+  margin-inline: auto;
+  width: fit-content;
   max-width: 44%;
   overflow: hidden;
   text-overflow: ellipsis;
