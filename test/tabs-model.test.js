@@ -160,19 +160,27 @@ test("closeDecision: draft Save graduates (Save As); Don't Save deletes the draf
   assert.equal(closeDecision({ dirty: true, hasPath: true }, "discard"), "close");
 });
 
-test("isDraftTab: derived from the Autosave path prefix, never stored", () => {
-  assert.equal(isDraftTab(createTab({ path: "/Users/x/Documents/Plume/Autosave/note.md" })), true);
-  assert.equal(isDraftTab(createTab({ path: "/Users/x/Documents/Plume/real.md" })), false);
-  assert.equal(isDraftTab(createTab()), false);
+test("isDraftTab: authoritative prefix vs the native-published dir, never a shape heuristic", () => {
+  const DIR = "/Users/x/Documents/Plume/Autosave";
+  assert.equal(isDraftTab(createTab({ path: DIR + "/note.md" }), DIR), true);
+  assert.equal(isDraftTab(createTab({ path: DIR + "/note.md" }), DIR + "/"), true); // trailing-slash tolerant
+  assert.equal(isDraftTab(createTab({ path: "/Users/x/Documents/Plume/real.md" }), DIR), false);
+  // be-dev F1: a USER file whose path merely LOOKS like a drafts path is NOT a draft.
+  assert.equal(isDraftTab(createTab({ path: "/Users/x/work/Plume/Autosave/notes.md" }), DIR), false);
+  // No draftsDir known (native absent) → nothing is a draft.
+  assert.equal(isDraftTab(createTab({ path: DIR + "/note.md" }), null), false);
+  assert.equal(isDraftTab(createTab(), DIR), false);
   // An unbound draft (file vanished) falls back to normal dirty semantics.
-  assert.equal(isDraftTab(createTab({ path: "/Users/x/Documents/Plume/Autosave/note.md", unbound: true })), false);
+  assert.equal(isDraftTab(createTab({ path: DIR + "/note.md", unbound: true }), DIR), false);
 });
 
 test("dirtyBackgroundTabs: clean background DRAFT with content still needs a decision", () => {
-  const A = "/Users/x/Documents/Plume/Autosave/";
+  const DIR = "/Users/x/Documents/Plume/Autosave";
   const active = createTab({ path: "/notes/a.md" });
-  const cleanDraft = createTab({ path: A + "note.md", text: "draft body", savedText: "draft body" });
-  const emptyDraft = createTab({ path: A + "empty.md", text: "  ", savedText: "  " });
+  const cleanDraft = createTab({ path: DIR + "/note.md", text: "draft body", savedText: "draft body" });
+  const emptyDraft = createTab({ path: DIR + "/empty.md", text: "  ", savedText: "  " });
   const cleanDoc = createTab({ path: "/notes/b.md", text: "x", savedText: "x" });
-  assert.deepEqual(dirtyBackgroundTabs([active, cleanDraft, emptyDraft, cleanDoc], active.id).map((x) => x.id), [cleanDraft.id]);
+  assert.deepEqual(dirtyBackgroundTabs([active, cleanDraft, emptyDraft, cleanDoc], active.id, DIR).map((x) => x.id), [cleanDraft.id]);
+  // Without a draftsDir, only genuinely dirty tabs qualify (no draft semantics).
+  assert.deepEqual(dirtyBackgroundTabs([active, cleanDraft, cleanDoc], active.id), []);
 });

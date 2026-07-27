@@ -157,7 +157,7 @@ function scheduleSideEffects() {
   // slot — benign, user-confirmed banner content only; merge order handles it.)
   if (snapshotTimer) clearTimeout(snapshotTimer);
   snapshotTimer = setTimeout(() => {
-    if (isDraftTab(activeTab())) return; // the autosaved draft file IS the live copy
+    if (isDraft(activeTab())) return; // the autosaved draft file IS the live copy
     window.plume.snapshot(view.state.doc.toString());
   }, 700);
 
@@ -198,16 +198,18 @@ async function autosave() {
       const r = await window.plume.createDraft(deriveDocName(text0), text0);
       if (r && r.path) {
         savedText = text0;
+        if (!draftsDir) draftsDir = r.path.slice(0, r.path.lastIndexOf("/") + 1); // fallback derivation
         setTitle(r.path); // native bound it; renderer records — tab record follows via setTitle→renderTabbar
         const t0 = activeTab();
         if (t0) { t0.path = r.path; t0.unbound = false; }
-        setDirty(false);
+        // The user may have typed during the createDraft round-trip — recompute
+        // instead of asserting clean (be-dev review: agent-guard under-report).
+        setDirty(view.state.doc.toString() !== savedText);
         pushOpenPaths();
       }
     } finally { autosaving = false; }
     return;
   }
-  if (autosaving) return;
   // A dropped binding (file moved/deleted under this tab) must never autosave —
   // the next save is an explicit Save As so the user picks the destination.
   const t = activeTab();
@@ -999,7 +1001,7 @@ async function save(thenClose = false) {
   // No path, dropped binding, or a DRAFT (⌘S on a draft = graduation: native
   // writes the current buffer to the chosen path, deletes the Autosave source,
   // rebinds) → route through Save As.
-  if (!currentPath || (t && t.unbound) || isDraftTab(t)) {
+  if (!currentPath || (t && t.unbound) || isDraft(t)) {
     const saved = await saveAs();
     if (saved && thenClose) window.close();
     return;
@@ -2203,6 +2205,12 @@ let tabs = [createTab()];
 let activeTabId = tabs[0].id;
 let pendingTabRestore = null; // consumed by loadDocument when a switch is in flight
 
+// Canonical Autosave dir, published by the native side (authoritative for the
+// is-draft prefix check). Fallback: derived from createDraft's own response.
+let draftsDir = null;
+window.plume.draftsDir?.().then((d) => { if (d) draftsDir = d; }).catch(() => {});
+function isDraft(tab) { return isDraftTab(tab, draftsDir); }
+
 function activeTab() { return findTab(tabs, activeTabId); }
 
 // Mirror the window's tab path-set to the native side (agent scope +
@@ -2429,10 +2437,16 @@ async function resolveCloseOfActiveDoc(detail, deferredCleanups = null) {
   const state = () => ({
     dirty: activeDocDirtySync(),
     hasPath: !!currentPath,
-    isDraft: isDraftTab(activeTab()),
+    isDraft: isDraft(activeTab()),
     empty: view.state.doc.toString().trim().length === 0,
   });
   let action = closeDecision(state());
+  // An EMPTY draft closes without a prompt — but its file must not linger as a
+  // permanent orphan in listDrafts (be-dev review): delete it on the way out.
+  if (action === "close" && state().isDraft && state().empty && currentPath) {
+    if (deferredCleanups) deferredCleanups.push({ path: currentPath, deleteDraft: true });
+    else window.plume.discardDraft?.(currentPath);
+  }
   if (action === "prompt") {
     const draft = state().isDraft;
     const choice = draft
@@ -2539,7 +2553,7 @@ window.plume.onCloseRequested?.(async () => {
   // captured buffer when we move on, and must not be prompted again.
   const resolvedIds = new Set([activeTabId]);
   for (;;) {
-    const t = dirtyBackgroundTabs(tabs, activeTabId).find((x) => !resolvedIds.has(x.id));
+    const t = dirtyBackgroundTabs(tabs, activeTabId, draftsDir).find((x) => !resolvedIds.has(x.id));
     if (!t) break;
     await activateTab(t.id, { flush: false }); // no autosave flush: outgoing tab may be freshly discarded
     if (!(await resolveCloseOfActiveDoc(detail, cleanups))) { window.plume.cancelClose?.(); return; }

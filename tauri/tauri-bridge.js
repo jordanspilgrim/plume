@@ -77,6 +77,8 @@ window.plume = {
   // Containment-guarded unlink of a draft (strictly inside the Autosave dir).
   discardDraft: (path) => invoke("discard_draft", { path }).catch(() => false),
   listDrafts: () => invoke("list_drafts").catch(() => []),
+  // Canonical Autosave dir — the authoritative prefix for is-draft derivation.
+  draftsDir: () => invoke("drafts_dir").catch(() => null),
   // Full tab path-set for this window — feeds the agent write scope and
   // listOpenFiles, so background tabs stay agent-writable/visible.
   setOpenPaths: (paths) => { invoke("set_open_paths", { paths }).catch(noop); },

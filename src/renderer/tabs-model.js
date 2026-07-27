@@ -98,14 +98,20 @@ export function closeDecision({ dirty, hasPath, isDraft = false, empty = false }
 // Save / Don't Save / Cancel; none may be dropped silently.
 // SAVEFLOW: "is a draft" is DERIVED from the path, never stored — the same
 // anti-desync rule the native side follows (coord ruling, cluster-A lesson).
-const DRAFT_DIR_RE = /\/Plume\/Autosave\//;
-export function isDraftTab(tab) {
-  return !!(tab && tab.path && DRAFT_DIR_RE.test(tab.path) && !tab.unbound);
+// The check is an AUTHORITATIVE prefix match against the canonical Autosave
+// dir published by the native side (be-dev review F1: a shape heuristic like
+// /Plume\/Autosave\// misclassified a user's own ~/work/Plume/Autosave/x.md).
+// With no draftsDir known, nothing is a draft — correct, because drafts can
+// only exist once the native half (which publishes the dir) is present.
+export function isDraftTab(tab, draftsDir) {
+  if (!draftsDir || !tab || !tab.path || tab.unbound) return false;
+  const dir = draftsDir.endsWith("/") ? draftsDir : draftsDir + "/";
+  return tab.path.startsWith(dir);
 }
 
-export function dirtyBackgroundTabs(tabs, activeId) {
+export function dirtyBackgroundTabs(tabs, activeId, draftsDir = null) {
   // A background DRAFT with content also needs a decision even when captured
   // clean — drafts prompt on close regardless of dirty (SAVEFLOW option B).
   return tabs.filter((t) => t.id !== activeId &&
-    (isCapturedDirty(t) || (isDraftTab(t) && t.text != null && t.text.trim().length > 0)));
+    (isCapturedDirty(t) || (isDraftTab(t, draftsDir) && t.text != null && t.text.trim().length > 0)));
 }
