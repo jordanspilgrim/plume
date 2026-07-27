@@ -251,8 +251,7 @@ fn write_file(app: AppHandle, window: tauri::WebviewWindow, path: String, conten
     let bound = app
         .state::<AppState>()
         .docs
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .get(window.label())
         .map(|d| d.path.clone())
         .filter(|p| !p.is_empty())
@@ -1494,6 +1493,21 @@ fn draft_title(content: &str, stem_fallback: &str) -> String {
 // drafts_dir()/create_draft return — otherwise a draft opened from this list on a
 // Mac with a symlinked ~/Documents (iCloud sync) would carry a divergent prefix
 // and silently stop classifying as a draft (N1).
+// Enough to hold a first line by any sane measure; a draft whose first 64 KiB
+// contain no newline gets a truncated title rather than an OOM.
+const DRAFT_TITLE_SCAN_BYTES: u64 = 64 * 1024;
+
+// Read at most `cap` bytes from the head of a file, lossily. Never loads a file
+// whole, so an attacker-sized (or agent-sized) draft can't exhaust memory.
+fn read_head(path: &Path, cap: u64) -> String {
+    let Ok(f) = fs::File::open(path) else { return String::new() };
+    let mut buf = Vec::new();
+    if f.take(cap).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn list_drafts_in(dir: &Path) -> Vec<Value> {
     let mut rows: Vec<(u64, Value)> = vec![];
     let Ok(entries) = fs::read_dir(dir) else { return vec![] };
@@ -1504,8 +1518,12 @@ fn list_drafts_in(dir: &Path) -> Vec<Value> {
         }
         let path = canonical_key(&p);
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-        let content = fs::read_to_string(&path).unwrap_or_default();
-        let title = draft_title(&content, stem);
+        // Read only the HEAD of the file: the title comes from the first
+        // non-empty line, but this ran on the welcome screen and slurped every
+        // draft WHOLE — one multi-GB file in Autosave (an agent appending to a
+        // draft, a pasted dump) exhausted memory and aborted the app before it
+        // drew. Bounded like search_walk's scan guard.
+        let title = draft_title(&read_head(&path, DRAFT_TITLE_SCAN_BYTES), stem);
         let ts = file_mtime_ms(&path);
         rows.push((ts, json!({ "path": path.to_string_lossy(), "ts": ts, "title": title })));
     }
@@ -1822,8 +1840,7 @@ fn recovery_for(path: &str) -> Option<String> {
 fn window_doc_path(app: &AppHandle, label: &str) -> Option<String> {
     app.state::<AppState>()
         .docs
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .get(label)
         .map(|d| d.path.clone())
         .filter(|p| !p.is_empty())
@@ -2371,6 +2388,11 @@ fn untitled_recovery_dir() -> PathBuf {
     plume_dir().join("recovery")
 }
 
+// Generous OOM backstop, not a policy limit: far above any document a person
+// edits, so no realistic recovery is lost, while a runaway snapshot can't
+// abort the app during startup recovery.
+const MAX_RECOVERY_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+
 fn untitled_recovery_file(label: &str) -> PathBuf {
     let clean: String = label
         .chars()
@@ -2445,6 +2467,15 @@ fn untitled_recovery() -> Option<Value> {
             continue;
         }
         let p = e.path();
+        // Same unbounded-read class as list_drafts_in, but the fix differs:
+        // this content is the document to be RESTORED, so truncating it would
+        // silently hand back a corrupted buffer. Skip an implausibly large
+        // snapshot instead — losing one recovery beats aborting the process
+        // (and every other window's unsaved work) on the welcome screen.
+        if p.metadata().map(|m| m.len() > MAX_RECOVERY_SNAPSHOT_BYTES).unwrap_or(true) {
+            eprintln!("untitled_recovery: skipping oversized snapshot {}", p.display());
+            continue;
+        }
         let Some(content) = fs::read_to_string(&p)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -3052,8 +3083,29 @@ fn path_within_open_scope(opens: &HashSet<PathBuf>, target: &Path) -> bool {
     false
 }
 
+// The socket write/annotation-read gate (`writeDocument`, `getAnnotations`).
+//
+// This used to be scope-only, on the reasoning that the socket is token-gated
+// and an agent editing a `.env` the user pointed it at is legitimate work. That
+// reasoning was incomplete: it weighed secret DISCLOSURE and missed CODE
+// EXECUTION. Scope is directory-inclusive, so opening one file in a repo made
+// `<repo>/.git/hooks/pre-commit` writable — arbitrary code on the user's next
+// commit — plus `.git/config` (remote URLs, credential helpers) and committed
+// keys. An authenticated channel doesn't help when the threat is a compromised
+// or confused agent rather than an unauthenticated attacker.
+//
+// Same shape as the read gate now: the deny wins over territory, EXCEPT for a
+// file the user opened explicitly, so deliberately editing your own `.env`
+// still works.
 fn write_allowed(app: &AppHandle, target: &Path) -> bool {
-    path_within_open_scope(&open_files(app), target)
+    let st = app.state::<AppState>();
+    let explicitly_opened = st.approved_files.lock_or_recover().contains(target);
+    scope_decision(
+        target,
+        explicitly_opened,
+        path_within_open_scope(&open_files(app), target),
+        false, // dir grants are a READ affordance; a write still needs scope or an explicit open
+    )
 }
 
 // Pure: is `target` inside (or equal to) any of the granted directory roots?
@@ -3617,6 +3669,54 @@ mod tests {
         ] {
             assert!(!is_sensitive_path(Path::new(ok)), "should allow: {ok}");
         }
+    }
+
+    #[test]
+    fn draft_titles_read_only_the_head_of_a_file() {
+        // M3: this ran on the welcome screen and slurped every draft WHOLE.
+        let dir = std::env::temp_dir().join(format!("plume-readhead-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.md");
+        // First line, then far more than the scan window.
+        let mut content = String::from("# Real Title\n");
+        content.push_str(&"x".repeat((DRAFT_TITLE_SCAN_BYTES as usize) * 3));
+        fs::write(&big, &content).unwrap();
+
+        let head = read_head(&big, DRAFT_TITLE_SCAN_BYTES);
+        assert!(head.len() as u64 <= DRAFT_TITLE_SCAN_BYTES, "must not read the whole file");
+        assert!(head.starts_with("# Real Title"), "the head still carries the title");
+        // The title survives despite the bound.
+        assert!(draft_title(&head, "stem").contains("Real Title"));
+        // Missing file → empty, never a panic.
+        assert_eq!(read_head(&dir.join("nope.md"), DRAFT_TITLE_SCAN_BYTES), "");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socket_writes_cannot_reach_code_execution_or_secrets_from_scope_alone() {
+        // H2: the socket write gate shares scope_decision with reads, so an
+        // agent that has the repo in scope still cannot write the paths that
+        // turn a document edit into code execution or credential theft.
+        for exec_or_secret in [
+            "/Users/x/repo/.git/hooks/pre-commit", // runs on the next commit
+            "/Users/x/repo/.git/config",           // remote URLs + credential helper
+            "/Users/x/repo/.git-credentials",
+            "/Users/x/repo/.env",
+            "/Users/x/repo/deploy/id_rsa",
+            "/Users/x/.bash_history",
+        ] {
+            assert!(
+                !scope_decision(Path::new(exec_or_secret), false, true, true),
+                "socket write must be refused from scope alone: {exec_or_secret}"
+            );
+        }
+        // Ordinary documents in that same scope stay writable — the agent
+        // workflow this gate exists to serve is untouched.
+        assert!(scope_decision(Path::new("/Users/x/repo/notes.md"), false, true, false));
+        // And a file the user explicitly opened stays writable even if its name
+        // is on the deny list: editing your own .env is legitimate work.
+        assert!(scope_decision(Path::new("/Users/x/repo/.env"), true, false, false));
     }
 
     #[test]
@@ -4516,8 +4616,7 @@ fn main() {
                     }
                     let survivors: HashSet<PathBuf> = st
                         .open_tabs
-                        .lock()
-                        .unwrap()
+                        .lock_or_recover()
                         .values()
                         .flatten()
                         .cloned()
