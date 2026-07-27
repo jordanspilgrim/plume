@@ -1043,15 +1043,39 @@ async fn open_dialog(app: AppHandle) -> Option<String> {
 
 #[tauri::command]
 async fn save_dialog(app: AppHandle, window: tauri::WebviewWindow, content: String) -> Option<String> {
+    // The doc bound to this window BEFORE we rebind. If it is a draft, ⌘S is a
+    // graduation: write the current buffer to the chosen path, then delete the
+    // Autosave source (SAVEFLOW write-then-delete — never a rename, which would
+    // lose edits newer than the last autosave tick and fail across volumes).
+    let prev = window_doc_path(&app, window.label());
     let picked = app
         .dialog()
         .file()
         .add_filter("Markdown", &["md", "markdown"])
+        // SAVEFLOW: the save dialog opens on ~/Documents by default.
+        .set_directory(home_dir().join("Documents"))
         .set_file_name("Untitled.md")
         .blocking_save_file()?;
     let path = picked.into_path().ok()?;
     let p = path.to_string_lossy().to_string();
+    // Write the CURRENT buffer and confirm it landed before touching the source.
     fs::write(&p, &content).ok()?;
+    // Graduate: only a DRAFT source is deleted (a normal Save As leaves its
+    // original in place); never delete the very file we just wrote.
+    if let Some(prev) = prev {
+        if graduate_should_delete_source(&autosave_key(), Path::new(&prev), &path) {
+            let _ = fs::remove_file(&prev);
+            let _ = fs::remove_file(recovery_path(&prev)); // orphaned draft snapshot
+        }
+    }
+    // The user picked this location in a native dialog — its dir is now
+    // user-established territory (same trust as pick_folder).
+    if let Some(parent) = path.parent() {
+        app.state::<AppState>()
+            .approved_dirs
+            .lock_or_recover()
+            .insert(canonical_key(parent));
+    }
     clear_untitled_recovery(window.label());
     set_current(&app, window.label(), &p, &content);
     Some(p)
@@ -1111,6 +1135,296 @@ fn materialize_doc(app: AppHandle, window: tauri::WebviewWindow, dir: Option<Str
     clear_untitled_recovery(window.label());
     set_current(&app, window.label(), &p, &content);
     Some(p)
+}
+
+// ---- SAVEFLOW: draft autosave ----
+// Untitled markdown buffers autosave here as real .md files — the Autosave file
+// IS the draft's persistence. "Is a draft" is DERIVED (a bound path inside this
+// ONE canonical dir), never a stored flag; the renderer mirrors the rule via the
+// authoritative drafts_dir() prefix. This subdir alone is always in fs scope (see
+// fs_scope_allows); its parent ~/Documents/Plume is NOT blanket-allowed.
+fn autosave_dir() -> PathBuf {
+    default_plume_dir().join("Autosave")
+}
+
+// Canonicalized Autosave dir for containment/prefix comparisons. Falls back to the
+// literal path only when the dir does not exist yet; every caller that needs a
+// stable canonical form (drafts_dir, create_draft) ensures the dir first.
+fn autosave_key() -> PathBuf {
+    canonical_key(&autosave_dir())
+}
+
+// Component-wise containment: ".../Autosave-evil" does NOT count as inside
+// ".../Autosave" (Path::starts_with compares whole components). The dir itself
+// counts as "in scope"; discard_draft additionally demands STRICTLY inside.
+fn is_within_autosave(autosave: &Path, target: &Path) -> bool {
+    target == autosave || target.starts_with(autosave)
+}
+
+// On Save As: delete the previous binding as a graduated draft iff it lived inside
+// Autosave AND is not the very file we just wrote. A normal (non-draft) Save As
+// leaves its original untouched.
+fn graduate_should_delete_source(autosave: &Path, prev: &Path, chosen: &Path) -> bool {
+    let prev = canonical_key(prev);
+    is_within_autosave(autosave, &prev) && prev.as_path() != autosave && prev != canonical_key(chosen)
+}
+
+// discard_draft's containment gate (pure, unit-tested): a deletable draft is a
+// REGULAR FILE strictly inside the Autosave dir.
+fn draft_delete_ok(autosave: &Path, target: &Path, is_regular_file: bool) -> bool {
+    is_regular_file && target != autosave && target.starts_with(autosave)
+}
+
+// Write a fresh, collision-free draft file (pure FS — no AppHandle, so it
+// unit-tests against a temp dir). Ensures the dir, uniquifies the sanitized stem.
+fn write_new_draft(autosave: &Path, suggested: &str, content: &str) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(autosave)?;
+    let path = unique_path(autosave, &sanitize_stem(suggested), "md");
+    fs::write(&path, content)?;
+    Ok(path)
+}
+
+// The canonical Autosave dir — the authoritative prefix the renderer uses for
+// is-draft derivation (bridge draftsDir). Created on demand so the returned path
+// is fully canonical and shares create_draft's form.
+#[tauri::command]
+fn drafts_dir() -> Option<String> {
+    let dir = autosave_dir();
+    fs::create_dir_all(&dir).ok()?;
+    Some(canonical_key(&dir).to_string_lossy().to_string())
+}
+
+// Create + bind a new draft from a never-saved markdown buffer. The renderer calls
+// this on the first autosave tick of an untitled markdown doc; after binding, the
+// normal bound write_file autosave path takes over. Returns { path } (canonical,
+// so it shares the drafts_dir prefix). None on failure (bridge catches -> null).
+#[tauri::command]
+fn create_draft(app: AppHandle, window: tauri::WebviewWindow, suggested_name: String, content: String) -> Option<Value> {
+    let path = write_new_draft(&autosave_dir(), &suggested_name, &content).ok()?;
+    let p = canonical_key(&path).to_string_lossy().to_string();
+    set_current(&app, window.label(), &p, &content);
+    Some(json!({ "path": p }))
+}
+
+// A human label for a draft: the first non-empty line (heading/bullet markers
+// stripped), falling back to the filename stem. The stem is the creation-time
+// name and goes stale as the draft is edited, so the live first line wins.
+fn draft_title(content: &str, stem_fallback: &str) -> String {
+    for line in content.lines() {
+        let t = line
+            .trim()
+            .trim_start_matches('#')
+            .trim_start_matches(['-', '*', '+'])
+            .trim();
+        if !t.is_empty() {
+            return t.chars().take(120).collect();
+        }
+    }
+    stem_fallback.to_string()
+}
+
+// Pure (unit-testable against a temp dir): the .md drafts in `dir`, newest first,
+// as { path, ts, title }. Each path is CANONICALIZED so it shares the exact form
+// drafts_dir()/create_draft return — otherwise a draft opened from this list on a
+// Mac with a symlinked ~/Documents (iCloud sync) would carry a divergent prefix
+// and silently stop classifying as a draft (N1).
+fn list_drafts_in(dir: &Path) -> Vec<Value> {
+    let mut rows: Vec<(u64, Value)> = vec![];
+    let Ok(entries) = fs::read_dir(dir) else { return vec![] };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_file() || p.extension().and_then(|x| x.to_str()) != Some("md") {
+            continue;
+        }
+        let path = canonical_key(&p);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        let title = draft_title(&content, stem);
+        let ts = file_mtime_ms(&path);
+        rows.push((ts, json!({ "path": path.to_string_lossy(), "ts": ts, "title": title })));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.into_iter().map(|(_, v)| v).collect()
+}
+
+// The .md drafts currently in Autosave/ (renderer welcome/palette group). Read-only,
+// newest first.
+#[tauri::command]
+fn list_drafts() -> Vec<Value> {
+    list_drafts_in(&autosave_dir())
+}
+
+// Delete a draft — the ONLY renderer-callable unlink primitive, so HARD-CONTAINED:
+// canonicalize, require STRICTLY inside the canonical Autosave dir AND a regular
+// file, then unlink (+ clear its recovery snapshot). Anything else is refused with
+// an eprintln! and never touched.
+#[tauri::command]
+fn discard_draft(path: String) -> bool {
+    let target = canonical_key(Path::new(&path));
+    let autosave = autosave_key();
+    let inside = target != autosave && target.starts_with(&autosave);
+    if !draft_delete_ok(&autosave, &target, target.is_file()) {
+        if inside {
+            eprintln!("discard_draft refused: {path} is not a regular file");
+        } else {
+            eprintln!("discard_draft refused: {path} is not inside the Autosave dir");
+        }
+        return false;
+    }
+    match fs::remove_file(&target) {
+        Ok(()) => {
+            // Clear the recovery snapshot keyed by the CANONICAL bound path
+            // snapshot() wrote under (create_draft binds the canonical form) —
+            // not the raw arg, which can diverge under a symlinked ~/Documents (N3).
+            let _ = fs::remove_file(recovery_path(&target.to_string_lossy()));
+            true
+        }
+        Err(e) => {
+            eprintln!("discard_draft failed to delete {path}: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod saveflow_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("plume-saveflow-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // The Autosave subdir is in scope; its PARENT ~/Documents/Plume is NOT blanket
+    // allowed, and a sibling "Autosave-evil" must not be swept in.
+    #[test]
+    fn autosave_containment_is_subdir_only() {
+        let av = Path::new("/Users/x/Documents/Plume/Autosave");
+        assert!(is_within_autosave(av, av)); // the dir itself is in scope
+        assert!(is_within_autosave(av, &av.join("note.md")));
+        assert!(is_within_autosave(av, &av.join("sub/deep.md")));
+        // parent Plume dir is NOT in scope (only the Autosave subdir is)
+        assert!(!is_within_autosave(av, Path::new("/Users/x/Documents/Plume/other.md")));
+        assert!(!is_within_autosave(av, Path::new("/Users/x/Documents/Plume")));
+        // sibling prefix trap
+        assert!(!is_within_autosave(av, Path::new("/Users/x/Documents/Plume/Autosave-evil/x.md")));
+        assert!(!is_within_autosave(av, Path::new("/etc/passwd")));
+    }
+
+    // create_draft's core: uniquifies within Autosave and writes the content.
+    #[test]
+    fn write_new_draft_uniquifies() {
+        let av = tmp("uniq").join("Autosave");
+        let a = write_new_draft(&av, "My Note!", "alpha").unwrap();
+        let b = write_new_draft(&av, "My Note!", "beta").unwrap();
+        assert_ne!(a, b, "second draft with the same name must uniquify");
+        assert!(a.exists() && b.exists());
+        assert_eq!(a.file_name().unwrap().to_string_lossy(), "My-Note.md"); // sanitized stem
+        assert_eq!(b.file_name().unwrap().to_string_lossy(), "My-Note-2.md");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "alpha");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "beta");
+        let _ = fs::remove_dir_all(av.parent().unwrap());
+    }
+
+    // Graduate = WRITE-THEN-DELETE: the chosen file exists and NOTHING is left in
+    // Autosave. A non-draft source or the same-file case is never deleted.
+    #[test]
+    fn graduate_write_then_delete_leaves_autosave_empty() {
+        let root = tmp("grad");
+        let av = root.join("Autosave");
+        let draft = write_new_draft(&av, "draft", "old-tick").unwrap();
+        // av now exists; canonicalize for containment (prod passes autosave_key(),
+        // already canonical — macOS temp_dir resolves /var -> /private/var).
+        let avk = canonical_key(&av);
+        let chosen = root.join("final.md");
+        assert!(graduate_should_delete_source(&avk, &draft, &chosen));
+        assert!(!graduate_should_delete_source(&avk, &draft, &draft), "same file must not self-delete");
+        let outside = root.join("outside.md");
+        fs::write(&outside, "x").unwrap();
+        assert!(!graduate_should_delete_source(&avk, &outside, &chosen), "a non-draft source stays");
+        // mirror save_dialog's core: write the CURRENT buffer, then delete the source
+        fs::write(&chosen, "current-buffer").unwrap();
+        if graduate_should_delete_source(&avk, &draft, &chosen) {
+            fs::remove_file(&draft).unwrap();
+        }
+        assert!(!draft.exists());
+        assert!(chosen.exists());
+        assert_eq!(fs::read_to_string(&chosen).unwrap(), "current-buffer");
+        assert_eq!(fs::read_dir(&av).unwrap().count(), 0, "Autosave left empty after graduation");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // discard_draft's gate refuses a path outside Autosave and a non-regular file;
+    // accepts a regular file strictly inside.
+    #[test]
+    fn draft_delete_gate_refuses_outside_and_nonfile() {
+        let av = Path::new("/Users/x/Documents/Plume/Autosave");
+        assert!(draft_delete_ok(av, &av.join("d.md"), true));
+        assert!(!draft_delete_ok(av, Path::new("/tmp/evil.md"), true), "outside Autosave refused");
+        assert!(!draft_delete_ok(av, &av.join("subdir"), false), "non-regular file refused");
+        assert!(!draft_delete_ok(av, av, true), "the Autosave dir itself is not a draft");
+    }
+
+    // The live command refuses non-contained targets without unlinking anything
+    // (HOME-independent: /tmp is never inside ~/Documents/Plume/Autosave, and an
+    // in-Autosave path that isn't a regular file is refused too).
+    #[test]
+    fn discard_draft_refuses_and_never_unlinks_outside() {
+        let outside = tmp("disc").join("keep.md");
+        fs::write(&outside, "keep me").unwrap();
+        assert!(!discard_draft(outside.to_string_lossy().to_string()));
+        assert!(outside.exists(), "a path outside Autosave must never be unlinked");
+        // inside-but-nonexistent → not a regular file → refused, no side effect
+        let ghost = autosave_dir().join(format!("ghost-{}.md", std::process::id()));
+        assert!(!discard_draft(ghost.to_string_lossy().to_string()));
+        let _ = fs::remove_dir_all(outside.parent().unwrap());
+    }
+
+    // N1 + N4: every list_drafts path is CANONICAL (shares the drafts_dir prefix)
+    // even when reached through a symlinked entry point — the iCloud ~/Documents
+    // symlink case that made drafts silently stop classifying. Also asserts the
+    // { path, ts, title } contract shape and title semantics.
+    #[test]
+    #[cfg(unix)]
+    fn list_drafts_canonicalizes_through_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = tmp("list");
+        let real_av = root.join("real").join("Autosave");
+        // first-line title (markers stripped) vs empty-file → stem fallback
+        write_new_draft(&real_av, "old-stem", "# Live Title\n\nbody").unwrap();
+        write_new_draft(&real_av, "just-stem", "").unwrap();
+        let canon_av = canonical_key(&real_av);
+
+        // A symlinked view of the same tree (mimics iCloud's ~/Documents symlink).
+        let link_root = root.join("link");
+        symlink(root.join("real"), &link_root).unwrap();
+        let link_av = link_root.join("Autosave");
+
+        for rows in [list_drafts_in(&real_av), list_drafts_in(&link_av)] {
+            assert_eq!(rows.len(), 2, "both .md drafts listed");
+            for r in &rows {
+                let path = PathBuf::from(r["path"].as_str().unwrap());
+                assert_eq!(path, canonical_key(&path), "path must be canonical");
+                assert!(
+                    path.starts_with(&canon_av),
+                    "path must share the canonical Autosave prefix regardless of symlink: {path:?}"
+                );
+                assert!(r["ts"].is_u64(), "contract: ts present");
+                assert!(r["title"].is_string(), "contract: title present");
+                assert!(r.get("name").is_none() && r.get("modified").is_none(), "old keys gone");
+            }
+        }
+
+        let titles: Vec<String> = list_drafts_in(&real_av)
+            .iter()
+            .map(|r| r["title"].as_str().unwrap().to_string())
+            .collect();
+        assert!(titles.contains(&"Live Title".to_string()), "first-line title wins: {titles:?}");
+        assert!(titles.contains(&"just-stem".to_string()), "empty draft falls back to stem: {titles:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 // Rename the current file in place (same folder, new stem), collision-safe and
@@ -2525,6 +2839,14 @@ fn fs_scope_allows(app: &AppHandle, target: &Path) -> bool {
     if is_sensitive_path(target) {
         return false; // cheap and decisive — skip the scope walk entirely
     }
+    // SAVEFLOW: the canonical Autosave draft home is always in scope so draft
+    // reads/writes pass — but ONLY this subdir, never ~/Documents/Plume at large.
+    // BELOW the sensitive deny (N2): a sensitive-NAMED file dropped into Autosave
+    // by something other than Plume must not become readable through this grant.
+    // Zero functional loss — Plume's own drafts are always sanitized .md.
+    if is_within_autosave(&autosave_key(), target) {
+        return true;
+    }
     let in_open_scope = path_within_open_scope(&open_files(app), target);
     let in_approved_dir = {
         let dirs = st.approved_dirs.lock_or_recover();
@@ -3553,6 +3875,10 @@ fn main() {
             open_dialog,
             save_dialog,
             materialize_doc,
+            create_draft,
+            list_drafts,
+            discard_draft,
+            drafts_dir,
             rename_file,
             pick_folder,
             default_docs_dir,
