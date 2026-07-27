@@ -767,6 +767,9 @@ async fn export_doc(app: AppHandle, format: String, html: String, default_name: 
         };
     }
     if ext == "docx" {
+        // Vet + inline every remote image BEFORE the sidecar sees the HTML, so
+        // html-to-docx never fetches anything (export SSRF choke point).
+        let html = sanitize_export_html(&html);
         let mut res = run_sidecar(&app, &json!({ "cmd": "docx", "html": html, "out": p }));
         if res["ok"] == true {
             res["path"] = Value::String(p);
@@ -779,6 +782,266 @@ async fn export_doc(app: AppHandle, format: String, html: String, default_name: 
 #[tauri::command]
 async fn publish_google(app: AppHandle, markdown: String, default_name: Option<String>) -> Value {
     run_sidecar(&app, &json!({ "cmd": "gdocs", "markdown": markdown, "defaultName": default_name }))
+}
+
+// ---- export SSRF choke point ----
+// A document is untrusted, and `![](http://169.254.169.254/…)` becomes a plain
+// <img src>. Both export renderers used to fetch those themselves — html-to-docx
+// in the Node sidecar (twice per image, following redirects) and WKWebView for
+// PDF — reaching cloud metadata, loopback and intranet hosts from the user's
+// machine, and embedding whatever came back into a file they may then share.
+// link_preview's guard never saw those paths.
+//
+// So every export now goes through here FIRST: each remote <img src> is fetched
+// by Rust through the same vetted-address path as link_preview and inlined as a
+// data: URI, or dropped to its alt text. The renderers receive zero remote URLs
+// and never need the network. Deliberately NOT a "is this host safe?" helper for
+// the sidecar: a check in one process followed by a fetch in another re-creates
+// the DNS-rebinding window cluster D closed — whoever connects must be whoever
+// vetted the address.
+const EXPORT_IMG_MAX_BYTES: u64 = 8 * 1024 * 1024; // per image
+const EXPORT_IMG_TIMEOUT: Duration = Duration::from_secs(10);
+const EXPORT_TOTAL_BUDGET: Duration = Duration::from_secs(45);
+const EXPORT_MAX_IMAGES: usize = 40;
+
+// Minimal base64 (no new dependency for ~20 lines).
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+// True for the schemes this rewriter must vet. Anything else (data:, relative,
+// file:, asset:) is left exactly as-is: those never make Plume fetch a remote
+// host, and rewriting them would change existing export behavior.
+fn is_remote_url(src: &str) -> bool {
+    let s = src.trim().to_ascii_lowercase();
+    s.starts_with("http://") || s.starts_with("https://") || s.starts_with("//")
+}
+
+// Fetch one image through the vetted-address path and return a data: URI.
+// Fail-closed at every step: non-public address, redirect, non-image type, or
+// oversize all yield None, and the caller falls back to alt text.
+fn fetch_image_data_uri(url: &str) -> Option<String> {
+    // Protocol-relative "//host/x.png" has no scheme for the resolver; assume
+    // https rather than guessing http (and never silently downgrade).
+    let absolute = if url.trim().starts_with("//") { format!("https:{}", url.trim()) } else { url.trim().to_string() };
+    let vetted = resolve_public_addrs(&absolute)?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(EXPORT_IMG_TIMEOUT)
+        .redirects(0) // a public URL that 30x's to an internal host is refused, not followed
+        .resolver(move |_: &str| Ok(vetted.clone()))
+        .build();
+    let resp = agent.get(&absolute).set("User-Agent", PREVIEW_UA).call().ok()?;
+    let ct = resp.content_type().to_string();
+    let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(EXPORT_IMG_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.is_empty() || buf.len() as u64 > EXPORT_IMG_MAX_BYTES {
+        return None;
+    }
+    Some(format!("data:{};base64,{}", mime, base64_encode(&buf)))
+}
+
+// Escape a string for use as HTML text (alt-text fallback).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+// Walk a tag's attributes the way an HTML parser does: name, optional '=',
+// then a quoted-or-bare value, with the FIRST occurrence of a name winning.
+// Returns None if the tag does not cleanly parse, so the caller can fail closed.
+//
+// Substring matching (`find("src=")`) is NOT good enough here, and the failure
+// is exploitable — pkg-dev measured it fetching. In
+//   <img alt="<img src=data:image/png;base64,AAA>" src="http://attacker/x.png">
+// the first `src=` lives inside the ALT value, so a substring reader either
+// concludes "already data:, leave it" or finds no usable src and passes the tag
+// through — while the converter's real parser sees the remote src and fetches
+// it. Walking attributes means the src we vet is the src the parser will use.
+// First-wins also matches how parsers resolve duplicates, so a trailing
+// `src="data:…"` decoy cannot rescue a leading remote one.
+fn parse_tag_attrs(tag: &str) -> Option<Vec<(String, String)>> {
+    let inner = tag.strip_prefix('<')?.strip_suffix('>')?;
+    let inner = inner.strip_suffix('/').unwrap_or(inner);
+    let c: Vec<char> = inner.chars().collect();
+    let mut i = 0;
+    while i < c.len() && !c[i].is_whitespace() {
+        i += 1; // tag name
+    }
+    let mut attrs: Vec<(String, String)> = vec![];
+    loop {
+        while i < c.len() && c[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= c.len() {
+            return Some(attrs);
+        }
+        let name_start = i;
+        while i < c.len() && !c[i].is_whitespace() && c[i] != '=' {
+            i += 1;
+        }
+        if i == name_start {
+            return None; // no progress (e.g. a stray '=') — unparseable, fail closed
+        }
+        let name: String = c[name_start..i].iter().collect::<String>().to_ascii_lowercase();
+        while i < c.len() && c[i].is_whitespace() {
+            i += 1;
+        }
+        let mut value = String::new();
+        if i < c.len() && c[i] == '=' {
+            i += 1;
+            while i < c.len() && c[i].is_whitespace() {
+                i += 1;
+            }
+            if i < c.len() && (c[i] == '"' || c[i] == '\'') {
+                let q = c[i];
+                i += 1;
+                let vs = i;
+                while i < c.len() && c[i] != q {
+                    i += 1;
+                }
+                if i >= c.len() {
+                    return None; // unterminated quote — unparseable, fail closed
+                }
+                value = c[vs..i].iter().collect();
+                i += 1;
+            } else {
+                let vs = i;
+                while i < c.len() && !c[i].is_whitespace() {
+                    i += 1;
+                }
+                value = c[vs..i].iter().collect();
+            }
+        }
+        if !attrs.iter().any(|(n, _)| n == &name) {
+            attrs.push((name, value)); // first occurrence wins
+        }
+    }
+}
+
+fn attr_of<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attrs.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+}
+
+// Rewrite ONE <img …> tag. `fetch` is injected so the policy is unit-testable
+// without a network. Every path REBUILDS the tag from the attributes we vetted
+// (src + alt) rather than passing the original through — pass-through is what
+// lets an unrecognised attribute carry a second remote reference.
+fn rewrite_img_tag(tag: &str, fetch: &mut dyn FnMut(&str) -> Option<String>) -> String {
+    let Some(attrs) = parse_tag_attrs(tag) else {
+        return String::new(); // unparseable → drop, never trust
+    };
+    let alt = attr_of(&attrs, "alt").unwrap_or_default().to_string();
+    let alt_fallback = || {
+        if alt.trim().is_empty() {
+            String::new()
+        } else {
+            format!("<span>{}</span>", html_escape(&alt))
+        }
+    };
+    let src = match attr_of(&attrs, "src") {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => return alt_fallback(), // no usable src — nothing to render
+    };
+    if !is_remote_url(&src) {
+        // data:/relative/file: never makes Plume fetch a remote host. Keep the
+        // src, but still emit only the attributes we parsed.
+        return format!("<img src=\"{}\" alt=\"{}\">", html_escape(&src), html_escape(&alt));
+    }
+    match fetch(&src) {
+        Some(data_uri) => format!("<img src=\"{}\" alt=\"{}\">", data_uri, html_escape(&alt)),
+        // Refused: keep the author's alt text so the document still reads.
+        None => alt_fallback(),
+    }
+}
+
+// End of the tag starting at `start`, QUOTE-AWARE: the terminating '>' is the
+// first one outside an attribute value.
+//
+// A naive `find('>')` truncates the tag at a '>' inside a quoted value, and
+// that is a BYPASS, not a cosmetic bug: for `<img alt="a>b" src="http://evil/">`
+// the scan would stop before `src`, leave the whole thing untouched — and a
+// real HTML parser (WKWebView, html-to-docx) would then read one well-formed
+// tag with a live remote src and fetch it. Our own markdown pipeline escapes
+// '>' inside attributes, but a sanitizer must not be correct only because of
+// what its current caller happens to emit.
+fn tag_end(html: &str, start: usize) -> usize {
+    let mut quote: Option<char> = None;
+    for (off, c) in html[start..].char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '>' => return start + off + c.len_utf8(),
+            None => {}
+        }
+    }
+    html.len() // unterminated tag — consume the rest
+}
+
+// Rewrite every <img> in `html` (see rewrite_img_tag). Offsets index the
+// ORIGINAL string via find_ci — never a lowercased copy (cluster C).
+fn sanitize_export_html_with(html: &str, fetch: &mut dyn FnMut(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while let Some(rel) = html.get(i..).and_then(|s| find_ci(s, "<img")) {
+        let start = i + rel;
+        let end = tag_end(html, start);
+        if end <= start {
+            break; // defensive: never spin on a zero-width step
+        }
+        out.push_str(slice_clamped(html, i, start));
+        out.push_str(&rewrite_img_tag(slice_clamped(html, start, end), fetch));
+        i = end;
+    }
+    out.push_str(slice_clamped(html, i, html.len()));
+    out
+}
+
+fn sanitize_export_html(html: &str) -> String {
+    let deadline = std::time::Instant::now() + EXPORT_TOTAL_BUDGET;
+    let mut fetched = 0usize;
+    let mut fetch = move |url: &str| -> Option<String> {
+        // Bound the work a hostile document can cause: a doc with hundreds of
+        // images, or slow hosts, must not hang the export indefinitely. Past
+        // either bound everything remaining degrades to alt text.
+        if fetched >= EXPORT_MAX_IMAGES || std::time::Instant::now() >= deadline {
+            return None;
+        }
+        fetched += 1;
+        fetch_image_data_uri(url)
+    };
+    sanitize_export_html_with(html, &mut fetch)
+}
+
+// Defense in depth for the PDF path (pkg-dev's measurement: WebKit enforces a
+// document CSP, so an unenumerated subresource vector still cannot fetch after
+// inlining). Injected into <head> if there is one; otherwise prepended.
+const EXPORT_CSP: &str = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:\">";
+
+fn with_export_csp(html: &str) -> String {
+    match find_ci(html, "<head>") {
+        Some(i) => {
+            let at = i + "<head>".len();
+            format!("{}{}{}", slice_clamped(html, 0, at), EXPORT_CSP, slice_clamped(html, at, html.len()))
+        }
+        None => format!("{}{}", EXPORT_CSP, html),
+    }
 }
 
 // ---- PDF export: render HTML in a hidden WKWebView, then WKWebView.createPDF ----
@@ -1003,6 +1266,9 @@ async fn export_pdf(app: AppHandle, html: String, default_name: Option<String>) 
         .set_file_name(&format!("{}.pdf", default_name.unwrap_or_else(|| "document".into())))
         .blocking_save_file()?;
     let out = picked.into_path().ok()?.to_string_lossy().to_string();
+    // Same choke point for PDF: WKWebView receives no remote URLs, and the
+    // injected CSP stops any vector we didn't enumerate from fetching.
+    let html = with_export_csp(&sanitize_export_html(&html));
     match generate_pdf(&app, html) {
         Ok(bytes) if !bytes.is_empty() => { fs::write(&out, bytes).ok()?; Some(out) }
         _ => None,
@@ -3110,6 +3376,219 @@ mod tests {
         assert_eq!(urlencoding_decode("%2G"), "%2G");
         // Uppercase and lowercase hex both decode.
         assert_eq!(urlencoding_decode("%2f%2F"), "//");
+    }
+
+    // ---- export SSRF choke point ----
+    // The policy is tested with an injected fetch, so these assert what the
+    // rewriter DOES rather than what a network happens to answer.
+
+    #[test]
+    fn remote_images_are_inlined_and_failures_degrade_to_alt_text() {
+        let mut seen: Vec<String> = vec![];
+        let mut fetch = |u: &str| {
+            seen.push(u.to_string());
+            (u.contains("good")).then(|| "data:image/png;base64,AAAA".to_string())
+        };
+        let html = r#"<p><img src="https://good.example/a.png" alt="Chart"><img src="http://169.254.169.254/latest/meta-data/iam" alt="secret"></p>"#;
+        let out = sanitize_export_html_with(html, &mut fetch);
+        // The vetted one is inlined; nothing remote survives in the output.
+        assert!(out.contains("data:image/png;base64,AAAA"));
+        assert!(!out.contains("169.254.169.254"));
+        assert!(!out.contains("https://good.example"));
+        // A refused fetch keeps the author's alt text so the doc still reads.
+        assert!(out.contains("secret"));
+        // Both were offered to the guard — the rewriter never decides on its own.
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn non_remote_srcs_are_kept_without_fetching() {
+        // NB: this asserts SEMANTICS (src preserved, no fetch), not byte
+        // identity. The original version demanded output == input, which forced
+        // pass-through of the untouched tag — and pass-through is precisely
+        // what let a hidden remote src survive (see the parser-differential
+        // test below). Rebuilding from vetted attributes is the safe shape.
+        let mut fetch = |_: &str| -> Option<String> { panic!("must not fetch a non-remote src") };
+        for (html, keep) in [
+            (r#"<img src="data:image/png;base64,AAAA" alt="x">"#, "data:image/png;base64,AAAA"),
+            (r#"<img src="assets/local.png" alt="x">"#, "assets/local.png"),
+            (r#"<img src="file:///tmp/x.png">"#, "file:///tmp/x.png"),
+        ] {
+            let out = sanitize_export_html_with(html, &mut fetch);
+            assert!(out.contains(keep), "local src must survive: {out}");
+            assert!(out.starts_with("<img "), "still an image: {out}");
+        }
+        // No usable src → nothing to render; alt text carries the meaning.
+        assert_eq!(sanitize_export_html_with(r#"<img alt="no src">"#, &mut fetch), "<span>no src</span>");
+    }
+
+    #[test]
+    fn a_src_hidden_inside_another_attribute_cannot_escape_vetting() {
+        // pkg-dev's measured parser differential: the FIRST `src=` in the byte
+        // stream lives inside the alt VALUE, so a substring reader sees a
+        // harmless data: (or no usable src) and passes the tag through — while
+        // the converter's real parser uses the trailing remote src and fetches
+        // it. Walking attributes is what makes the vetted src the used src.
+        let mut seen: Vec<String> = vec![];
+        let mut fetch = |u: &str| { seen.push(u.to_string()); None };
+        let out = sanitize_export_html_with(
+            r#"<img alt="<img src=data:image/png;base64,AAA>" src="http://attacker.example/x.png">"#,
+            &mut fetch,
+        );
+        assert_eq!(seen, vec!["http://attacker.example/x.png"], "the REAL src must be the one vetted");
+        assert!(!out.contains("attacker.example"), "refused src must not survive: {out}");
+
+        // Duplicate attributes: first wins, matching HTML parsers — a trailing
+        // data: decoy cannot rescue a leading remote src.
+        let mut seen2: Vec<String> = vec![];
+        let mut f2 = |u: &str| { seen2.push(u.to_string()); None };
+        let out2 = sanitize_export_html_with(
+            r#"<img src="http://evil.example/a.png" src="data:image/png;base64,AAAA" alt="d">"#,
+            &mut f2,
+        );
+        assert_eq!(seen2, vec!["http://evil.example/a.png"]);
+        assert!(!out2.contains("evil.example"));
+
+        // Quoted inner decoy, single quotes, and a bare (unquoted) remote src.
+        let mut seen3: Vec<String> = vec![];
+        let mut f3 = |u: &str| { seen3.push(u.to_string()); None };
+        let out3 = sanitize_export_html_with(
+            r#"<img title="x src='data:image/png;base64,AA'" src=http://evil.example/b.png alt='t'>"#,
+            &mut f3,
+        );
+        assert_eq!(seen3, vec!["http://evil.example/b.png"], "bare values parse too");
+        assert!(!out3.contains("evil.example"));
+    }
+
+    #[test]
+    fn unparseable_tags_are_dropped_not_trusted() {
+        let mut fetch = |_: &str| -> Option<String> { panic!("must not fetch from an unparseable tag") };
+        // Unterminated quote: a real parser may still recover a src, so we must
+        // not emit the original markup.
+        let out = sanitize_export_html_with(r#"<img src="http://evil.example/x.png alt=y>"#, &mut fetch);
+        assert!(!out.contains("evil.example"), "unparseable tag must be dropped: {out}");
+        assert_eq!(parse_tag_attrs(r#"<img src="unterminated>"#), None);
+        assert_eq!(parse_tag_attrs("<img ="), None);
+    }
+
+    #[test]
+    fn parse_tag_attrs_reads_quoted_bare_and_valueless_attributes() {
+        let a = parse_tag_attrs(r#"<img SRC="a b.png" alt='q' hidden data-x=bare />"#).unwrap();
+        assert_eq!(attr_of(&a, "src"), Some("a b.png"));
+        assert_eq!(attr_of(&a, "alt"), Some("q"));
+        assert_eq!(attr_of(&a, "hidden"), Some("")); // valueless
+        assert_eq!(attr_of(&a, "data-x"), Some("bare"));
+        assert_eq!(attr_of(&a, "missing"), None);
+        assert_eq!(parse_tag_attrs("<img>").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rewritten_tags_cannot_smuggle_a_second_remote_reference() {
+        // Attributes we don't control are dropped, not carried over: the
+        // replacement tag is rebuilt from src + alt only.
+        let mut fetch = |_: &str| Some("data:image/png;base64,AAAA".to_string());
+        let html = r#"<img src="https://a.example/x.png" srcset="https://evil.example/y.png 2x" style="background:url(https://evil.example/z.png)" onerror="x()" alt="ok">"#;
+        let out = sanitize_export_html_with(html, &mut fetch);
+        assert!(!out.contains("evil.example"), "no other remote ref may survive: {out}");
+        assert!(!out.contains("onerror"));
+        assert_eq!(out, r#"<img src="data:image/png;base64,AAAA" alt="ok">"#);
+    }
+
+    #[test]
+    fn protocol_relative_and_uppercase_tags_are_still_vetted() {
+        let mut seen: Vec<String> = vec![];
+        let mut fetch = |u: &str| { seen.push(u.to_string()); None };
+        let out = sanitize_export_html_with(r#"<IMG SRC="//evil.example/x.png" ALT="a">"#, &mut fetch);
+        assert_eq!(seen, vec!["//evil.example/x.png"], "case-insensitive tag/attr matching");
+        assert!(!out.contains("evil.example"));
+        assert!(out.contains('a'));
+    }
+
+    #[test]
+    fn alt_text_is_escaped_and_surrounding_markup_survives() {
+        let mut fetch = |_: &str| -> Option<String> { None };
+        let out = sanitize_export_html_with(
+            r#"<h1>T</h1><img src="https://a.example/x.png" alt="<script>x</script>"><p>after</p>"#,
+            &mut fetch,
+        );
+        assert!(out.starts_with("<h1>T</h1>"));
+        assert!(out.ends_with("<p>after</p>"));
+        assert!(!out.contains("<script>"), "alt text must be escaped: {out}");
+        assert!(out.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn a_gt_inside_an_attribute_cannot_hide_a_remote_src() {
+        // Found by the escaping test below: with a naive find('>') the tag was
+        // truncated at the '>' inside alt, so `src` was never seen and the
+        // ORIGINAL markup passed through — while a real HTML parser reads one
+        // well-formed tag with a live remote src and fetches it. Quote-aware
+        // scanning is what makes the vetting unskippable.
+        let mut seen: Vec<String> = vec![];
+        let mut fetch = |u: &str| { seen.push(u.to_string()); None };
+        let out = sanitize_export_html_with(
+            r#"<img alt="a>b" src="http://169.254.169.254/latest/meta-data/">"#,
+            &mut fetch,
+        );
+        assert_eq!(seen, vec!["http://169.254.169.254/latest/meta-data/"], "src must still be vetted");
+        assert!(!out.contains("169.254.169.254"), "refused src must not survive: {out}");
+        // Single quotes and a '>' in a title attribute behave the same.
+        let mut seen2: Vec<String> = vec![];
+        let mut f2 = |u: &str| { seen2.push(u.to_string()); None };
+        let out2 = sanitize_export_html_with(
+            r#"<img title='x>y' src='http://evil.example/p.png' alt='t'>"#,
+            &mut f2,
+        );
+        assert_eq!(seen2, vec!["http://evil.example/p.png"]);
+        assert!(!out2.contains("evil.example"));
+    }
+
+    #[test]
+    fn tag_end_is_quote_aware() {
+        let s = r#"<img alt="a>b" src="x">tail"#;
+        assert_eq!(&s[..tag_end(s, 0)], r#"<img alt="a>b" src="x">"#);
+        assert_eq!(tag_end("<img src=\"x\"", 0), 12); // unterminated → rest of input
+        assert_eq!(&"<img>"[..tag_end("<img>", 0)], "<img>");
+    }
+
+    #[test]
+    fn malformed_and_hostile_img_markup_terminates() {
+        let mut fetch = |_: &str| Some("data:image/png;base64,AAAA".to_string());
+        // Unclosed tags, empty srcs, and a stream of them must not hang or panic.
+        for html in ["<img", "<img src=", "<img><img><img>", "<img src=\"\">", "a<img src=\"https://x.example/1.png\">b"] {
+            let _ = sanitize_export_html_with(html, &mut fetch);
+        }
+    }
+
+    #[test]
+    fn export_csp_is_injected_into_head() {
+        let with_head = with_export_csp("<html><head><title>t</title></head><body>x</body></html>");
+        assert!(with_head.contains("default-src 'none'; img-src data:"));
+        assert!(with_head.find("Content-Security-Policy") < with_head.find("<title>"), "CSP must precede content");
+        // No <head>: still present, ahead of everything.
+        assert!(with_export_csp("<p>x</p>").starts_with("<meta http-equiv=\"Content-Security-Policy\""));
+    }
+
+    #[test]
+    fn base64_encodes_with_correct_padding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0xfd]), "//79"); // binary, incl. + / alphabet
+    }
+
+    #[test]
+    fn is_remote_url_classifies_schemes() {
+        for r in ["http://a/x.png", "HTTPS://A/x.png", " //a/x.png", "https://a/x"] {
+            assert!(is_remote_url(r), "should be remote: {r}");
+        }
+        for l in ["data:image/png;base64,AA", "assets/x.png", "/abs/x.png", "file:///x.png", "asset://localhost/x"] {
+            assert!(!is_remote_url(l), "should be local: {l}");
+        }
     }
 
     #[test]
