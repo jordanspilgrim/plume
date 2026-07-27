@@ -20,6 +20,11 @@ ureq = "2"
 getrandom = "0.2"
 sha2 = "0.10"
 
+# Process-group kill for the bounded node probe (node_runs): a hung shim's
+# descendants must die with it, not get orphaned by a direct-child kill.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"

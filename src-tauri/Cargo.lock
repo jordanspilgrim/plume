@@ -2675,6 +2675,7 @@ dependencies = [
  "glib",
  "gtk",
  "interprocess",
+ "libc",
  "notify",
  "objc2",
  "objc2-foundation",

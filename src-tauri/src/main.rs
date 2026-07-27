@@ -243,15 +243,32 @@ fn managed_node_path(app: &AppHandle) -> Option<PathBuf> {
 // blocked resolve_node/node_status (and export's UI promise) forever.
 const NODE_PROBE_TIMEOUT_SECS: u64 = 3;
 
+// Kill the probe AND everything it spawned. A wrapper/shim's hang usually
+// lives in a descendant (sh → sleep); Child::kill() reaps only the shim and
+// orphans the rest, and repeated probes accumulate strays. The probe is
+// spawned as its own process-group leader, so signalling -pid takes the tree.
+fn kill_probe_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill(); // non-unix path; harmless no-op after the group kill
+    let _ = child.wait(); // reap
+}
+
 fn node_runs(p: &Path) -> bool {
     use std::process::{Command, Stdio};
-    let mut child = match Command::new(p)
-        .arg("--version")
+    let mut cmd = Command::new(p);
+    cmd.arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0); // own group, leader pid = child pid
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -261,15 +278,13 @@ fn node_runs(p: &Path) -> bool {
             Ok(Some(status)) => return status.success(),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap
+                    kill_probe_tree(&mut child);
                     return false;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_probe_tree(&mut child);
                 return false;
             }
         }
@@ -2808,7 +2823,10 @@ abc123DEF  node-v22.22.0-darwin-arm64.tar.gz
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let hung = dir.join("node-hung");
-        fs::write(&hung, "#!/bin/sh\nsleep 30\n").unwrap();
+        // Distinctive duration so we can pgrep for exactly this descendant; the
+        // trailing `true` stops sh from exec-optimizing sleep into the direct
+        // child — the hang must live in a DESCENDANT to prove the group kill.
+        fs::write(&hung, "#!/bin/sh\nsleep 30303\ntrue\n").unwrap();
         fs::set_permissions(&hung, fs::Permissions::from_mode(0o755)).unwrap();
         let working = dir.join("node-working");
         fs::write(&working, "#!/bin/sh\necho v22.22.0\nexit 0\n").unwrap();
@@ -2822,6 +2840,26 @@ abc123DEF  node-v22.22.0-darwin-arm64.tar.gz
             elapsed < Duration::from_secs(NODE_PROBE_TIMEOUT_SECS + 5),
             "probe must give up at ~{NODE_PROBE_TIMEOUT_SECS}s, took {elapsed:?}"
         );
+
+        // The group kill must take the forked descendant with it — poll until
+        // the sentinel sleep is gone (signal delivery is async).
+        let mut orphaned = true;
+        for _ in 0..40 {
+            let out = std::process::Command::new("pgrep")
+                .args(["-f", "sleep 30303"])
+                .output()
+                .unwrap();
+            if !out.status.success() || out.stdout.is_empty() {
+                orphaned = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if orphaned {
+            // Don't leak the sentinel on assertion failure.
+            let _ = std::process::Command::new("pkill").args(["-f", "sleep 30303"]).status();
+        }
+        assert!(!orphaned, "descendant `sleep 30303` survived the process-group kill");
         let _ = fs::remove_dir_all(&dir);
     }
 
