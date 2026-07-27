@@ -1,0 +1,41 @@
+# Keeps the three dependency surfaces current so advisories are a trickle of
+# small PRs rather than a wall of upgrades at release time.
+#
+# github-actions matters more here than it looks: every action in this repo is
+# pinned to a full commit SHA (a mutable @tag is a supply-chain lever, and the
+# release workflow handles the Apple signing cert and updater key). Pinned SHAs
+# don't drift on their own — Dependabot is what moves them forward, with the
+# version comment updated alongside.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:40"
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine bumps; security advisories still arrive separately
+      # and immediately.
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: cargo
+    directory: "/src-tauri"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:40"
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:40"
+    open-pull-requests-limit: 5

@@ -30,6 +30,8 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy
 
       - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -48,6 +50,12 @@ jobs:
 
       - name: Rust tests (node probe, containment, parsing)
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # Static analysis, deliberately deny-on-warning: this codebase hand-rolls
+      # parsers and sanitizers over hostile input, which is where clippy earns
+      # its keep. --all-targets so test code is linted too.
+      - name: Clippy (deny warnings)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
   build:
     needs: test
