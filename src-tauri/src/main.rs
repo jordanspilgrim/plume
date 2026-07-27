@@ -234,23 +234,47 @@ fn managed_node_path(app: &AppHandle) -> Option<PathBuf> {
     Some(app.path().app_data_dir().ok()?.join("node/bin/node"))
 }
 
+// A path that exists isn't necessarily a runtime that works: a broken Homebrew
+// install (missing dylibs), a wrong-arch binary, or an nvm shim all pass
+// is_file() and then die at spawn — and a working node one probe later never
+// gets tried (F3). Only offer nodes that prove they run.
+fn node_runs(p: &Path) -> bool {
+    use std::process::{Command, Stdio};
+    Command::new(p)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn first_working_node(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|p| p.is_file() && node_runs(p))
+}
+
 fn system_node() -> Option<PathBuf> {
     // GUI-launched macOS apps inherit a minimal PATH (/usr/bin:/bin:...), so a
     // plain `Command::new("node")` misses Homebrew/nvm installs. Probe the
     // common install spots, then whatever PATH we do have.
-    for cand in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"] {
-        let p = PathBuf::from(cand);
-        if p.is_file() { return Some(p); }
+    let probes = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
+        .into_iter()
+        .map(PathBuf::from);
+    if let Some(p) = first_working_node(probes) {
+        return Some(p);
     }
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|d| d.join(if cfg!(windows) { "node.exe" } else { "node" }))
-        .find(|p| p.is_file())
+    first_working_node(
+        std::env::split_paths(&paths).map(|d| d.join(if cfg!(windows) { "node.exe" } else { "node" })),
+    )
 }
 
 fn resolve_node(app: &AppHandle) -> Option<PathBuf> {
+    // Health-check the managed runtime too: a half-copied or corrupted app-data
+    // install should fall through to a system node, not wedge export.
     if let Some(p) = managed_node_path(app) {
-        if p.is_file() { return Some(p); }
+        if p.is_file() && node_runs(&p) { return Some(p); }
     }
     system_node()
 }
@@ -275,14 +299,16 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
         .arg(&script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Piped, not null (F2): when the runtime crashes at launch (broken
+        // Homebrew dylibs, wrong arch), stderr holds the only useful evidence.
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
         Err(e) => return json!({ "ok": false, "error": format!("export helper failed to start: {e}") }),
     };
-    // Feed stdin and drain stdout on their own threads so a child that never
-    // reads (or floods) a pipe can't deadlock us against the timeout loop below.
+    // Feed stdin and drain stdout/stderr on their own threads so a child that
+    // never reads (or floods) a pipe can't deadlock us against the timeout loop below.
     if let Some(mut stdin) = child.stdin.take() {
         let payload = req.to_string();
         std::thread::spawn(move || {
@@ -297,10 +323,18 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
             buf
         })
     });
+    let err_reader = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err.read_to_end(&mut buf);
+            buf
+        })
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(SIDECAR_TIMEOUT_SECS);
+    let mut exit_status = None;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => { exit_status = Some(status); break; }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
@@ -313,7 +347,25 @@ fn run_sidecar(app: &AppHandle, req: &Value) -> Value {
         }
     }
     let stdout = reader.and_then(|t| t.join().ok()).unwrap_or_default();
-    serde_json::from_slice(&stdout).unwrap_or(json!({ "ok": false, "error": "no result" }))
+    if let Ok(v) = serde_json::from_slice::<Value>(&stdout) {
+        return v;
+    }
+    // No parseable result: the helper died before it could answer. Surface the
+    // reason — exit code + stderr tail — instead of a blank "no result" (F2).
+    let stderr = err_reader.and_then(|t| t.join().ok()).unwrap_or_default();
+    let msg = String::from_utf8_lossy(&stderr);
+    let msg = msg.trim();
+    let start = msg.char_indices().rev().nth(299).map(|(i, _)| i).unwrap_or(0);
+    let tail = &msg[start..];
+    let code_txt = exit_status
+        .map(|s| s.code().map(|c| c.to_string()).unwrap_or_else(|| "killed by signal".into()))
+        .unwrap_or_else(|| "?".into());
+    let error = if tail.is_empty() {
+        format!("export helper exited (code {code_txt}) without producing a result")
+    } else {
+        format!("export helper failed (exit {code_txt}): {tail}")
+    };
+    json!({ "ok": false, "error": error })
 }
 
 // Runtime hardware arch — NOT the compile target: an x64 build running under
@@ -485,26 +537,41 @@ async fn install_node(app: AppHandle) -> Value {
     }
 }
 
+// Returns { ok:true, path } | { ok:false, cancelled:true } (save dialog closed)
+// | { ok:false, error, code? }. Failures used to collapse to None here, which
+// left the renderer nothing to show the user (F2).
 #[tauri::command]
-async fn export_doc(app: AppHandle, format: String, html: String, default_name: Option<String>) -> Option<String> {
+async fn export_doc(app: AppHandle, format: String, html: String, default_name: Option<String>) -> Value {
     let ext = match format.as_str() { "html" => "html", "pdf" => "pdf", "docx" => "docx", _ => "html" };
-    let picked = app
+    let picked = match app
         .dialog()
         .file()
         .add_filter(&ext.to_uppercase(), &[ext])
         .set_file_name(&format!("{}.{}", default_name.unwrap_or_else(|| "document".into()), ext))
-        .blocking_save_file()?;
-    let path = picked.into_path().ok()?;
+        .blocking_save_file()
+    {
+        Some(p) => p,
+        None => return json!({ "ok": false, "cancelled": true }),
+    };
+    let path = match picked.into_path() {
+        Ok(p) => p,
+        Err(e) => return json!({ "ok": false, "error": e.to_string() }),
+    };
     let p = path.to_string_lossy().to_string();
     if ext == "html" {
-        fs::write(&p, html).ok()?;
-        return Some(p);
+        return match fs::write(&p, html) {
+            Ok(()) => json!({ "ok": true, "path": p }),
+            Err(e) => json!({ "ok": false, "error": e.to_string() }),
+        };
     }
     if ext == "docx" {
-        let res = run_sidecar(&app, &json!({ "cmd": "docx", "html": html, "out": p }));
-        return if res["ok"] == true { Some(p) } else { None };
+        let mut res = run_sidecar(&app, &json!({ "cmd": "docx", "html": html, "out": p }));
+        if res["ok"] == true {
+            res["path"] = Value::String(p);
+        }
+        return res; // failures keep run_sidecar's error + code (e.g. NODE_MISSING)
     }
-    None // pdf — see MIGRATION.md
+    json!({ "ok": false, "error": "pdf export goes through export_pdf" })
 }
 
 #[tauri::command]
@@ -2675,6 +2742,36 @@ abc123DEF  node-v22.22.0-darwin-arm64.tar.gz
     #[test]
     fn node_arch_is_a_known_value() {
         assert!(matches!(node_arch(), "arm64" | "x64"));
+    }
+
+    // F3: a candidate that exists but can't run (broken Homebrew node with a
+    // missing dylib, wrong arch, no exec bit) must be SKIPPED, not selected —
+    // a working node later in the list wins.
+    #[test]
+    #[cfg(unix)]
+    fn first_working_node_skips_broken_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("plume-nodepick-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let write_fake = |name: &str, body: &str, mode: u32| -> PathBuf {
+            let p = dir.join(name);
+            fs::write(&p, body).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+            p
+        };
+        // Executable but exits non-zero — the broken-Homebrew shape.
+        let broken = write_fake("node-broken", "#!/bin/sh\nexit 1\n", 0o755);
+        // Exists but not executable at all.
+        let noexec = write_fake("node-noexec", "#!/bin/sh\necho v0.0.0\n", 0o644);
+        // Healthy.
+        let working = write_fake("node-working", "#!/bin/sh\necho v22.22.0\nexit 0\n", 0o755);
+        let missing = dir.join("node-missing");
+
+        let picked = first_working_node([missing, broken.clone(), noexec, working.clone()]);
+        assert_eq!(picked.as_deref(), Some(working.as_path()), "skips missing/broken/noexec, picks the runner");
+        assert_eq!(first_working_node([broken]), None, "no working candidate → None");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // Real network, ~50 MB download. Run explicitly:
