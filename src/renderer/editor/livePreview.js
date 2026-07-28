@@ -3,6 +3,7 @@ import { StateField, StateEffect } from "@codemirror/state";
 import { syntaxTree, foldService, codeFolding, foldEffect, unfoldEffect, foldedRanges } from "@codemirror/language";
 import katex from "katex";
 import mermaid from "mermaid";
+import { parseFrontMatter } from "./frontmatter.js";
 
 /* ---------- Document path (for resolving relative images/links) ---------- */
 
@@ -604,6 +605,14 @@ function buildDecorations(state) {
   const tree = syntaxTree(state);
   const docPath = state.field(docPathField, false) || ""; // for per-doc table column widths
 
+  // Front matter: a leading `---...---` block drives per-doc settings (theme,
+  // font, width, focus). Render it as a muted "properties" block; the guards
+  // below suppress the <hr> / setext-<h2> its fences would otherwise become.
+  // The parser matches only at document offset 0, so a mid-doc `---` is safe.
+  const fm = parseFrontMatter(state.sliceDoc(0, Math.min(state.doc.length, 4096)));
+  const fmEnd = fm ? state.doc.line(fm.endLine + 1).to : 0;
+  if (fmEnd > 0) addLineClasses(ranges, state, 0, fmEnd, "tok-frontmatter");
+
   tree.iterate({
     enter: (node) => {
       const name = node.name;
@@ -661,7 +670,7 @@ function buildDecorations(state) {
       }
 
       // ----- Block line styling -----
-      if (HEADING_LINE[name]) { addLineClasses(ranges, state, node.from, node.from, HEADING_LINE[name]); return; }
+      if (HEADING_LINE[name]) { if (fmEnd > 0 && node.from < fmEnd) return; addLineClasses(ranges, state, node.from, node.from, HEADING_LINE[name]); return; }
       if (name === "Blockquote") {
         const first = state.doc.lineAt(node.from);
         const cm = CALLOUT_RE.exec(first.text);
@@ -699,6 +708,7 @@ function buildDecorations(state) {
       // ----- Concealable marks (hidden even when editing unless reveal mode is on) -----
       const onActive = active.has(state.doc.lineAt(node.from).number);
       if (name === "HeaderMark" || name === "QuoteMark") {
+        if (name === "HeaderMark" && fmEnd > 0 && node.from < fmEnd) return; // FM fence: shown raw & muted
         if (shouldConceal(onActive)) ranges.push(conceal.range(node.from, eatTrailingSpace(state, node.to)));
         return;
       }
@@ -732,6 +742,7 @@ function buildDecorations(state) {
         return;
       }
       if (name === "HorizontalRule") {
+        if (fmEnd > 0 && node.from < fmEnd) return; // FM fence, not a thematic-break rule
         addLineClasses(ranges, state, node.from, node.from, "tok-hr");
         if (!onActive) ranges.push(Decoration.replace({ widget: new RuleWidget() }).range(node.from, node.to));
         return;

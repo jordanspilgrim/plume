@@ -1,7 +1,7 @@
 {
   "name": "plume",
   "version": "0.1.0",
-  "description": "A fast, single-surface Markdown editor — renders like a document, saves like a text file.",
+  "description": "A fast, single-surface Markdown editor for macOS. Renders like a document, saves like a text file.",
   "author": "Gabriel",
   "license": "MIT",
   "bin": {

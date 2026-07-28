@@ -678,6 +678,19 @@ body { display: flex; flex-direction: column; }
 .cm-line.tok-code-fence { color: var(--text-faint); font-family: var(--font-mono); font-size: 0.85em; }
 .cm-line.tok-hr { position: relative; }
 
+/* Front matter: a leading `---...---` block that drives per-doc settings
+   (theme, font, width, focus). Rendered as a muted, monospace "properties"
+   block; its fences stay visible (single-surface) instead of becoming an
+   <hr> / setext <h2>. */
+.cm-line.tok-frontmatter {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  line-height: 1.5;
+  border-left: 2px solid var(--rule);
+  padding-left: 14px;
+}
+
 .tok-list-bullet { color: var(--accent); }
 
 /* Concealed markup — collapsed to zero width when inactive */
