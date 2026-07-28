@@ -1,4 +1,5 @@
 import MarkdownIt from "markdown-it";
+import { stripFrontMatter } from "./frontmatter.js";
 
 // html:false — a document is untrusted; raw <script>/<img onerror> in the source must
 // not pass through verbatim into exported HTML or the rich-text clipboard payload
@@ -6,7 +7,10 @@ import MarkdownIt from "markdown-it";
 const md = new MarkdownIt({ html: false, linkify: true, breaks: false, typographer: false });
 
 export function mdToHtml(src) {
-  return md.render(src || "");
+  // Drop a leading front-matter block: those are Plume settings, not content,
+  // and MarkdownIt would otherwise render the fences as an <hr> + setext <h2>
+  // in copied and exported HTML.
+  return md.render(stripFrontMatter(src || ""));
 }
 
 function esc(s) {

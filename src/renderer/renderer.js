@@ -95,7 +95,10 @@ function applyDocSettings(fm) {
 let _fmSlice = null, _fmTimer = null;
 function applyDocSettingsNow() {
   _fmSlice = view.state.doc.sliceString(0, 4096);
-  applyDocSettings(parseFrontMatter(_fmSlice));
+  // Front matter is a Markdown-doc concept; a `---` block at the top of a
+  // YAML/JSON/etc. file is that file's own data, not Plume settings. In any
+  // non-Markdown mode, apply the global defaults instead.
+  applyDocSettings(currentMode === "markdown" ? parseFrontMatter(_fmSlice) : null);
 }
 function scheduleDocSettings() {
   if (_fmTimer) clearTimeout(_fmTimer);
@@ -1152,10 +1155,16 @@ function renderOutline() {
   if (outlineEl.classList.contains("hidden")) return;
   const tree = syntaxTree(view.state);
   const items = [];
+  // A front-matter property line plus its closing `---` parse as a setext H2
+  // that we render as muted settings, not a heading — keep it out of the
+  // outline too, so `theme: dark` never shows up as a bogus document heading.
+  const fmDoc = currentMode === "markdown" ? parseFrontMatter(view.state.doc.sliceString(0, 4096)) : null;
+  const fmEnd = fmDoc ? view.state.doc.line(fmDoc.endLine + 1).to : 0;
   tree.iterate({
     enter: (node) => {
       const m = /^ATXHeading([1-6])$/.exec(node.name) || /^SetextHeading([1-2])$/.exec(node.name);
       if (m) {
+        if (fmEnd > 0 && node.from < fmEnd) return; // inside front matter, not a heading
         const line = view.state.doc.lineAt(node.from);
         const text = line.text.replace(/^#{1,6}\s*/, "").replace(/\s*#*\s*$/, "").trim();
         if (text) items.push({ level: Number(m[1]), text, pos: node.from });

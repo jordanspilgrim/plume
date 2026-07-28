@@ -7,7 +7,7 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { parseFrontMatter } = require("../src/renderer/editor/frontmatter.js");
+const { parseFrontMatter, stripFrontMatter } = require("../src/renderer/editor/frontmatter.js");
 
 test("full valid block: every supported key", () => {
   const r = parseFrontMatter("---\ntheme: dark\nfont: mono\nwidth: wide\nfocus: true\n---\n# Body");
@@ -79,4 +79,26 @@ test("non-string and tiny inputs => null", () => {
   assert.strictEqual(parseFrontMatter(null), null);
   assert.strictEqual(parseFrontMatter(""), null);
   assert.strictEqual(parseFrontMatter("---"), null);
+});
+
+test("indented keys are nested YAML, not top-level Plume settings", () => {
+  // `theme` here is nested under `author:` — must NOT change the editor theme.
+  const r = parseFrontMatter("---\nauthor:\n  theme: dark\n  font: mono\n---");
+  assert.deepStrictEqual(r.settings, {});
+});
+
+test("indented value inside a recognized block is ignored", () => {
+  const r = parseFrontMatter("---\nnote: |\n  theme: dark\ntheme: light\n---");
+  assert.deepStrictEqual(r.settings, { theme: "light" });
+});
+
+test("stripFrontMatter removes a leading block, keeps the body", () => {
+  const out = stripFrontMatter("---\ntheme: dark\n---\n\n# Body\n\ntext");
+  assert.strictEqual(out, "# Body\n\ntext");
+});
+
+test("stripFrontMatter leaves content without front matter untouched", () => {
+  const src = "# Just a heading\n\nsome text";
+  assert.strictEqual(stripFrontMatter(src), src);
+  assert.strictEqual(stripFrontMatter("A heading\n---\nbody"), "A heading\n---\nbody");
 });

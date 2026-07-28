@@ -50,6 +50,10 @@ function parseFrontMatter(text) {
   for (let i = 1; i < limit; i++) {
     const line = lines[i].replace(/\r$/, "");
     if (line.trimEnd() === "---") { endLine = i; break; }
+    // A recognized setting must be a top-level scalar. An indented line is
+    // nested YAML (e.g. `author:\n  theme: dark`) or block-scalar content, so it
+    // is never a Plume setting — skip it rather than read the nested key.
+    if (/^[ \t]/.test(line)) continue;
     const colon = line.indexOf(":");
     if (colon <= 0) continue; // blank line, comment, or no key before the colon
     const key = line.slice(0, colon).trim().toLowerCase();
@@ -65,4 +69,15 @@ function parseFrontMatter(text) {
   return { settings, endLine };
 }
 
-module.exports = { parseFrontMatter, FONT_IDS, THEMES };
+// Remove a leading front-matter block so it never reaches copy/export HTML
+// (Plume settings are not document content, and MarkdownIt would otherwise
+// render the fences as an <hr> plus a setext <h2>). Returns the text unchanged
+// when there is no front matter.
+function stripFrontMatter(text) {
+  const fm = parseFrontMatter(text);
+  if (!fm) return text;
+  const rest = text.split("\n").slice(fm.endLine + 1).join("\n");
+  return rest.replace(/^\n+/, ""); // drop blank lines left where the block was
+}
+
+module.exports = { parseFrontMatter, stripFrontMatter, FONT_IDS, THEMES };
