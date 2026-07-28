@@ -18,6 +18,7 @@ import { annotField, setAnnotRanges, locateQuote } from "./editor/annotations.js
 import { computeSegments, applySegments, hunkCount } from "./diff.js";
 import { renderJsonl, renderCsv, looksLikeTranscript, renderConversation } from "./editor/viewers.js";
 import { htmlToMarkdown, looksRich, inlinePastedImages } from "./editor/paste.js";
+import { parseFrontMatter } from "./editor/frontmatter.js";
 import {
   createTab, findTab, addTab, closeTab, cycleTabId, tabDisplayName, isCapturedDirty, isBlankTab,
   closeDecision, dirtyBackgroundTabs, isDraftTab, isKeepableDraft, findTabByPath,
@@ -75,8 +76,41 @@ function markdownLang() {
   return markdown({ base: markdownLanguage, extensions: [GFM, Highlight], codeLanguages, addKeymap: true });
 }
 
+// Per-document settings from front matter (theme/font/width/focus) override the
+// user's GLOBAL defaults for the active doc only, and are never persisted. A key
+// absent from the front matter falls back to the global default, so opening or
+// switching to a plain doc reverts cleanly. Applied on load, and (debounced) as
+// the leading block is edited or an agent rewrites the file.
+function applyDocSettings(fm) {
+  const s = (fm && fm.settings) || {};
+  const gTheme = localStorage.getItem("plume-theme") || "system";
+  const gFont = localStorage.getItem("plume-font") || "inter";
+  const gWide = localStorage.getItem("plume-wide") === "1";
+  const gFocus = localStorage.getItem("plume-focus") === "1";
+  applyTheme("theme" in s ? s.theme : gTheme, false);
+  applyFont("font" in s ? s.font : gFont, false);
+  applyWide("wide" in s ? s.wide : gWide, false);
+  applyFocus("focus" in s ? s.focus : gFocus, false);
+}
+let _fmSlice = null, _fmTimer = null;
+function applyDocSettingsNow() {
+  _fmSlice = view.state.doc.sliceString(0, 4096);
+  // Front matter is a Markdown-doc concept; a `---` block at the top of a
+  // YAML/JSON/etc. file is that file's own data, not Plume settings. In any
+  // non-Markdown mode, apply the global defaults instead.
+  applyDocSettings(currentMode === "markdown" ? parseFrontMatter(_fmSlice) : null);
+}
+function scheduleDocSettings() {
+  if (_fmTimer) clearTimeout(_fmTimer);
+  _fmTimer = setTimeout(() => {
+    _fmTimer = null;
+    if (view.state.doc.sliceString(0, 4096) === _fmSlice) return; // leading block unchanged
+    applyDocSettingsNow();
+  }, 250);
+}
+
 const updateListener = EditorView.updateListener.of((u) => {
-  if (u.docChanged) { scheduleSideEffects(); updateWelcome(); maybeCreateDraft(); }
+  if (u.docChanged) { scheduleSideEffects(); updateWelcome(); maybeCreateDraft(); scheduleDocSettings(); }
   if (u.selectionSet) updateStatus();
   if (u.selectionSet || u.docChanged) updateSelBar();
   handleSlash(u);
@@ -901,6 +935,8 @@ function loadDocument(content, filePath, recovery, gotoLine) {
   // (in-place navigation from the sidebar retargets the current tab).
   const at = findTab(tabs, activeTabId);
   if (at) { at.path = filePath || null; at.pendingName = null; at.text = null; at.savedText = null; at.unbound = false; }
+  // Apply this doc's front-matter settings (or revert to global for a plain doc).
+  applyDocSettingsNow();
   renderTabbar();
   refreshSidebar();
   view.focus();
@@ -1119,10 +1155,16 @@ function renderOutline() {
   if (outlineEl.classList.contains("hidden")) return;
   const tree = syntaxTree(view.state);
   const items = [];
+  // A front-matter property line plus its closing `---` parse as a setext H2
+  // that we render as muted settings, not a heading — keep it out of the
+  // outline too, so `theme: dark` never shows up as a bogus document heading.
+  const fmDoc = currentMode === "markdown" ? parseFrontMatter(view.state.doc.sliceString(0, 4096)) : null;
+  const fmEnd = fmDoc ? view.state.doc.line(fmDoc.endLine + 1).to : 0;
   tree.iterate({
     enter: (node) => {
       const m = /^ATXHeading([1-6])$/.exec(node.name) || /^SetextHeading([1-2])$/.exec(node.name);
       if (m) {
+        if (fmEnd > 0 && node.from < fmEnd) return; // inside front matter, not a heading
         const line = view.state.doc.lineAt(node.from);
         const text = line.text.replace(/^#{1,6}\s*/, "").replace(/\s*#*\s*$/, "").trim();
         if (text) items.push({ level: Number(m[1]), text, pos: node.from });
@@ -1160,12 +1202,12 @@ function toggleOutline() {
 }
 
 /* ---------- Theme ---------- */
-function applyTheme(theme) {
+function applyTheme(theme, persist = true) {
   appEl.dataset.theme = theme;
   // Also theme <html> so the palette vars (--bg, --text) cascade to html/body —
   // otherwise body's background is transparent and the window bg bleeds through.
   document.documentElement.dataset.theme = theme;
-  localStorage.setItem("plume-theme", theme);
+  if (persist) localStorage.setItem("plume-theme", theme);
   const dark =
     theme === "dark" ||
     (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
@@ -1176,9 +1218,9 @@ applyTheme(localStorage.getItem("plume-theme") || "system");
 
 // Wide mode — full-width content (for tables / wide docs); off keeps the
 // readable prose measure. Toggled from Settings or the command palette.
-function applyWide(on) {
+function applyWide(on, persist = true) {
   document.documentElement.dataset.wide = on ? "1" : "0";
-  localStorage.setItem("plume-wide", on ? "1" : "0");
+  if (persist) localStorage.setItem("plume-wide", on ? "1" : "0");
 }
 applyWide(localStorage.getItem("plume-wide") === "1");
 
@@ -1439,10 +1481,10 @@ const FONTS = [
   { id: "mono", label: "JetBrains Mono", stack: '"JetBrains Mono", "SF Mono", ui-monospace, monospace' },
 ];
 
-function applyFont(id) {
+function applyFont(id, persist = true) {
   const font = FONTS.find((f) => f.id === id) || FONTS[0];
   document.documentElement.style.setProperty("--font-body", font.stack);
-  localStorage.setItem("plume-font", font.id);
+  if (persist) localStorage.setItem("plume-font", font.id);
 }
 
 /* ---------- Title bar: brand (left) + Share (right) ---------- */
@@ -1821,10 +1863,10 @@ function applyReveal(reveal) {
   view.dispatch({ effects: refreshEffect.of(null) });
 }
 
-function applyFocus(on) {
+function applyFocus(on, persist = true) {
   setFocusMode(on);
   appEl.classList.toggle("focus-mode", on);
-  localStorage.setItem("plume-focus", on ? "1" : "0");
+  if (persist) localStorage.setItem("plume-focus", on ? "1" : "0");
   view.dispatch({ effects: refreshEffect.of(null) });
 }
 
