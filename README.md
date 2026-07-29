@@ -1,5 +1,7 @@
 # Plume
 
+**The Human Pane for Agentic Coding**
+
 A fast, single-surface Markdown editor for macOS. It renders like a document, saves like a text file, and stays out of the way while an AI agent writes alongside you.
 
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS%2011%2B-black)
@@ -12,7 +14,7 @@ Plume is the human pane for agentic coding. The terminal is where your agent wri
 
 It shows finished Markdown, not syntax. Bold is bold, headings are sized, links show their text, checkboxes are checkboxes. The syntax marks (`**`, `#`, `` ` ``, `[]()`) reveal only on the line your cursor is on. What lands on disk is exactly what you typed: plain UTF-8 Markdown, no wrapper, no lock-in.
 
-Built on Tauri v2 (native WKWebView plus Rust) and CodeMirror 6. About 4.7 MB, not 449.
+Built on Tauri v2 (native WKWebView plus Rust) and CodeMirror 6. It uses the system WebView instead of bundling a browser engine, so the whole app is about 11 MB.
 
 ## The agent companion
 
@@ -33,7 +35,7 @@ Setup and drop-in agent config live in [docs/agent-setup.md](docs/agent-setup.md
 - **Plain Markdown on disk:** UTF-8 `.md`, no database, no wrapper. Open it in anything.
 - **First-keystroke autosave:** a new note is backed by a file from the first character you type, saved under `~/Documents/Plume/Autosave`. Scratch buffers are never lost.
 - **Export & share:** copy as rich text or HTML, export to PDF, HTML, and Word, publish one-way to Google Docs.
-- **Hardened:** a written threat model and a signed, notarized release. See [Security](#security).
+- **Hardened:** a written threat model and a signing-and-notarization release pipeline. See [Security](#security).
 
 ## Quickstart
 
@@ -88,13 +90,13 @@ Plume lets an agent read and write your files over a local socket and an MCP ser
 - **Three adversaries:** a prompt-injected agent holding a valid token, a hostile document, and a remote web page reaching the `plume://` handler. A token is not a person. Any control that needs a human keys on a human act (a native dialog, a launch argument), not on the caller holding a token.
 - **Reads and writes stay in bounds:** every renderer and socket file command is scoped to files you opened. A deny list (credentials, `.env*`, `.git` internals, keys, shell history) overrides that scope for reads and writes alike. The path checked is the path used, resolved once, so a symlink swap cannot redirect it.
 - **Nothing phones home:** export vets and inlines remote images through one Rust choke point, so neither the Word sidecar nor the PDF renderer ever reaches the network. Link previews use a pinned resolver and follow no redirects. A strict Content Security Policy leaves no `fetch()` behind the sanitizer.
-- **Supply chain:** CI runs the full test suite, `cargo clippy -D warnings`, and `npm audit` plus `cargo audit`. The optional Node runtime download checks a build-pinned digest. The release build is Developer-ID signed and notarized.
+- **Supply chain:** CI runs the full test suite, `cargo clippy -D warnings`, and `npm audit` plus `cargo audit`. The optional Node runtime download checks a build-pinned digest. The release pipeline Developer-ID signs and notarizes on a version tag.
 
 We put the model through an adversarial review and several independent re-checks. If you find a gap, please open an issue.
 
 ## Architecture
 
-Tauri v2: a native WKWebView plus a Rust binary, about 4.7 MB against Electron's roughly 449. The renderer is vanilla JavaScript on CodeMirror 6, running unchanged through a `window.plume` bridge (`tauri/tauri-bridge.js`) backed by the Rust commands in `src-tauri/`. A small Node sidecar handles Word and Google Docs export. Plume began on Electron; the Tauri port is complete and Electron has been removed.
+Tauri v2: a native WKWebView plus a Rust binary. It renders through the system WebView instead of bundling a browser engine, so the app is about 11 MB. The renderer is vanilla JavaScript on CodeMirror 6, running unchanged through a `window.plume` bridge (`tauri/tauri-bridge.js`) backed by the Rust commands in `src-tauri/`. A small Node sidecar handles Word and Google Docs export.
 
 ## Development
 

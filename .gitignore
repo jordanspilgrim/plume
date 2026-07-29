@@ -9,6 +9,9 @@ sample.md
 phase2.md
 test-image.png
 
+# Local agent session artifacts (worktrees, plans) - never publish
+.claude/
+
 # Tauri
 build-tauri/
 src-tauri/target/
