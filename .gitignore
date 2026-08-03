@@ -17,3 +17,11 @@ build-tauri/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/sidecar/
+
+# secrets (added during public-prep)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
