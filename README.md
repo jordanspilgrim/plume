@@ -35,7 +35,7 @@ Setup and drop-in agent config live in [docs/agent-setup.md](docs/agent-setup.md
 - **Plain Markdown on disk:** UTF-8 `.md`, no database, no wrapper. Open it in anything.
 - **First-keystroke autosave:** a new note is backed by a file from the first character you type, saved under `~/Documents/Plume/Autosave`. Scratch buffers are never lost.
 - **Export & share:** copy as rich text or HTML, export to PDF, HTML, and Word, publish one-way to Google Docs.
-- **Hardened:** a written threat model and a signing-and-notarization release pipeline. See [Security](#security).
+- **Hardened:** a written threat model, plus a release workflow set up to sign and notarize builds (no signed release published yet; build from source for now). See [Security](#security).
 
 ## Quickstart
 
@@ -90,7 +90,7 @@ Plume lets an agent read and write your files over a local socket and an MCP ser
 - **Three adversaries:** a prompt-injected agent holding a valid token, a hostile document, and a remote web page reaching the `plume://` handler. A token is not a person. Any control that needs a human keys on a human act (a native dialog, a launch argument), not on the caller holding a token.
 - **Reads and writes stay in bounds:** every renderer and socket file command is scoped to files you opened. A deny list (credentials, `.env*`, `.git` internals, keys, shell history) overrides that scope for reads and writes alike. The path checked is the path used, resolved once, so a symlink swap cannot redirect it.
 - **Nothing phones home:** export vets and inlines remote images through one Rust choke point, so neither the Word sidecar nor the PDF renderer ever reaches the network. Link previews use a pinned resolver and follow no redirects. A strict Content Security Policy leaves no `fetch()` behind the sanitizer.
-- **Supply chain:** CI runs the full test suite, `cargo clippy -D warnings`, and `npm audit` plus `cargo audit`. The optional Node runtime download checks a build-pinned digest. The release pipeline Developer-ID signs and notarizes on a version tag.
+- **Supply chain:** CI runs the full test suite, `cargo clippy -D warnings`, and `npm audit` plus `cargo audit`. The optional Node runtime download checks a build-pinned digest. A release workflow (`.github/workflows/release.yml`) is in place to Developer-ID sign and notarize on a version tag; no tagged release has been published yet.
 
 We put the model through an adversarial review and several independent re-checks. If you find a gap, please open an issue.
 
